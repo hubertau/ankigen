@@ -3,15 +3,20 @@
 from pydantic import BaseModel, Field
 
 
-class SentenceResponse(BaseModel):
-    """Response model for sentence generation."""
+def create_sentence_response(num_sentences: int = 3) -> type[BaseModel]:
+    """Factory to create a SentenceResponse model with dynamic sentence count."""
 
-    sentences: list[str] = Field(
-        ...,
-        min_length=3,
-        max_length=3,
-        description="Exactly 3 example sentences using the target word",
-    )
+    class SentenceResponse(BaseModel):
+        """Response model for sentence generation."""
+
+        sentences: list[str] = Field(
+            ...,
+            min_length=num_sentences,
+            max_length=num_sentences,
+            description=f"Exactly {num_sentences} example sentences using the target word",
+        )
+
+    return SentenceResponse
 
 
 class TranslationResponse(BaseModel):

@@ -49,14 +49,14 @@ def read_words(input_file: Path) -> list[str]:
     return words
 
 
-def process_word(word: str, lang: Language, include_sentences: bool) -> dict:
+def process_word(word: str, lang: Language, num_sentences: int) -> dict:
     """
     Process a single word: get translation, Jyutping (for Chinese), and optionally sentences.
 
     Args:
         word: The vocabulary word
         lang: Language code
-        include_sentences: Whether to generate sentences
+        num_sentences: Number of sentences to generate (0 to skip)
 
     Returns:
         Dict with language-appropriate field names
@@ -66,9 +66,9 @@ def process_word(word: str, lang: Language, include_sentences: bool) -> dict:
     # Get translation
     translation = translate_word(word, lang)
 
-    if include_sentences:
+    if num_sentences > 0:
         # Generate sentences
-        sentences = generate_sentences(word, lang)
+        sentences = generate_sentences(word, lang, num_sentences)
         # Format as numbered string for the formatter
         numbered = " ".join(f"{i+1}. {s}" for i, s in enumerate(sentences))
         # Apply HTML formatting
@@ -124,7 +124,7 @@ def generate_csv(
     input_file: Path,
     output_file: Path,
     lang: Language,
-    include_sentences: bool,
+    num_sentences: int,
 ) -> None:
     """
     Generate the output CSV from a word list.
@@ -133,7 +133,7 @@ def generate_csv(
         input_file: Path to input .txt file with words
         output_file: Path to output .csv file
         lang: Language code ('zh' or 'ko')
-        include_sentences: Whether to generate example sentences
+        num_sentences: Number of sentences to generate per word (0 to skip)
     """
     words = read_words(input_file)
     print(f"Found {len(words)} words in {input_file}")
@@ -152,7 +152,7 @@ def generate_csv(
         writer.writeheader()
 
         for word in words:
-            row = process_word(word, lang, include_sentences)
+            row = process_word(word, lang, num_sentences)
             writer.writerow(row)
 
     print(f"\nOutput written to {output_file}")
@@ -183,9 +183,11 @@ def main():
         help="Language: zh (Chinese) or ko (Korean). Default: zh",
     )
     parser.add_argument(
-        "--no-sentences",
-        action="store_true",
-        help="Skip sentence generation (only get translations)",
+        "-n",
+        "--sentences",
+        type=int,
+        default=3,
+        help="Number of example sentences per word (default: 3, use 0 to skip)",
     )
 
     args = parser.parse_args()
@@ -202,7 +204,7 @@ def main():
         input_file=args.input_file,
         output_file=output_file,
         lang=args.lang,
-        include_sentences=not args.no_sentences,
+        num_sentences=args.sentences,
     )
 
 

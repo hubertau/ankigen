@@ -7,7 +7,7 @@ import instructor
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from ankigen.models import SentenceResponse, TranslationResponse
+from ankigen.models import create_sentence_response, TranslationResponse
 
 # Load environment variables
 load_dotenv()
@@ -34,12 +34,12 @@ Provider = Literal["openai", "openrouter", "local"]
 LANGUAGE_CONFIG = {
     "zh": {
         "name": "Chinese",
-        "sentence_prompt": "Generate exactly 3 natural example sentences in Chinese using the word '{word}'. The sentences should demonstrate different usages and contexts of the word. Return only the sentences, no translations or explanations.",
+        "sentence_prompt": "Generate exactly {num_sentences} natural example sentences in Chinese using the word '{word}'. The sentences should demonstrate different usages and contexts of the word. Return only the sentences, no translations or explanations.",
         "translation_prompt": "Translate the Chinese word '{word}' to English. Include the part of speech and any common meanings or usages. Do NOT include pinyin or the original Chinese characters. Be concise.",
     },
     "ko": {
         "name": "Korean",
-        "sentence_prompt": "Generate exactly 3 natural example sentences in Korean using the word '{word}'. The sentences should demonstrate different usages and contexts of the word. Return only the sentences, no translations or explanations.",
+        "sentence_prompt": "Generate exactly {num_sentences} natural example sentences in Korean using the word '{word}'. The sentences should demonstrate different usages and contexts of the word. Return only the sentences, no translations or explanations.",
         "translation_prompt": "Translate the Korean word '{word}' to English. Include the part of speech and any common meanings or usages. Do NOT include romanization or the original Korean characters. Be concise.",
     },
 }
@@ -98,19 +98,21 @@ def get_model() -> str:
     return PROVIDER_CONFIG[provider]["default_model"]
 
 
-def generate_sentences(word: str, lang: Language = "zh") -> list[str]:
+def generate_sentences(word: str, lang: Language = "zh", num_sentences: int = 3) -> list[str]:
     """
     Generate example sentences for a word using the LLM.
 
     Args:
         word: The vocabulary word to generate sentences for
         lang: Language code ('zh' for Chinese, 'ko' for Korean)
+        num_sentences: Number of sentences to generate (default: 3)
 
     Returns:
-        List of 3 example sentences
+        List of example sentences
     """
     client = get_client()
     config = LANGUAGE_CONFIG[lang]
+    SentenceResponse = create_sentence_response(num_sentences)
 
     response = client.chat.completions.create(
         model=get_model(),
@@ -122,7 +124,7 @@ def generate_sentences(word: str, lang: Language = "zh") -> list[str]:
             },
             {
                 "role": "user",
-                "content": config["sentence_prompt"].format(word=word),
+                "content": config["sentence_prompt"].format(word=word, num_sentences=num_sentences),
             },
         ],
     )
