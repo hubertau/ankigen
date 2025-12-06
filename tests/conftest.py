@@ -45,4 +45,3 @@ def mock_translation_zh():
 def mock_translation_ko():
     """Mock Korean translation."""
     return "Adjective: comfortable, relaxed, easy"
-

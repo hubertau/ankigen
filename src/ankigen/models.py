@@ -26,4 +26,3 @@ class TranslationResponse(BaseModel):
         ...,
         description="English translation of the word, including part of speech and multiple meanings if applicable",
     )
-

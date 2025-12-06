@@ -8,17 +8,24 @@ Usage:
     ankigen words.txt --no-sentences
 """
 
-# Suppress pkg_resources deprecation warning from wordseg (pycantonese dependency)
+# Suppress pkg_resources deprecation warning from wordseg (pycantonese dependency).
+# This MUST happen before any imports that trigger pycantonese loading.
+# ruff: noqa: E402 (imports below are intentionally after the warning filter)
 import warnings
+
 warnings.filterwarnings("ignore", message="pkg_resources is deprecated")
 
 import argparse
 import csv
+import logging
 import sys
 from pathlib import Path
 
 from ankigen.formatter import format_sentences
 from ankigen.llm import Language, generate_sentences, translate_word
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 
 def get_jyutping(word: str) -> str:
@@ -44,12 +51,12 @@ def get_jyutping(word: str) -> str:
 
 def read_words(input_file: Path) -> list[str]:
     """Read words from a text file, one per line."""
-    with open(input_file, "r", encoding="utf-8") as f:
+    with open(input_file, encoding="utf-8") as f:
         words = [line.strip() for line in f if line.strip()]
     return words
 
 
-def process_word(word: str, lang: Language, num_sentences: int) -> dict:
+def process_word(word: str, lang: Language, num_sentences: int) -> dict[str, str]:
     """
     Process a single word: get translation, Jyutping (for Chinese), and optionally sentences.
 
@@ -61,7 +68,7 @@ def process_word(word: str, lang: Language, num_sentences: int) -> dict:
     Returns:
         Dict with language-appropriate field names
     """
-    print(f"  Processing: {word}...", end=" ", flush=True)
+    logger.info("Processing: %s...", word)
 
     # Get translation
     translation = translate_word(word, lang)
@@ -70,13 +77,13 @@ def process_word(word: str, lang: Language, num_sentences: int) -> dict:
         # Generate sentences
         sentences = generate_sentences(word, lang, num_sentences)
         # Format as numbered string for the formatter
-        numbered = " ".join(f"{i+1}. {s}" for i, s in enumerate(sentences))
+        numbered = " ".join(f"{i + 1}. {s}" for i, s in enumerate(sentences))
         # Apply HTML formatting
         formatted = format_sentences(numbered, word)
     else:
         formatted = ""
 
-    print("done")
+    logger.debug("Done processing word")
 
     # Return language-specific field names
     if lang == "zh":
@@ -136,7 +143,7 @@ def generate_csv(
         num_sentences: Number of sentences to generate per word (0 to skip)
     """
     words = read_words(input_file)
-    print(f"Found {len(words)} words in {input_file}")
+    logger.info("Found %d words in %s", len(words), input_file)
 
     # Ensure output directory exists
     output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -155,10 +162,10 @@ def generate_csv(
             row = process_word(word, lang, num_sentences)
             writer.writerow(row)
 
-    print(f"\nOutput written to {output_file}")
+    logger.info("Output written to %s", output_file)
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate Anki vocabulary CSV from a word list",
         prog="ankigen",
@@ -173,7 +180,7 @@ def main():
         "--output",
         type=Path,
         default=None,
-        help="Output CSV file (default: outputs/{lang}/output_YYYYMMDD.csv)",
+        help="Output CSV file (default: outputs/{lang}/output_{input}.csv)",
     )
     parser.add_argument(
         "--lang",
@@ -189,12 +196,25 @@ def main():
         default=3,
         help="Number of example sentences per word (default: 3, use 0 to skip)",
     )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose output",
+    )
 
     args = parser.parse_args()
 
+    # Configure logging
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format="%(message)s",
+    )
+
     # Validate input file
     if not args.input_file.exists():
-        print(f"Error: Input file not found: {args.input_file}", file=sys.stderr)
+        logger.error("Input file not found: %s", args.input_file)
         sys.exit(1)
 
     # Determine output path
@@ -210,4 +230,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

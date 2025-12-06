@@ -7,7 +7,7 @@ import instructor
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from ankigen.models import create_sentence_response, TranslationResponse
+from ankigen.models import TranslationResponse, create_sentence_response
 
 # Load environment variables
 load_dotenv()
@@ -129,7 +129,9 @@ def generate_sentences(word: str, lang: Language = "zh", num_sentences: int = 3)
         ],
     )
 
-    return response.sentences
+    # instructor dynamically patches the return type based on response_model,
+    # but mypy can't infer this at static analysis time
+    return response.sentences  # type: ignore[attr-defined,no-any-return]
 
 
 def translate_word(word: str, lang: Language = "zh") -> str:
@@ -161,5 +163,6 @@ def translate_word(word: str, lang: Language = "zh") -> str:
         ],
     )
 
-    return response.translation
-
+    # instructor dynamically patches the return type based on response_model,
+    # but mypy can't infer this at static analysis time
+    return response.translation  # type: ignore[no-any-return]

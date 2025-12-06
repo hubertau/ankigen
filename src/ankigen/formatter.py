@@ -39,4 +39,3 @@ def format_sentences(text: str, keyword: str) -> str:
     result = result.replace('<span style="color: blue;"></span>', "")
 
     return result
-
