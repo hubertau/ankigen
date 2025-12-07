@@ -99,6 +99,7 @@ dependencies = [
     { name = "instructor" },
     { name = "openai" },
     { name = "pycantonese" },
+    { name = "pypdf" },
     { name = "python-dotenv" },
     { name = "setuptools" },
 ]
@@ -117,6 +118,7 @@ requires-dist = [
     { name = "instructor", specifier = ">=1.13.0" },
     { name = "openai", specifier = ">=2.9.0" },
     { name = "pycantonese", specifier = ">=3.4.0" },
+    { name = "pypdf", specifier = ">=5.1.0" },
     { name = "python-dotenv", specifier = ">=1.2.1" },
     { name = "setuptools", specifier = ">=80.9.0" },
 ]
@@ -992,6 +994,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/ef/9b/2ed966a4c1469c3c3526d1be1ddecec0716f6dcd40ea48aa4c14c3acdcdd/pylangacq-0.16.2.tar.gz", hash = "sha256:2f869657a54c0e8be2ff783f24b1f0f7c733bddd46157384697da0475acdadc8", size = 64709, upload-time = "2022-03-17T05:52:32.355Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/0c/1c/b2bb5cfc5704403ee258641210510b2bf423fd686e0fb584d5de8a89474c/pylangacq-0.16.2-py3-none-any.whl", hash = "sha256:01e707e5e1bdc1e7fbb93bc820bc8aefd05011daaaa3ad0973ee36042c2c6a27", size = 64474, upload-time = "2022-03-17T05:51:31.025Z" },
+]
+
+[[package]]
+name = "pypdf"
+version = "6.4.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f3/01/f7510cc6124f494cfbec2e8d3c2e1a20d4f6c18622b0c03a3a70e968bacb/pypdf-6.4.0.tar.gz", hash = "sha256:4769d471f8ddc3341193ecc5d6560fa44cf8cd0abfabf21af4e195cc0c224072", size = 5276661, upload-time = "2025-11-23T14:04:43.185Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cd/f2/9c9429411c91ac1dd5cd66780f22b6df20c64c3646cdd1e6d67cf38579c4/pypdf-6.4.0-py3-none-any.whl", hash = "sha256:55ab9837ed97fd7fcc5c131d52fcc2223bc5c6b8a1488bbf7c0e27f1f0023a79", size = 329497, upload-time = "2025-11-23T14:04:41.448Z" },
 ]
 
 [[package]]
