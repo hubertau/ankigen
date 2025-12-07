@@ -5,10 +5,13 @@ CLI for generating Anki vocabulary CSVs.
 Usage:
     ankigen generate inputs/zh/words.txt
     ankigen generate inputs/ko/words.txt --lang ko
-    ankigen generate words.txt --no-sentences
+    ankigen generate words.txt --clean  # Clean input before generating
 
     ankigen extract document.pdf --lang zh -o words.txt
     ankigen extract image.png --lang ko -o words.txt --append
+
+    ankigen clean inputs/ko/words.txt  # Clean a vocabulary file in-place
+    ankigen clean inputs/ko/words.txt -o cleaned.txt  # Clean to new file
 """
 
 # Suppress pkg_resources deprecation warning from wordseg (pycantonese dependency).
@@ -24,6 +27,7 @@ import logging
 import sys
 from pathlib import Path
 
+from ankigen.cleaner import clean_and_write, clean_vocabulary_file
 from ankigen.extractor import extract_vocabulary_from_file
 from ankigen.formatter import format_sentences
 from ankigen.llm import Language, generate_sentences, translate_word
@@ -136,6 +140,8 @@ def generate_csv(
     output_file: Path,
     lang: Language,
     num_sentences: int,
+    *,
+    clean_input: bool = False,
 ) -> None:
     """
     Generate the output CSV from a word list.
@@ -145,8 +151,14 @@ def generate_csv(
         output_file: Path to output .csv file
         lang: Language code ('zh' or 'ko')
         num_sentences: Number of sentences to generate per word (0 to skip)
+        clean_input: If True, clean the input before processing
     """
-    words = read_words(input_file)
+    if clean_input:
+        logger.info("Cleaning input file before processing...")
+        words = clean_vocabulary_file(input_file, lang)
+    else:
+        words = read_words(input_file)
+
     logger.info("Found %d words in %s", len(words), input_file)
 
     # Ensure output directory exists
@@ -184,6 +196,7 @@ def cmd_generate(args: argparse.Namespace) -> None:
         output_file=output_file,
         lang=args.lang,
         num_sentences=args.sentences,
+        clean_input=args.clean,
     )
 
 
@@ -247,6 +260,34 @@ def cmd_extract(args: argparse.Namespace) -> None:
     logger.info("Output written to %s", output_file)
 
 
+def cmd_clean(args: argparse.Namespace) -> None:
+    """Handle the 'clean' subcommand."""
+    # Validate input file
+    if not args.input_file.exists():
+        logger.error("Input file not found: %s", args.input_file)
+        sys.exit(1)
+
+    # Determine if we're overwriting in-place or writing to new file
+    output_file = args.output
+    overwrite = args.overwrite
+
+    # If no output specified, we're cleaning in-place
+    if output_file is None:
+        output_file = args.input_file
+        overwrite = True  # Always overwrite when cleaning in-place
+
+    try:
+        clean_and_write(
+            input_path=args.input_file,
+            output_path=output_file,
+            lang=args.lang,
+            overwrite=overwrite,
+        )
+    except FileExistsError as e:
+        logger.error(str(e))
+        sys.exit(1)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate Anki vocabulary CSVs from word lists or extract vocabulary from documents",
@@ -293,8 +334,14 @@ def main() -> None:
         default=3,
         help="Number of example sentences per word (default: 3, use 0 to skip)",
     )
+    gen_parser.add_argument(
+        "-c",
+        "--clean",
+        action="store_true",
+        help="Clean input file before processing (removes translations, romanization, etc.)",
+    )
 
-    # 'extract' subcommand (new functionality)
+    # 'extract' subcommand
     ext_parser = subparsers.add_parser(
         "extract",
         help="Extract vocabulary from PDF or image",
@@ -331,6 +378,37 @@ def main() -> None:
         help="Overwrite existing output file",
     )
 
+    # 'clean' subcommand
+    clean_parser = subparsers.add_parser(
+        "clean",
+        help="Clean a vocabulary file",
+        description="Clean a vocabulary file by removing translations, romanization, and annotations",
+    )
+    clean_parser.add_argument(
+        "input_file",
+        type=Path,
+        help="Input text file to clean",
+    )
+    clean_parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=None,
+        help="Output file (default: overwrite input file in-place)",
+    )
+    clean_parser.add_argument(
+        "--lang",
+        type=str,
+        choices=["zh", "ko"],
+        default="ko",
+        help="Language: zh (Chinese) or ko (Korean). Default: ko",
+    )
+    clean_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing output file",
+    )
+
     args = parser.parse_args()
 
     # Configure logging
@@ -345,6 +423,8 @@ def main() -> None:
         cmd_generate(args)
     elif args.command == "extract":
         cmd_extract(args)
+    elif args.command == "clean":
+        cmd_clean(args)
     else:
         parser.print_help()
         sys.exit(1)
