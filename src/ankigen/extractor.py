@@ -342,7 +342,9 @@ def extract_vocabulary_from_file(path: Path, lang: Language = "zh") -> list[str]
 
 def get_supported_files(directory: Path) -> list[Path]:
     """
-    Get all supported files (PDFs and images) from a directory.
+    Get all supported files (PDFs, Word docs, and images) from a directory.
+
+    Excludes hidden files (starting with .) and temporary files (starting with ~).
 
     Args:
         directory: Directory to scan
@@ -355,6 +357,9 @@ def get_supported_files(directory: Path) -> list[Path]:
 
     files: list[Path] = []
     for path in directory.iterdir():
+        # Skip hidden files and temp files (e.g., .DS_Store, ~$document.docx)
+        if path.name.startswith(".") or path.name.startswith("~"):
+            continue
         if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS:
             files.append(path)
 
