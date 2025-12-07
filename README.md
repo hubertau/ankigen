@@ -154,7 +154,7 @@ Watch folder behavior:
 | `--overwrite` | Overwrite existing file |
 | `--no-move` | Don't move processed files (watch folder mode only) |
 
-**Supported formats**: PDF, PNG, JPG, JPEG, GIF, WEBP
+**Supported formats**: PDF, DOCX, PNG, JPG, JPEG, GIF, WEBP
 
 ### Clean: Remove translations and annotations
 

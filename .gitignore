@@ -15,3 +15,8 @@ wheels/
 # Input/output data (not needed in git)
 inputs/
 outputs/
+
+# Working directories
+watch/
+processed/
+logs/

@@ -1,4 +1,4 @@
-"""Text extraction and vocabulary identification from PDFs and images."""
+"""Text extraction and vocabulary identification from PDFs, images, and Word documents."""
 
 import base64
 import logging
@@ -8,6 +8,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from docx import Document
 from openai import OpenAI
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
@@ -18,8 +19,9 @@ logger = logging.getLogger("ankigen.extractor")
 
 # Supported file extensions
 PDF_EXTENSIONS = {".pdf"}
+DOCX_EXTENSIONS = {".docx"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
-SUPPORTED_EXTENSIONS = PDF_EXTENSIONS | IMAGE_EXTENSIONS
+SUPPORTED_EXTENSIONS = PDF_EXTENSIONS | DOCX_EXTENSIONS | IMAGE_EXTENSIONS
 
 # Default directories
 DEFAULT_WATCH_DIR = "./watch"
@@ -116,6 +118,46 @@ def extract_text_from_pdf(path: Path) -> str:
     elapsed = time.time() - start_time
     logger.debug("PDF extraction completed in %.2fs", elapsed)
     logger.info("Extracted %d characters from %d pages", len(full_text), len(reader.pages))
+    return full_text
+
+
+def extract_text_from_docx(path: Path) -> str:
+    """
+    Extract text content from a Word document (.docx).
+
+    Args:
+        path: Path to the .docx file
+
+    Returns:
+        Extracted text content
+    """
+    try:
+        file_size = path.stat().st_size / 1024  # KB
+        logger.debug("Processing DOCX: %s (%.1f KB)", path.name, file_size)
+    except OSError:
+        logger.debug("Processing DOCX: %s", path.name)
+    logger.info("Extracting text from DOCX: %s", path.name)
+
+    start_time = time.time()
+    doc = Document(str(path))
+
+    # Extract text from paragraphs
+    text_parts: list[str] = []
+    for para in doc.paragraphs:
+        if para.text.strip():
+            text_parts.append(para.text)
+
+    # Also extract text from tables
+    for table in doc.tables:
+        for row in table.rows:
+            row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+            if row_text:
+                text_parts.append(row_text)
+
+    full_text = "\n".join(text_parts)
+    elapsed = time.time() - start_time
+    logger.debug("DOCX extraction completed in %.2fs", elapsed)
+    logger.info("Extracted %d characters from DOCX", len(full_text))
     return full_text
 
 
@@ -248,32 +290,35 @@ def get_file_type(path: Path) -> str:
     Determine the file type based on extension.
 
     Returns:
-        'pdf', 'image', or raises ValueError for unsupported types
+        'pdf', 'docx', 'image', or raises ValueError for unsupported types
     """
     suffix = path.suffix.lower()
     if suffix in PDF_EXTENSIONS:
         return "pdf"
+    elif suffix in DOCX_EXTENSIONS:
+        return "docx"
     elif suffix in IMAGE_EXTENSIONS:
         return "image"
     else:
         raise ValueError(
             f"Unsupported file type: {suffix}. "
             f"Supported: PDF ({', '.join(PDF_EXTENSIONS)}), "
+            f"Word ({', '.join(DOCX_EXTENSIONS)}), "
             f"Images ({', '.join(IMAGE_EXTENSIONS)})"
         )
 
 
 def extract_vocabulary_from_file(path: Path, lang: Language = "zh") -> list[str]:
     """
-    Extract vocabulary words from a PDF or image file.
+    Extract vocabulary words from a PDF, Word document, or image file.
 
     This is the main entry point that:
     1. Detects file type
-    2. Extracts text (PDF text extraction or OCR for images)
+    2. Extracts text (PDF/DOCX text extraction or OCR for images)
     3. Identifies vocabulary using LLM
 
     Args:
-        path: Path to the PDF or image file
+        path: Path to the PDF, DOCX, or image file
         lang: Language of the content
 
     Returns:
@@ -283,6 +328,8 @@ def extract_vocabulary_from_file(path: Path, lang: Language = "zh") -> list[str]
 
     if file_type == "pdf":
         text = extract_text_from_pdf(path)
+    elif file_type == "docx":
+        text = extract_text_from_docx(path)
     else:  # image
         text = extract_text_from_image(path, lang)
 

@@ -10,6 +10,7 @@ dependencies = [
     "openai>=2.9.0",
     "pycantonese>=3.4.0",
     "pypdf>=5.1.0",
+    "python-docx>=1.1.0",
     "python-dotenv>=1.2.1",
     "setuptools>=80.9.0",
 ]
@@ -67,5 +68,5 @@ warn_unused_ignores = false  # Different envs need different ignores (local vs p
 mypy_path = "src"
 
 [[tool.mypy.overrides]]
-module = ["pycantonese.*", "instructor.*", "pypdf.*"]
+module = ["pycantonese.*", "instructor.*", "pypdf.*", "docx.*"]
 ignore_missing_imports = true

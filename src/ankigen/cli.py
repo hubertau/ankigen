@@ -460,7 +460,7 @@ def main() -> None:
         type=Path,
         nargs="?",
         default=None,
-        help="Input PDF or image file (optional; if omitted, processes watch folder)",
+        help="Input file: PDF, DOCX, or image (optional; if omitted, processes watch folder)",
     )
     ext_parser.add_argument(
         "-o",
