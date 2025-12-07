@@ -29,10 +29,10 @@ cp .env.example .env
 
 ## Configuration
 
-Create a `.env` file with your LLM settings:
+Create a `.env` file with your settings:
 
 ```bash
-# Provider: openai, openrouter, or local
+# LLM Provider: openai, openrouter, or local
 LLM_PROVIDER=openrouter
 
 # API key
@@ -40,6 +40,20 @@ LLM_API_KEY=sk-or-...
 
 # Model name
 LLM_MODEL=google/gemini-2.0-flash-001
+
+# Watch folder settings (optional, have sensible defaults)
+ANKIGEN_WATCH_DIR=./watch           # Base watch folder (uses subfolders: watch/zh/, watch/ko/)
+ANKIGEN_WATCH_DIR_ZH=./watch/zh     # Override: Chinese watch folder
+ANKIGEN_WATCH_DIR_KO=./watch/ko     # Override: Korean watch folder
+ANKIGEN_OUTPUT_DIR=./inputs         # Base output directory for extracted vocab
+ANKIGEN_PROCESSED_DIR=./processed   # Base processed folder (uses subfolders)
+ANKIGEN_PROCESSED_DIR_ZH=./processed/zh  # Override: Chinese processed folder
+ANKIGEN_PROCESSED_DIR_KO=./processed/ko  # Override: Korean processed folder
+
+# Logging settings (optional)
+ANKIGEN_LOG_DIR=./logs              # Log directory (default: ./logs)
+ANKIGEN_LOG_LEVEL=DEBUG             # File log level (default: DEBUG)
+ANKIGEN_LOG_RETENTION=-1            # Days to keep logs (-1 = forever, default)
 ```
 
 ## Usage
@@ -93,6 +107,8 @@ ankigen generate words.txt -o my_vocab.csv
 
 Extract vocabulary words from documents using PDF text extraction or OCR (via GPT-4 Vision).
 
+**Single file mode**:
+
 ```bash
 # Extract from PDF
 ankigen extract textbook.pdf --lang zh -o inputs/zh/vocab.txt
@@ -107,14 +123,36 @@ ankigen extract page2.pdf --lang zh -o inputs/zh/vocab.txt --append
 ankigen extract new_doc.pdf --lang zh -o inputs/zh/vocab.txt --overwrite
 ```
 
+**Watch folder mode** (batch processing):
+
+When run without a file argument, processes all PDFs/images from the language-specific watch folder:
+
+```bash
+# Process all files in watch/zh/
+ankigen extract --lang zh
+
+# Process all files in watch/ko/
+ankigen extract --lang ko
+
+# Process without moving files to processed folder
+ankigen extract --lang zh --no-move
+```
+
+Watch folder behavior:
+1. Reads all PDF/image files from `{ANKIGEN_WATCH_DIR}/{lang}/` (e.g., `watch/zh/`)
+2. Extracts vocabulary and combines into `{ANKIGEN_OUTPUT_DIR}/{lang}/{YYYYMMDD}.txt`
+3. Moves processed files to `{ANKIGEN_PROCESSED_DIR}/{lang}/` (e.g., `processed/zh/`)
+4. Automatically deduplicates if output file already exists
+
 **Options**:
 
 | Option | Description |
 |--------|-------------|
-| `-o, --output FILE` | Output text file (default: inputs/{lang}/{input_stem}.txt) |
+| `-o, --output FILE` | Output text file (default: inputs/{lang}/{input_stem}.txt or {YYYYMMDD}.txt) |
 | `--lang {zh,ko}` | Language of the content (default: zh) |
 | `-a, --append` | Append to existing file (skips duplicates) |
 | `--overwrite` | Overwrite existing file |
+| `--no-move` | Don't move processed files (watch folder mode only) |
 
 **Supported formats**: PDF, PNG, JPG, JPEG, GIF, WEBP
 
@@ -149,16 +187,47 @@ ankigen clean inputs/ko/dirty.txt -o inputs/ko/clean.txt --lang ko
 | `--lang {zh,ko}` | Language (default: ko) |
 | `--overwrite` | Overwrite existing output file |
 
+### Status: Check configuration
+
+View your current configuration and verify all paths are set up correctly:
+
+```bash
+ankigen status
+```
+
+Shows watch folders, output folders, processed folders, and logging settings with a ✓ or ✗ for each path.
+
 ### Global Options
 
 | Option | Description |
 |--------|-------------|
-| `-v, --verbose` | Enable verbose output |
+| `-v, --verbose` | Enable verbose output (DEBUG to console) |
 | `-h, --help` | Show help message |
 
-## Workflow Example
+## Logging
 
-Complete workflow from document to Anki deck:
+ankigen automatically logs to daily files in the `logs/` directory:
+
+- **Console**: Clean INFO messages (or DEBUG with `-v`)
+- **File**: Detailed DEBUG logs with timestamps
+
+**Log files**: `logs/ankigen_YYYYMMDD.log` (e.g., `logs/ankigen_20251207.log`)
+
+**Example log output**:
+
+```
+2025-12-07 14:32:15 DEBUG [ankigen.extractor] Processing PDF: textbook.pdf (2.3 MB)
+2025-12-07 14:32:16 DEBUG [ankigen.extractor] Page 1: extracted 1,234 characters
+2025-12-07 14:32:17 DEBUG [ankigen.llm] Calling gpt-4o-mini for vocabulary identification
+2025-12-07 14:32:18 DEBUG [ankigen.llm] Vocabulary identification completed in 1.2s
+2025-12-07 14:32:18 INFO  [ankigen.extractor] Identified 15 vocabulary words
+```
+
+Set `ANKIGEN_LOG_RETENTION` to automatically clean up old logs (e.g., `30` for 30 days). Default is `-1` (keep forever).
+
+## Workflow Examples
+
+### Single file workflow
 
 ```bash
 # 1. Extract vocabulary from a textbook PDF
@@ -171,6 +240,32 @@ ankigen clean inputs/zh/chapter1.txt --lang zh
 ankigen generate inputs/zh/chapter1.txt
 
 # 4. Import outputs/zh/output_chapter1.csv into Anki
+```
+
+### Watch folder workflow (batch processing)
+
+Set up language-specific watch folders for ongoing vocabulary collection:
+
+```bash
+# 1. Create watch folders for each language
+mkdir -p watch/zh watch/ko
+
+# 2. Add files to the appropriate language folder
+cp chinese_textbook.pdf watch/zh/
+cp korean_vocabulary.png watch/ko/
+
+# 3. Process each language separately
+ankigen extract --lang zh
+ankigen extract --lang ko
+
+# 4. Files are moved to processed/zh/ and processed/ko/
+#    Vocabulary saved to inputs/zh/20251207.txt and inputs/ko/20251207.txt
+
+# 5. Generate Anki CSVs
+ankigen generate inputs/zh/20251207.txt
+ankigen generate inputs/ko/20251207.txt --lang ko
+
+# 6. Add more files to watch/{lang}/ and repeat daily
 ```
 
 ## Development
@@ -212,26 +307,34 @@ uv run mypy src/
 ankigen/
 ├── src/ankigen/
 │   ├── __init__.py
-│   ├── cli.py          # CLI entry point (generate, extract, clean)
-│   ├── cleaner.py      # Input file cleaning
-│   ├── extractor.py    # PDF/image extraction and OCR
-│   ├── formatter.py    # HTML sentence formatting
-│   ├── llm.py          # LLM client (OpenAI-compatible)
-│   └── models.py       # Pydantic response models
+│   ├── cli.py            # CLI entry point (generate, extract, clean)
+│   ├── cleaner.py        # Input file cleaning
+│   ├── extractor.py      # PDF/image extraction, OCR, and watch folder
+│   ├── formatter.py      # HTML sentence formatting
+│   ├── llm.py            # LLM client (OpenAI-compatible)
+│   ├── logging_config.py # Logging setup with file rotation
+│   └── models.py         # Pydantic response models
 ├── tests/
-│   ├── conftest.py     # Test fixtures
+│   ├── conftest.py       # Test fixtures
 │   ├── test_cleaner.py
 │   ├── test_extractor.py
 │   ├── test_formatter.py
 │   └── test_llm.py
-├── inputs/             # Word lists (gitignored)
+├── logs/                 # Daily log files (gitignored)
+├── watch/                # Watch folders for batch extraction (gitignored)
+│   ├── zh/               # Chinese documents to process
+│   └── ko/               # Korean documents to process
+├── processed/            # Processed files moved here (gitignored)
 │   ├── zh/
 │   └── ko/
-├── outputs/            # Generated CSVs (gitignored)
+├── inputs/               # Word lists (gitignored)
 │   ├── zh/
 │   └── ko/
-├── .env.example        # Environment template
-├── pyproject.toml      # Project configuration
+├── outputs/              # Generated CSVs (gitignored)
+│   ├── zh/
+│   └── ko/
+├── .env.example          # Environment template
+├── pyproject.toml        # Project configuration
 └── README.md
 ```
 

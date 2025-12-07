@@ -6,7 +6,7 @@ from pathlib import Path
 
 from ankigen.llm import Language
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("ankigen.cleaner")
 
 # Regex patterns for cleaning
 PATTERNS = {
@@ -91,19 +91,40 @@ def clean_vocabulary_file(input_path: Path, lang: Language) -> list[str]:
     Returns:
         List of cleaned vocabulary words
     """
-    logger.info("Cleaning vocabulary file: %s", input_path)
+    logger.info("Cleaning vocabulary file: %s", input_path.name)
+    logger.debug("Input path: %s, language: %s", input_path, lang)
 
     with open(input_path, encoding="utf-8") as f:
         lines = f.readlines()
 
+    logger.debug("Read %d lines from input file", len(lines))
+
     cleaned_words: list[str] = []
     seen: set[str] = set()
+    skipped_empty = 0
+    skipped_duplicate = 0
+    skipped_invalid = 0
 
     for line in lines:
         cleaned = clean_line(line, lang)
-        if cleaned and cleaned not in seen:
+        if cleaned is None:
+            if not line.strip():
+                skipped_empty += 1
+            else:
+                skipped_invalid += 1
+        elif cleaned in seen:
+            skipped_duplicate += 1
+        else:
             cleaned_words.append(cleaned)
             seen.add(cleaned)
+
+    logger.debug(
+        "Cleaning stats: %d valid, %d empty, %d invalid, %d duplicates",
+        len(cleaned_words),
+        skipped_empty,
+        skipped_invalid,
+        skipped_duplicate,
+    )
 
     removed_count = len(lines) - len(cleaned_words)
     if removed_count > 0:

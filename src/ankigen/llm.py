@@ -1,6 +1,8 @@
 """LLM client for generating sentences and translations."""
 
+import logging
 import os
+import time
 from typing import Literal
 
 import instructor
@@ -8,6 +10,8 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 from ankigen.models import TranslationResponse, create_sentence_response
+
+logger = logging.getLogger("ankigen.llm")
 
 # Load environment variables
 load_dotenv()
@@ -111,11 +115,15 @@ def generate_sentences(word: str, lang: Language = "zh", num_sentences: int = 3)
         List of example sentences
     """
     client = get_client()
+    model = get_model()
     config = LANGUAGE_CONFIG[lang]
     SentenceResponse = create_sentence_response(num_sentences)
 
+    logger.debug("Generating %d sentences for '%s' using %s", num_sentences, word, model)
+    start_time = time.time()
+
     response = client.chat.completions.create(
-        model=get_model(),
+        model=model,
         response_model=SentenceResponse,
         messages=[
             {
@@ -129,9 +137,12 @@ def generate_sentences(word: str, lang: Language = "zh", num_sentences: int = 3)
         ],
     )
 
+    elapsed = time.time() - start_time
     # instructor dynamically patches the return type based on response_model,
     # but mypy can't infer this at static analysis time
-    return response.sentences  # type: ignore[attr-defined,no-any-return]
+    sentences = response.sentences  # type: ignore[attr-defined]
+    logger.debug("Generated %d sentences in %.2fs", len(sentences), elapsed)
+    return sentences  # type: ignore[no-any-return]
 
 
 def translate_word(word: str, lang: Language = "zh") -> str:
@@ -146,10 +157,14 @@ def translate_word(word: str, lang: Language = "zh") -> str:
         English translation with part of speech
     """
     client = get_client()
+    model = get_model()
     config = LANGUAGE_CONFIG[lang]
 
+    logger.debug("Translating '%s' (%s) using %s", word, lang, model)
+    start_time = time.time()
+
     response = client.chat.completions.create(
-        model=get_model(),
+        model=model,
         response_model=TranslationResponse,
         messages=[
             {
@@ -163,6 +178,13 @@ def translate_word(word: str, lang: Language = "zh") -> str:
         ],
     )
 
+    elapsed = time.time() - start_time
     # instructor dynamically patches the return type based on response_model,
     # but mypy can't infer this at static analysis time
-    return response.translation  # type: ignore[no-any-return]
+    translation = response.translation  # type: ignore[attr-defined]
+    logger.debug(
+        "Translation completed in %.2fs: %s",
+        elapsed,
+        translation[:50] if len(translation) > 50 else translation,
+    )
+    return translation  # type: ignore[no-any-return]

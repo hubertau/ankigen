@@ -9,9 +9,12 @@ Usage:
 
     ankigen extract document.pdf --lang zh -o words.txt
     ankigen extract image.png --lang ko -o words.txt --append
+    ankigen extract --lang zh  # Process all files from watch folder
 
     ankigen clean inputs/ko/words.txt  # Clean a vocabulary file in-place
     ankigen clean inputs/ko/words.txt -o cleaned.txt  # Clean to new file
+
+    ankigen status  # Show configuration and health check
 """
 
 # Suppress pkg_resources deprecation warning from wordseg (pycantonese dependency).
@@ -25,15 +28,23 @@ import argparse
 import csv
 import logging
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from ankigen.cleaner import clean_and_write, clean_vocabulary_file
-from ankigen.extractor import extract_vocabulary_from_file
+from ankigen.extractor import (
+    extract_vocabulary_from_file,
+    get_output_dir,
+    get_processed_dir,
+    get_watch_dir,
+    process_watch_folder,
+)
 from ankigen.formatter import format_sentences
 from ankigen.llm import Language, generate_sentences, translate_word
+from ankigen.logging_config import get_log_dir, get_log_level, get_log_retention, setup_logging
 
 # Configure logging
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("ankigen.cli")
 
 
 def get_jyutping(word: str) -> str:
@@ -202,7 +213,32 @@ def cmd_generate(args: argparse.Namespace) -> None:
 
 def cmd_extract(args: argparse.Namespace) -> None:
     """Handle the 'extract' subcommand."""
-    # Validate input file
+    # Watch folder mode: no input file specified
+    if args.input_file is None:
+        watch_dir = get_watch_dir(args.lang)
+        logger.info("Processing watch folder: %s", watch_dir)
+
+        if not watch_dir.exists():
+            logger.error(
+                "Watch folder does not exist: %s\n"
+                "Create it or set ANKIGEN_WATCH_DIR_%s in your .env file.",
+                watch_dir,
+                args.lang.upper(),
+            )
+            sys.exit(1)
+
+        output_path, num_files = process_watch_folder(
+            lang=args.lang,
+            move_processed=not args.no_move,
+        )
+
+        if num_files == 0:
+            logger.info("No files to process in watch folder")
+        elif output_path:
+            logger.info("Processed %d files, output: %s", num_files, output_path)
+        return
+
+    # Single file mode: validate input file
     if not args.input_file.exists():
         logger.error("Input file not found: %s", args.input_file)
         sys.exit(1)
@@ -288,6 +324,75 @@ def cmd_clean(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def cmd_status(args: argparse.Namespace) -> None:
+    """Handle the 'status' subcommand - show configuration health check."""
+    print("=" * 60)
+    print("ANKIGEN CONFIGURATION STATUS")
+    print("=" * 60)
+
+    # Check watch folders
+    print("\n📁 WATCH FOLDERS (where to put files for extraction):")
+    for lang in ["zh", "ko"]:
+        path = get_watch_dir(lang)
+        status = "✓" if path.exists() else "✗ (not created)"
+        print(f"   {lang}: {path} {status}")
+
+    # Check output folder
+    print("\n📤 OUTPUT FOLDERS (where extracted vocabulary goes):")
+    output_base = get_output_dir()
+    for lang in ["zh", "ko"]:
+        path = output_base / lang
+        status = "✓" if path.exists() else "(will be created)"
+        print(f"   {lang}: {path} {status}")
+
+    # Check processed folders
+    print("\n📦 PROCESSED FOLDERS (where files move after extraction):")
+    for lang in ["zh", "ko"]:
+        path = get_processed_dir(lang)
+        status = "✓" if path.exists() else "(will be created)"
+        print(f"   {lang}: {path} {status}")
+
+    # Check log folder
+    print("\n📋 LOGGING:")
+    log_dir = get_log_dir()
+    status = "✓" if log_dir.exists() else "(will be created)"
+    print(f"   Directory: {log_dir} {status}")
+    level = get_log_level()
+    level_name = {10: "DEBUG", 20: "INFO", 30: "WARNING", 40: "ERROR"}.get(level, str(level))
+    print(f"   Level: {level_name}")
+    retention = get_log_retention()
+    print(f"   Retention: {'forever' if retention < 0 else f'{retention} days'}")
+
+    # Show example flow
+    print("\n" + "=" * 60)
+    print("EXAMPLE WORKFLOW")
+    print("=" * 60)
+    today = datetime.now().strftime("%Y%m%d")
+    zh_watch = get_watch_dir("zh")
+    zh_processed = get_processed_dir("zh")
+    output_dir = get_output_dir()
+
+    print(f"""
+1. Add a PDF/image to your watch folder:
+   cp document.pdf {zh_watch}/
+
+2. Run extraction:
+   ankigen extract --lang zh
+
+3. Vocabulary is extracted to:
+   {output_dir}/zh/{today}.txt
+
+4. Processed file is moved to:
+   {zh_processed}/document.pdf
+
+5. Generate Anki CSV:
+   ankigen generate {output_dir}/zh/{today}.txt
+
+6. Import into Anki:
+   outputs/zh/output_{today}.csv
+""")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate Anki vocabulary CSVs from word lists or extract vocabulary from documents",
@@ -345,19 +450,24 @@ def main() -> None:
     ext_parser = subparsers.add_parser(
         "extract",
         help="Extract vocabulary from PDF or image",
-        description="Extract vocabulary words from a PDF (text extraction) or image (OCR)",
+        description=(
+            "Extract vocabulary words from a PDF (text extraction) or image (OCR). "
+            "If no input file is specified, processes all files from the watch folder."
+        ),
     )
     ext_parser.add_argument(
         "input_file",
         type=Path,
-        help="Input PDF or image file (png/jpg/jpeg/gif/webp)",
+        nargs="?",
+        default=None,
+        help="Input PDF or image file (optional; if omitted, processes watch folder)",
     )
     ext_parser.add_argument(
         "-o",
         "--output",
         type=Path,
         default=None,
-        help="Output text file (default: inputs/{lang}/{input_stem}.txt)",
+        help="Output text file (default: inputs/{lang}/{input_stem}.txt or {YYYYMMDD}.txt for watch folder)",
     )
     ext_parser.add_argument(
         "--lang",
@@ -376,6 +486,11 @@ def main() -> None:
         "--overwrite",
         action="store_true",
         help="Overwrite existing output file",
+    )
+    ext_parser.add_argument(
+        "--no-move",
+        action="store_true",
+        help="Don't move processed files (watch folder mode only)",
     )
 
     # 'clean' subcommand
@@ -409,14 +524,17 @@ def main() -> None:
         help="Overwrite existing output file",
     )
 
+    # 'status' subcommand
+    subparsers.add_parser(
+        "status",
+        help="Show configuration status and health check",
+        description="Display current configuration, folder paths, and verify setup",
+    )
+
     args = parser.parse_args()
 
-    # Configure logging
-    log_level = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(
-        level=log_level,
-        format="%(message)s",
-    )
+    # Configure logging with file and console handlers
+    setup_logging(verbose=args.verbose)
 
     # Dispatch to subcommand handler
     if args.command == "generate":
@@ -425,6 +543,8 @@ def main() -> None:
         cmd_extract(args)
     elif args.command == "clean":
         cmd_clean(args)
+    elif args.command == "status":
+        cmd_status(args)
     else:
         parser.print_help()
         sys.exit(1)
