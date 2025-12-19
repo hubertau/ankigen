@@ -13,7 +13,14 @@ from openai import OpenAI
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
 
-from ankigen.llm import LANGUAGE_CONFIG, Language, get_client, get_model
+from ankigen.llm import (
+    LANGUAGE_CONFIG,
+    PROVIDER_CONFIG,
+    Language,
+    get_client,
+    get_model,
+    get_provider,
+)
 
 logger = logging.getLogger("ankigen.extractor")
 
@@ -196,15 +203,40 @@ def extract_text_from_image(path: Path, lang: Language = "zh") -> str:
     logger.debug("Image type: %s, base64 size: %d bytes", media_type, len(image_data))
 
     # Use raw OpenAI client for vision (instructor doesn't support vision well)
+    # But respect the provider configuration (e.g., OpenRouter)
+    provider = get_provider()
+    config = PROVIDER_CONFIG[provider]
+    base_url = os.getenv("LLM_BASE_URL") or config["base_url"]
     api_key = os.getenv("LLM_API_KEY", "")
-    client = OpenAI(api_key=api_key)
+
+    # Build headers for OpenRouter if needed
+    default_headers = {}
+    if provider == "openrouter" or "openrouter.ai" in base_url:
+        site_url = os.getenv("OPENROUTER_SITE_URL")
+        app_name = os.getenv("OPENROUTER_APP_NAME")
+        if site_url:
+            default_headers["HTTP-Referer"] = site_url
+        if app_name:
+            default_headers["X-Title"] = app_name
+
+    client = OpenAI(
+        base_url=base_url,
+        api_key=api_key,
+        default_headers=default_headers if default_headers else None,
+    )
 
     lang_name = LANGUAGE_CONFIG[lang]["name"]
-    logger.debug("Calling GPT-4 Vision for %s OCR", lang_name)
+
+    # Use configured model, with vision-capable fallback
+    # OpenRouter needs provider prefix (e.g., "openai/gpt-4o")
+    model = os.getenv("LLM_VISION_MODEL") or (
+        "openai/gpt-4o" if provider == "openrouter" else "gpt-4o"
+    )
+    logger.debug("Calling %s for %s OCR via %s", model, lang_name, provider)
 
     start_time = time.time()
     response = client.chat.completions.create(
-        model="gpt-4o",  # GPT-4 Vision model
+        model=model,
         messages=[
             {
                 "role": "system",
