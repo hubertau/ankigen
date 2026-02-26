@@ -31,6 +31,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from ankigen.anki_db import get_anki_db_path, get_anki_deck_name, load_anki_words
 from ankigen.cleaner import clean_and_write, clean_vocabulary_file
 from ankigen.extractor import (
     extract_vocabulary_from_file,
@@ -192,6 +193,50 @@ def generate_csv(
     logger.info("Output written to %s", output_file)
 
 
+def _add_anki_args(parser: argparse.ArgumentParser) -> None:
+    """Add --anki-db and --anki-deck flags to a subcommand parser."""
+    parser.add_argument(
+        "--anki-db",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Path to Anki database (.anki2 or .apkg) for filtering already-known words. "
+        "Overrides ANKIGEN_ANKI_DB env var.",
+    )
+    parser.add_argument(
+        "--anki-deck",
+        type=str,
+        default=None,
+        metavar="DECK",
+        help="Anki deck name to check for existing words (e.g. 'Chinese::Vocab'). "
+        "Overrides ANKIGEN_ANKI_DECK_{LANG} env var.",
+    )
+
+
+def _resolve_anki_words(args: argparse.Namespace, lang: Language) -> set[str]:
+    """
+    Load the set of words already in Anki for the given language.
+
+    Reads db path from --anki-db flag (or ANKIGEN_ANKI_DB env var) and deck name
+    from --anki-deck flag (or ANKIGEN_ANKI_DECK_{LANG} env var).
+    Returns an empty set if either value is not configured.
+    """
+    db_path: Path | None = args.anki_db or get_anki_db_path()
+    if not db_path:
+        return set()
+
+    deck_name: str | None = args.anki_deck or get_anki_deck_name(lang)
+    if not deck_name:
+        logger.warning(
+            "--anki-db provided but no deck name configured. "
+            "Use --anki-deck or set ANKIGEN_ANKI_DECK_%s in your .env file.",
+            lang.upper(),
+        )
+        return set()
+
+    return load_anki_words(db_path, deck_name)
+
+
 def cmd_generate(args: argparse.Namespace) -> None:
     """Handle the 'generate' subcommand."""
     # Validate input file
@@ -227,9 +272,11 @@ def cmd_extract(args: argparse.Namespace) -> None:
             )
             sys.exit(1)
 
+        exclude_words = _resolve_anki_words(args, args.lang)
         output_path, num_files = process_watch_folder(
             lang=args.lang,
             move_processed=not args.no_move,
+            exclude_words=exclude_words or None,
         )
 
         if num_files == 0:
@@ -267,6 +314,15 @@ def cmd_extract(args: argparse.Namespace) -> None:
         return
 
     logger.info("Extracted %d vocabulary words", len(words))
+
+    # Filter out words already in Anki
+    exclude_words = _resolve_anki_words(args, args.lang)
+    if exclude_words:
+        before = len(words)
+        words = [w for w in words if w not in exclude_words]
+        skipped = before - len(words)
+        if skipped:
+            logger.info("Skipped %d words already present in Anki", skipped)
 
     # Ensure output directory exists
     output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -312,12 +368,15 @@ def cmd_clean(args: argparse.Namespace) -> None:
         output_file = args.input_file
         overwrite = True  # Always overwrite when cleaning in-place
 
+    exclude_words = _resolve_anki_words(args, args.lang)
+
     try:
         clean_and_write(
             input_path=args.input_file,
             output_path=output_file,
             lang=args.lang,
             overwrite=overwrite,
+            exclude_words=exclude_words or None,
         )
     except FileExistsError as e:
         logger.error(str(e))
@@ -492,6 +551,7 @@ def main() -> None:
         action="store_true",
         help="Don't move processed files (watch folder mode only)",
     )
+    _add_anki_args(ext_parser)
 
     # 'clean' subcommand
     clean_parser = subparsers.add_parser(
@@ -523,6 +583,7 @@ def main() -> None:
         action="store_true",
         help="Overwrite existing output file",
     )
+    _add_anki_args(clean_parser)
 
     # 'status' subcommand
     subparsers.add_parser(
