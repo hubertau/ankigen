@@ -31,7 +31,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from ankigen.anki_db import get_anki_db_path, get_anki_deck_name, get_anki_field_index, load_anki_words
+from ankigen.anki_db import get_anki_db_path, get_anki_deck_name, get_anki_field, load_anki_words
 from ankigen.cleaner import clean_and_write, clean_vocabulary_file
 from ankigen.extractor import (
     extract_vocabulary_from_file,
@@ -213,11 +213,12 @@ def _add_anki_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--anki-field",
-        type=int,
+        type=str,
         default=None,
-        metavar="N",
-        help="0-based index of the note field containing the word to match against "
-        "(default: 0, the first field). Overrides ANKIGEN_ANKI_FIELD_{LANG} env var.",
+        metavar="FIELD",
+        help="Which note field contains the vocabulary word — either a 0-based integer "
+        "index (e.g. 0) or a field name (e.g. 'Hanzi'). "
+        "Overrides ANKIGEN_ANKI_FIELD_{LANG} env var.",
     )
 
 
@@ -242,8 +243,16 @@ def _resolve_anki_words(args: argparse.Namespace, lang: Language) -> set[str]:
         )
         return set()
 
-    field_index: int = args.anki_field if args.anki_field is not None else get_anki_field_index(lang)
-    return load_anki_words(db_path, deck_name, field_index=field_index)
+    # Resolve field: CLI flag (str) → try int, fall back to str; else use env/default
+    raw_field: str | None = args.anki_field
+    if raw_field is not None:
+        try:
+            field: int | str = int(raw_field)
+        except ValueError:
+            field = raw_field  # treat as field name
+    else:
+        field = get_anki_field(lang)
+    return load_anki_words(db_path, deck_name, field=field)
 
 
 def cmd_generate(args: argparse.Namespace) -> None:

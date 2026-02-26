@@ -9,16 +9,20 @@ from pathlib import Path
 import pytest
 
 from ankigen.anki_db import (
+    _build_model_field_map,
     _get_deck_id,
     _get_words_from_deck,
     get_anki_db_path,
     get_anki_deck_name,
-    get_anki_field_index,
+    get_anki_field,
     load_anki_words,
 )
 
 # ASCII unit separator used by Anki between fields
 FIELD_SEP = chr(31)
+
+# Model id used by all test helpers — must match the `mid` value in notes rows
+_MODEL_ID = 1
 
 
 # ---------------------------------------------------------------------------
@@ -26,8 +30,31 @@ FIELD_SEP = chr(31)
 # ---------------------------------------------------------------------------
 
 
-def _make_old_schema_db(path: Path, deck_name: str, words: list[str]) -> None:
-    """Create an old-schema (.anki2 schema ≤18) SQLite database."""
+def _make_old_schema_db(
+    path: Path,
+    deck_name: str,
+    words: list[str],
+    field_names: list[str] | None = None,
+) -> None:
+    """
+    Create an old-schema (.anki2 schema ≤18) SQLite database.
+
+    Args:
+        field_names: Names for the note type fields in order (default: ["word", "translation"]).
+                     The first field value is populated from `words`; remaining fields
+                     receive a placeholder equal to the field name.
+    """
+    if field_names is None:
+        field_names = ["word", "translation"]
+
+    models_json = json.dumps({
+        str(_MODEL_ID): {
+            "id": _MODEL_ID,
+            "name": "Basic",
+            "flds": [{"name": n, "ord": i} for i, n in enumerate(field_names)],
+        }
+    })
+
     conn = sqlite3.connect(str(path))
     conn.executescript("""
         CREATE TABLE col (
@@ -85,15 +112,17 @@ def _make_old_schema_db(path: Path, deck_name: str, words: list[str]) -> None:
         str(deck_id): {"id": deck_id, "name": deck_name, "conf": 1, "extendNew": 0}
     })
     conn.execute(
-        "INSERT INTO col VALUES (1,0,0,0,11,0,0,0,'{}','{}',?,'{}',' ')",
-        (decks_json,),
+        "INSERT INTO col VALUES (1,0,0,0,11,0,0,0,'{}',?,?,'{}',' ')",
+        (models_json, decks_json),
     )
 
     for i, word in enumerate(words, start=1):
-        flds = FIELD_SEP.join([word, "translation"])
+        # First field = the word; remaining fields = field name as placeholder
+        field_values = [word] + list(field_names[1:])
+        flds = FIELD_SEP.join(field_values)
         conn.execute(
-            "INSERT INTO notes VALUES (?,?,1,0,0,'',?,0,0,0,'')",
-            (i, f"guid{i}", flds),
+            "INSERT INTO notes VALUES (?,?,?,0,0,'',?,0,0,0,'')",
+            (i, f"guid{i}", _MODEL_ID, flds),
         )
         conn.execute(
             "INSERT INTO cards VALUES (?,?,?,0,0,0,0,0,0,0,0,0,0,0,0,0,0,'')",
@@ -104,8 +133,22 @@ def _make_old_schema_db(path: Path, deck_name: str, words: list[str]) -> None:
     conn.close()
 
 
-def _make_new_schema_db(path: Path, deck_name: str, words: list[str]) -> None:
-    """Create a new-schema (schema 21+) SQLite database with a standalone decks table."""
+def _make_new_schema_db(
+    path: Path,
+    deck_name: str,
+    words: list[str],
+    field_names: list[str] | None = None,
+) -> None:
+    """
+    Create a new-schema (schema 21+) SQLite database with standalone decks/fields tables.
+
+    Args:
+        field_names: Names for the note type fields in order
+                     (default: ["word", "translation", "extra"]).
+    """
+    if field_names is None:
+        field_names = ["word", "translation", "extra"]
+
     conn = sqlite3.connect(str(path))
     conn.executescript("""
         CREATE TABLE decks (
@@ -115,6 +158,12 @@ def _make_new_schema_db(path: Path, deck_name: str, words: list[str]) -> None:
             usn INTEGER NOT NULL,
             common BLOB NOT NULL,
             kind BLOB NOT NULL
+        );
+        CREATE TABLE fields (
+            ntid INTEGER NOT NULL,
+            ord INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            config BLOB NOT NULL
         );
         CREATE TABLE notes (
             id INTEGER NOT NULL PRIMARY KEY,
@@ -157,11 +206,18 @@ def _make_new_schema_db(path: Path, deck_name: str, words: list[str]) -> None:
         (deck_id, deck_name),
     )
 
-    for i, word in enumerate(words, start=1):
-        flds = FIELD_SEP.join([word, "translation", "extra"])
+    for ord_, name in enumerate(field_names):
         conn.execute(
-            "INSERT INTO notes VALUES (?,?,1,0,0,'',?,0,0,0,'')",
-            (i, f"guid{i}", flds),
+            "INSERT INTO fields VALUES (?,?,?,'')",
+            (_MODEL_ID, ord_, name),
+        )
+
+    for i, word in enumerate(words, start=1):
+        field_values = [word] + list(field_names[1:])
+        flds = FIELD_SEP.join(field_values)
+        conn.execute(
+            "INSERT INTO notes VALUES (?,?,?,0,0,'',?,0,0,0,'')",
+            (i, f"guid{i}", _MODEL_ID, flds),
         )
         conn.execute(
             "INSERT INTO cards VALUES (?,?,?,0,0,0,0,0,0,0,0,0,0,0,0,0,0,'')",
@@ -212,13 +268,55 @@ class TestGetDeckId:
         assert deck_id is None
 
 
+class TestBuildModelFieldMap:
+    def test_old_schema_finds_field(self, tmp_path):
+        db_path = tmp_path / "col.anki2"
+        _make_old_schema_db(db_path, "Chinese", ["促使"], field_names=["Hanzi", "Jyutping", "English"])
+        conn = sqlite3.connect(str(db_path))
+        result = _build_model_field_map(conn, "Hanzi")
+        conn.close()
+        assert result == {_MODEL_ID: 0}
+
+    def test_old_schema_finds_non_first_field(self, tmp_path):
+        db_path = tmp_path / "col.anki2"
+        _make_old_schema_db(db_path, "Chinese", ["促使"], field_names=["Hanzi", "Jyutping", "English"])
+        conn = sqlite3.connect(str(db_path))
+        result = _build_model_field_map(conn, "English")
+        conn.close()
+        assert result == {_MODEL_ID: 2}
+
+    def test_new_schema_finds_field(self, tmp_path):
+        db_path = tmp_path / "col.anki2"
+        _make_new_schema_db(db_path, "Korean", ["편한"], field_names=["Korean", "English", "Notes"])
+        conn = sqlite3.connect(str(db_path))
+        result = _build_model_field_map(conn, "Korean")
+        conn.close()
+        assert result == {_MODEL_ID: 0}
+
+    def test_new_schema_finds_non_first_field(self, tmp_path):
+        db_path = tmp_path / "col.anki2"
+        _make_new_schema_db(db_path, "Korean", ["편한"], field_names=["Korean", "English", "Notes"])
+        conn = sqlite3.connect(str(db_path))
+        result = _build_model_field_map(conn, "English")
+        conn.close()
+        assert result == {_MODEL_ID: 1}
+
+    def test_unknown_field_returns_empty(self, tmp_path):
+        db_path = tmp_path / "col.anki2"
+        _make_old_schema_db(db_path, "Chinese", ["促使"], field_names=["Hanzi", "English"])
+        conn = sqlite3.connect(str(db_path))
+        result = _build_model_field_map(conn, "NonExistent")
+        conn.close()
+        assert result == {}
+
+
 class TestGetWordsFromDeck:
     def test_extracts_first_field(self, tmp_path):
         words = ["促使", "归纳", "披露"]
         db_path = tmp_path / "col.anki2"
         _make_old_schema_db(db_path, "Chinese", words)
         conn = sqlite3.connect(str(db_path))
-        result = _get_words_from_deck(conn, 1001, field_index=0)
+        result = _get_words_from_deck(conn, 1001, field=0)
         conn.close()
         assert result == set(words)
 
@@ -227,16 +325,52 @@ class TestGetWordsFromDeck:
         db_path = tmp_path / "col.anki2"
         _make_old_schema_db(db_path, "Chinese", words)
         conn = sqlite3.connect(str(db_path))
-        # Field 1 is always "translation" in our test helper
-        result = _get_words_from_deck(conn, 1001, field_index=1)
+        # Field 1 is the field name ("translation") used as placeholder in helper
+        result = _get_words_from_deck(conn, 1001, field=1)
         conn.close()
         assert result == {"translation"}
+
+    def test_extracts_by_field_name_old_schema(self, tmp_path):
+        words = ["促使", "归纳"]
+        db_path = tmp_path / "col.anki2"
+        _make_old_schema_db(db_path, "Chinese", words, field_names=["Hanzi", "Jyutping"])
+        conn = sqlite3.connect(str(db_path))
+        result = _get_words_from_deck(conn, 1001, field="Hanzi")
+        conn.close()
+        assert result == set(words)
+
+    def test_extracts_non_first_field_by_name(self, tmp_path):
+        words = ["促使", "归纳"]
+        db_path = tmp_path / "col.anki2"
+        _make_old_schema_db(db_path, "Chinese", words, field_names=["Hanzi", "Jyutping"])
+        conn = sqlite3.connect(str(db_path))
+        # Field "Jyutping" is at index 1, populated with "Jyutping" as placeholder
+        result = _get_words_from_deck(conn, 1001, field="Jyutping")
+        conn.close()
+        assert result == {"Jyutping"}
+
+    def test_extracts_by_field_name_new_schema(self, tmp_path):
+        words = ["편한", "추천"]
+        db_path = tmp_path / "col.anki2"
+        _make_new_schema_db(db_path, "Korean", words, field_names=["Korean", "English"])
+        conn = sqlite3.connect(str(db_path))
+        result = _get_words_from_deck(conn, 2001, field="Korean")
+        conn.close()
+        assert result == set(words)
+
+    def test_unknown_field_name_returns_empty(self, tmp_path):
+        db_path = tmp_path / "col.anki2"
+        _make_old_schema_db(db_path, "Chinese", ["促使"], field_names=["Hanzi", "English"])
+        conn = sqlite3.connect(str(db_path))
+        result = _get_words_from_deck(conn, 1001, field="NonExistent")
+        conn.close()
+        assert result == set()
 
     def test_empty_deck(self, tmp_path):
         db_path = tmp_path / "col.anki2"
         _make_old_schema_db(db_path, "EmptyDeck", [])
         conn = sqlite3.connect(str(db_path))
-        result = _get_words_from_deck(conn, 1001, field_index=0)
+        result = _get_words_from_deck(conn, 1001, field=0)
         conn.close()
         assert result == set()
 
@@ -279,13 +413,34 @@ class TestLoadAnkiWords:
         result = load_anki_words(bad_path, "Deck")
         assert result == set()
 
-    def test_field_index_one(self, tmp_path):
+    def test_field_int_index(self, tmp_path):
         words = ["促使", "归纳"]
         db_path = tmp_path / "collection.anki2"
         _make_old_schema_db(db_path, "Chinese", words)
         # Field index 1 is the "translation" placeholder in our helper
-        result = load_anki_words(db_path, "Chinese", field_index=1)
+        result = load_anki_words(db_path, "Chinese", field=1)
         assert result == {"translation"}
+
+    def test_field_name_old_schema(self, tmp_path):
+        words = ["促使", "归纳"]
+        db_path = tmp_path / "collection.anki2"
+        _make_old_schema_db(db_path, "Chinese", words, field_names=["Hanzi", "Jyutping"])
+        result = load_anki_words(db_path, "Chinese", field="Hanzi")
+        assert result == set(words)
+
+    def test_field_name_new_schema(self, tmp_path):
+        words = ["편한", "추천"]
+        db_path = tmp_path / "collection.anki2"
+        _make_new_schema_db(db_path, "Korean", words, field_names=["Korean", "English"])
+        result = load_anki_words(db_path, "Korean", field="Korean")
+        assert result == set(words)
+
+    def test_field_name_non_first_field(self, tmp_path):
+        words = ["促使", "归纳"]
+        db_path = tmp_path / "collection.anki2"
+        _make_old_schema_db(db_path, "Chinese", words, field_names=["Hanzi", "English"])
+        result = load_anki_words(db_path, "Chinese", field="English")
+        assert result == {"English"}
 
     def test_anki21_extension(self, tmp_path):
         words = ["促使"]
@@ -317,18 +472,22 @@ class TestEnvHelpers:
         monkeypatch.delenv("ANKIGEN_ANKI_DECK_ZH", raising=False)
         assert get_anki_deck_name("zh") is None
 
-    def test_get_anki_field_index_default(self, monkeypatch):
+    def test_get_anki_field_default(self, monkeypatch):
         monkeypatch.delenv("ANKIGEN_ANKI_FIELD_ZH", raising=False)
-        assert get_anki_field_index("zh") == 0
+        assert get_anki_field("zh") == 0
 
-    def test_get_anki_field_index_set(self, monkeypatch):
+    def test_get_anki_field_integer_string(self, monkeypatch):
         monkeypatch.setenv("ANKIGEN_ANKI_FIELD_ZH", "2")
-        assert get_anki_field_index("zh") == 2
+        assert get_anki_field("zh") == 2
 
-    def test_get_anki_field_index_invalid_falls_back_to_zero(self, monkeypatch):
-        monkeypatch.setenv("ANKIGEN_ANKI_FIELD_ZH", "notanumber")
-        assert get_anki_field_index("zh") == 0
+    def test_get_anki_field_returns_str_for_field_name(self, monkeypatch):
+        monkeypatch.setenv("ANKIGEN_ANKI_FIELD_ZH", "Hanzi")
+        assert get_anki_field("zh") == "Hanzi"
 
-    def test_get_anki_field_index_negative_falls_back_to_zero(self, monkeypatch):
+    def test_get_anki_field_returns_str_for_any_non_numeric(self, monkeypatch):
+        monkeypatch.setenv("ANKIGEN_ANKI_FIELD_KO", "Korean")
+        assert get_anki_field("ko") == "Korean"
+
+    def test_get_anki_field_negative_falls_back_to_zero(self, monkeypatch):
         monkeypatch.setenv("ANKIGEN_ANKI_FIELD_KO", "-1")
-        assert get_anki_field_index("ko") == 0
+        assert get_anki_field("ko") == 0

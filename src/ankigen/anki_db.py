@@ -31,12 +31,18 @@ def get_anki_deck_name(lang: Language) -> str | None:
     return value if value else None
 
 
-def get_anki_field_index(lang: Language) -> int:
+def get_anki_field(lang: Language) -> int | str:
     """
     Read ANKIGEN_ANKI_FIELD_{LANG} from environment.
 
-    Returns the 0-based index of the note field containing the vocabulary word.
-    Defaults to 0 (first field) if not set.
+    Returns:
+        int: if the value is a non-negative integer string, or if unset (defaults to 0)
+        str: if the value is non-numeric — treated as a field name to look up in
+             the Anki note type schema (e.g. "Hanzi", "Korean", "Front")
+
+    Examples in .env:
+        ANKIGEN_ANKI_FIELD_ZH=0        # first field by position
+        ANKIGEN_ANKI_FIELD_ZH=Hanzi    # field named "Hanzi"
     """
     key = f"ANKIGEN_ANKI_FIELD_{lang.upper()}"
     value = os.environ.get(key, "").strip()
@@ -44,39 +50,36 @@ def get_anki_field_index(lang: Language) -> int:
         return 0
     try:
         index = int(value)
+        if index < 0:
+            logger.warning("Field index for %s is negative (%d); using 0.", key, index)
+            return 0
+        return index
     except ValueError:
-        logger.warning(
-            "Invalid value for %s: %r — must be an integer. Using 0.",
-            key,
-            value,
-        )
-        return 0
-    if index < 0:
-        logger.warning("Field index for %s is negative (%d); using 0.", key, index)
-        return 0
-    return index
+        return value  # treat as a field name
 
 
 def load_anki_words(
     db_path: Path,
     deck_name: str,
-    field_index: int = 0,
+    field: int | str = 0,
 ) -> set[str]:
     """
     Load words from a specific Anki deck.
 
     Supports both .anki2 (direct SQLite) and .apkg (zip containing SQLite).
-    Returns the set of field values at `field_index` for all notes in `deck_name`.
-    If the file is missing or the deck is not found, logs a warning and returns an
-    empty set so the calling pipeline can continue unaffected.
 
     Args:
         db_path: Path to .anki2 or .apkg file
         deck_name: Name of the Anki deck to read (e.g. "Chinese::Vocab")
-        field_index: Index of the note field to extract (0 = first/front field)
+        field: Which note field to extract — either a 0-based integer index or a
+               field name string (e.g. "Hanzi"). Field names are resolved from the
+               Anki note type schema stored in the database; notes whose note type
+               does not contain the named field are skipped gracefully.
 
     Returns:
-        Set of word strings from the specified deck
+        Set of word strings from the specified deck and field.
+        Returns an empty set (with a warning) if the file is missing, the extension
+        is unsupported, or the named deck is not found.
     """
     db_path = Path(db_path).expanduser()
 
@@ -86,9 +89,9 @@ def load_anki_words(
 
     suffix = db_path.suffix.lower()
     if suffix == ".apkg":
-        return _load_from_apkg(db_path, deck_name, field_index)
+        return _load_from_apkg(db_path, deck_name, field)
     elif suffix in (".anki2", ".anki21"):
-        return _load_from_anki2(db_path, deck_name, field_index)
+        return _load_from_anki2(db_path, deck_name, field)
     else:
         logger.warning(
             "Unrecognised Anki file extension '%s' for %s — expected .anki2 or .apkg",
@@ -103,7 +106,7 @@ def load_anki_words(
 # ---------------------------------------------------------------------------
 
 
-def _load_from_anki2(db_path: Path, deck_name: str, field_index: int) -> set[str]:
+def _load_from_anki2(db_path: Path, deck_name: str, field: int | str) -> set[str]:
     """Open a .anki2/.anki21 SQLite file and extract words."""
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -112,12 +115,12 @@ def _load_from_anki2(db_path: Path, deck_name: str, field_index: int) -> set[str
         return set()
 
     try:
-        return _extract_words(conn, deck_name, field_index)
+        return _extract_words(conn, deck_name, field)
     finally:
         conn.close()
 
 
-def _load_from_apkg(apkg_path: Path, deck_name: str, field_index: int) -> set[str]:
+def _load_from_apkg(apkg_path: Path, deck_name: str, field: int | str) -> set[str]:
     """Extract the embedded SQLite from a .apkg zip and read words from it."""
     try:
         with zipfile.ZipFile(apkg_path, "r") as zf:
@@ -147,11 +150,11 @@ def _load_from_apkg(apkg_path: Path, deck_name: str, field_index: int) -> set[st
             logger.warning("Failed to extract %s from %s: %s", inner_name, apkg_path, exc)
             return set()
 
-        return _load_from_anki2(tmp_path, deck_name, field_index)
+        return _load_from_anki2(tmp_path, deck_name, field)
 
 
 def _extract_words(
-    conn: sqlite3.Connection, deck_name: str, field_index: int
+    conn: sqlite3.Connection, deck_name: str, field: int | str
 ) -> set[str]:
     """Core logic: find deck ID, then pull words from notes in that deck."""
     deck_id = _get_deck_id(conn, deck_name)
@@ -159,12 +162,12 @@ def _extract_words(
         logger.warning("Deck '%s' not found in Anki database", deck_name)
         return set()
 
-    words = _get_words_from_deck(conn, deck_id, field_index)
+    words = _get_words_from_deck(conn, deck_id, field)
     logger.info(
-        "Loaded %d words from Anki deck '%s' (field index %d)",
+        "Loaded %d words from Anki deck '%s' (field: %r)",
         len(words),
         deck_name,
-        field_index,
+        field,
     )
     return words
 
@@ -204,16 +207,96 @@ def _get_deck_id(conn: sqlite3.Connection, deck_name: str) -> int | None:
     return None
 
 
+def _build_model_field_map(conn: sqlite3.Connection, field_name: str) -> dict[int, int]:
+    """
+    Build a mapping of note-type-id -> field-index for the given field name.
+
+    Anki stores note type (model) definitions in two places depending on schema:
+    - Old schema (≤18): col.models JSON — dict of {mid: {"flds": [{"name":..., "ord":...}]}}
+    - New schema (21+): standalone `fields` table — columns (ntid, ord, name, ...)
+
+    Tries the old schema first, then falls back to the new schema's `fields` table.
+    Returns an empty dict if the field name is not found in any note type.
+    """
+    result: dict[int, int] = {}
+
+    # Old schema: col.models JSON
+    try:
+        cursor = conn.execute("SELECT models FROM col LIMIT 1")
+        row = cursor.fetchone()
+        if row:
+            models_json: dict = json.loads(row[0])
+            for mid_str, model in models_json.items():
+                if not isinstance(model, dict):
+                    continue
+                for fld in model.get("flds", []):
+                    if fld.get("name") == field_name:
+                        result[int(mid_str)] = int(fld["ord"])
+                        break
+            if result:
+                return result
+    except (sqlite3.OperationalError, json.JSONDecodeError, KeyError, TypeError):
+        pass
+
+    # New schema: standalone fields table (ntid, ord, name, ...)
+    try:
+        cursor = conn.execute(
+            "SELECT ntid, ord FROM fields WHERE name = ?",
+            (field_name,),
+        )
+        for ntid, ord_ in cursor:
+            result[int(ntid)] = int(ord_)
+    except sqlite3.OperationalError:
+        pass
+
+    return result
+
+
 def _get_words_from_deck(
-    conn: sqlite3.Connection, deck_id: int, field_index: int
+    conn: sqlite3.Connection, deck_id: int, field: int | str
 ) -> set[str]:
     """
-    Return the set of words at `field_index` for all notes whose cards are in `deck_id`.
+    Return the set of words at the specified field for all notes in `deck_id`.
+
+    When `field` is an int, it is used directly as a 0-based field index.
+    When `field` is a str, it is treated as a field name and resolved per note type
+    via `_build_model_field_map`. Notes whose note type does not contain the named
+    field are skipped gracefully.
     """
+    if isinstance(field, int):
+        try:
+            cursor = conn.execute(
+                """
+                SELECT DISTINCT n.flds
+                FROM notes n
+                JOIN cards c ON c.nid = n.id
+                WHERE c.did = ?
+                """,
+                (deck_id,),
+            )
+        except sqlite3.OperationalError as exc:
+            logger.warning("Error querying Anki notes: %s", exc)
+            return set()
+
+        words: set[str] = set()
+        for (flds,) in cursor:
+            fields_list = flds.split(_FIELD_SEP)
+            if field < len(fields_list):
+                word = fields_list[field].strip()
+                if word:
+                    words.add(word)
+        return words
+
+    # Field name path
+    model_field_map = _build_model_field_map(conn, field)
+    if not model_field_map:
+        logger.warning("Field name %r not found in any note type", field)
+        return set()
+
     try:
         cursor = conn.execute(
             """
-            SELECT DISTINCT n.flds
+            SELECT n.mid, n.flds
             FROM notes n
             JOIN cards c ON c.nid = n.id
             WHERE c.did = ?
@@ -224,12 +307,23 @@ def _get_words_from_deck(
         logger.warning("Error querying Anki notes: %s", exc)
         return set()
 
-    words: set[str] = set()
-    for (flds,) in cursor:
-        fields = flds.split(_FIELD_SEP)
-        if field_index < len(fields):
-            word = fields[field_index].strip()
+    words = set()
+    skipped_models: set[int] = set()
+    for mid, flds in cursor:
+        field_idx = model_field_map.get(mid)
+        if field_idx is None:
+            skipped_models.add(mid)
+            continue
+        fields_list = flds.split(_FIELD_SEP)
+        if field_idx < len(fields_list):
+            word = fields_list[field_idx].strip()
             if word:
                 words.add(word)
 
+    if skipped_models:
+        logger.debug(
+            "%d note type(s) in this deck don't have field %r — those notes skipped",
+            len(skipped_models),
+            field,
+        )
     return words
