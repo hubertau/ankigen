@@ -31,7 +31,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from ankigen.anki_db import get_anki_db_path, get_anki_deck_name, load_anki_words
+from ankigen.anki_db import get_anki_db_path, get_anki_deck_name, get_anki_field_index, load_anki_words
 from ankigen.cleaner import clean_and_write, clean_vocabulary_file
 from ankigen.extractor import (
     extract_vocabulary_from_file,
@@ -194,7 +194,7 @@ def generate_csv(
 
 
 def _add_anki_args(parser: argparse.ArgumentParser) -> None:
-    """Add --anki-db and --anki-deck flags to a subcommand parser."""
+    """Add --anki-db, --anki-deck, and --anki-field flags to a subcommand parser."""
     parser.add_argument(
         "--anki-db",
         type=Path,
@@ -211,15 +211,23 @@ def _add_anki_args(parser: argparse.ArgumentParser) -> None:
         help="Anki deck name to check for existing words (e.g. 'Chinese::Vocab'). "
         "Overrides ANKIGEN_ANKI_DECK_{LANG} env var.",
     )
+    parser.add_argument(
+        "--anki-field",
+        type=int,
+        default=None,
+        metavar="N",
+        help="0-based index of the note field containing the word to match against "
+        "(default: 0, the first field). Overrides ANKIGEN_ANKI_FIELD_{LANG} env var.",
+    )
 
 
 def _resolve_anki_words(args: argparse.Namespace, lang: Language) -> set[str]:
     """
     Load the set of words already in Anki for the given language.
 
-    Reads db path from --anki-db flag (or ANKIGEN_ANKI_DB env var) and deck name
-    from --anki-deck flag (or ANKIGEN_ANKI_DECK_{LANG} env var).
-    Returns an empty set if either value is not configured.
+    Reads db path from --anki-db (or ANKIGEN_ANKI_DB), deck name from --anki-deck
+    (or ANKIGEN_ANKI_DECK_{LANG}), and field index from --anki-field (or
+    ANKIGEN_ANKI_FIELD_{LANG}).  Returns an empty set if db or deck is not configured.
     """
     db_path: Path | None = args.anki_db or get_anki_db_path()
     if not db_path:
@@ -234,7 +242,8 @@ def _resolve_anki_words(args: argparse.Namespace, lang: Language) -> set[str]:
         )
         return set()
 
-    return load_anki_words(db_path, deck_name)
+    field_index: int = args.anki_field if args.anki_field is not None else get_anki_field_index(lang)
+    return load_anki_words(db_path, deck_name, field_index=field_index)
 
 
 def cmd_generate(args: argparse.Namespace) -> None:

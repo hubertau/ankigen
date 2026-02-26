@@ -31,6 +31,32 @@ def get_anki_deck_name(lang: Language) -> str | None:
     return value if value else None
 
 
+def get_anki_field_index(lang: Language) -> int:
+    """
+    Read ANKIGEN_ANKI_FIELD_{LANG} from environment.
+
+    Returns the 0-based index of the note field containing the vocabulary word.
+    Defaults to 0 (first field) if not set.
+    """
+    key = f"ANKIGEN_ANKI_FIELD_{lang.upper()}"
+    value = os.environ.get(key, "").strip()
+    if not value:
+        return 0
+    try:
+        index = int(value)
+    except ValueError:
+        logger.warning(
+            "Invalid value for %s: %r — must be an integer. Using 0.",
+            key,
+            value,
+        )
+        return 0
+    if index < 0:
+        logger.warning("Field index for %s is negative (%d); using 0.", key, index)
+        return 0
+    return index
+
+
 def load_anki_words(
     db_path: Path,
     deck_name: str,

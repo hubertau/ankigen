@@ -13,6 +13,7 @@ from ankigen.anki_db import (
     _get_words_from_deck,
     get_anki_db_path,
     get_anki_deck_name,
+    get_anki_field_index,
     load_anki_words,
 )
 
@@ -315,3 +316,19 @@ class TestEnvHelpers:
     def test_get_anki_deck_name_unset(self, monkeypatch):
         monkeypatch.delenv("ANKIGEN_ANKI_DECK_ZH", raising=False)
         assert get_anki_deck_name("zh") is None
+
+    def test_get_anki_field_index_default(self, monkeypatch):
+        monkeypatch.delenv("ANKIGEN_ANKI_FIELD_ZH", raising=False)
+        assert get_anki_field_index("zh") == 0
+
+    def test_get_anki_field_index_set(self, monkeypatch):
+        monkeypatch.setenv("ANKIGEN_ANKI_FIELD_ZH", "2")
+        assert get_anki_field_index("zh") == 2
+
+    def test_get_anki_field_index_invalid_falls_back_to_zero(self, monkeypatch):
+        monkeypatch.setenv("ANKIGEN_ANKI_FIELD_ZH", "notanumber")
+        assert get_anki_field_index("zh") == 0
+
+    def test_get_anki_field_index_negative_falls_back_to_zero(self, monkeypatch):
+        monkeypatch.setenv("ANKIGEN_ANKI_FIELD_KO", "-1")
+        assert get_anki_field_index("ko") == 0
