@@ -64,13 +64,14 @@ def load_anki_words(
     field: int | str = 0,
 ) -> set[str]:
     """
-    Load words from a specific Anki deck.
+    Load words from a specific Anki deck (including all sub-decks).
 
     Supports both .anki2 (direct SQLite) and .apkg (zip containing SQLite).
 
     Args:
         db_path: Path to .anki2 or .apkg file
-        deck_name: Name of the Anki deck to read (e.g. "Chinese::Vocab")
+        deck_name: Name of the Anki deck to read (e.g. "Chinese::Vocab").
+                   Cards in sub-decks (e.g. "Chinese::Vocab::HSK1") are included.
         field: Which note field to extract — either a 0-based integer index or a
                field name string (e.g. "Hanzi"). Field names are resolved from the
                Anki note type schema stored in the database; notes whose note type
@@ -122,32 +123,25 @@ def _load_from_anki2(db_path: Path, deck_name: str, field: int | str) -> set[str
 
 def _load_from_apkg(apkg_path: Path, deck_name: str, field: int | str) -> set[str]:
     """Extract the embedded SQLite from a .apkg zip and read words from it."""
-    try:
-        with zipfile.ZipFile(apkg_path, "r") as zf:
-            names = zf.namelist()
-    except (zipfile.BadZipFile, OSError) as exc:
-        logger.warning("Could not open .apkg file %s: %s", apkg_path, exc)
-        return set()
-
-    # Prefer newer .anki21 format, fall back to .anki2
-    if "collection.anki21" in names:
-        inner_name = "collection.anki21"
-    elif "collection.anki2" in names:
-        inner_name = "collection.anki2"
-    else:
-        logger.warning(
-            "No collection.anki2 or collection.anki21 found inside %s", apkg_path
-        )
-        return set()
-
     with tempfile.TemporaryDirectory() as tmp_dir:
-        tmp_path = Path(tmp_dir) / inner_name
         try:
             with zipfile.ZipFile(apkg_path, "r") as zf:
+                names = zf.namelist()
+                if "collection.anki21" in names:
+                    inner_name = "collection.anki21"
+                elif "collection.anki2" in names:
+                    inner_name = "collection.anki2"
+                else:
+                    logger.warning(
+                        "No collection.anki2 or collection.anki21 found inside %s",
+                        apkg_path,
+                    )
+                    return set()
+                tmp_path = Path(tmp_dir) / inner_name
                 with zf.open(inner_name) as src, open(tmp_path, "wb") as dst:
                     dst.write(src.read())
         except (zipfile.BadZipFile, KeyError, OSError) as exc:
-            logger.warning("Failed to extract %s from %s: %s", inner_name, apkg_path, exc)
+            logger.warning("Could not read .apkg file %s: %s", apkg_path, exc)
             return set()
 
         return _load_from_anki2(tmp_path, deck_name, field)
@@ -156,55 +150,67 @@ def _load_from_apkg(apkg_path: Path, deck_name: str, field: int | str) -> set[st
 def _extract_words(
     conn: sqlite3.Connection, deck_name: str, field: int | str
 ) -> set[str]:
-    """Core logic: find deck ID, then pull words from notes in that deck."""
-    deck_id = _get_deck_id(conn, deck_name)
-    if deck_id is None:
+    """Core logic: find deck IDs (including sub-decks), then pull words from notes."""
+    deck_ids = _get_deck_ids(conn, deck_name)
+    if not deck_ids:
         logger.warning("Deck '%s' not found in Anki database", deck_name)
         return set()
 
-    words = _get_words_from_deck(conn, deck_id, field)
+    num_decks = len(deck_ids)
+    words = _get_words_from_deck(conn, deck_ids, field)
+    sub_info = f" (+{num_decks - 1} sub-deck(s))" if num_decks > 1 else ""
     logger.info(
-        "Loaded %d words from Anki deck '%s' (field: %r)",
+        "Loaded %d words from Anki deck '%s'%s (field: %r)",
         len(words),
         deck_name,
+        sub_info,
         field,
     )
     return words
 
 
-def _get_deck_id(conn: sqlite3.Connection, deck_name: str) -> int | None:
+def _get_deck_ids(conn: sqlite3.Connection, deck_name: str) -> set[int]:
     """
-    Find the integer deck ID for a named deck.
+    Return the deck ID for `deck_name` and all its sub-decks.
 
-    Handles two Anki schema variants:
-    - Old (schema ≤ 18): deck metadata is stored as JSON in col.decks
-    - New (schema 21+): decks are stored in a standalone `decks` table
+    A sub-deck is any deck whose name starts with ``deck_name + "::"``
+    (Anki's hierarchy separator). For example, querying "Chinese" will also
+    include cards in "Chinese::Vocabulary" and "Chinese::Vocabulary::HSK1".
+
+    Handles both old schema (col.decks JSON) and new schema (decks table).
+    Returns an empty set if no matching deck is found.
     """
-    # Try new schema first (Anki 2.1.50+): standalone decks table
+    ids: set[int] = set()
+    prefix = deck_name + "::"
+
+    # New schema first (Anki 2.1.50+): standalone decks table
     try:
-        cursor = conn.execute("SELECT id FROM decks WHERE name = ?", (deck_name,))
-        row = cursor.fetchone()
-        if row is not None:
-            return int(row[0])
-        # Deck table exists but name not found — still might be old schema exported
-        # as new format. Fall through to JSON check.
+        cursor = conn.execute("SELECT id, name FROM decks")
+        for did, name in cursor:
+            if name == deck_name or name.startswith(prefix):
+                ids.add(int(did))
+        if ids:
+            return ids
+        # Table exists but no match — fall through to JSON check in case data
+        # lives in both places (some exported files have both).
     except sqlite3.OperationalError:
-        pass  # Table doesn't exist — old schema
+        pass  # Old schema — no decks table
 
-    # Old schema: col.decks is a JSON dict of {deck_id_str: {name: str, ...}}
+    # Old schema: col.decks is a JSON dict of {id_str: {name: str, ...}}
     try:
         cursor = conn.execute("SELECT decks FROM col LIMIT 1")
         row = cursor.fetchone()
-        if row is None:
-            return None
-        decks_json: dict = json.loads(row[0])
-        for deck_id_str, deck_info in decks_json.items():
-            if isinstance(deck_info, dict) and deck_info.get("name") == deck_name:
-                return int(deck_id_str)
+        if row:
+            decks_json: dict = json.loads(row[0])
+            for did_str, info in decks_json.items():
+                if isinstance(info, dict):
+                    name = info.get("name", "")
+                    if name == deck_name or name.startswith(prefix):
+                        ids.add(int(did_str))
     except (sqlite3.OperationalError, json.JSONDecodeError, KeyError):
         pass
 
-    return None
+    return ids
 
 
 def _build_model_field_map(conn: sqlite3.Connection, field_name: str) -> dict[int, int]:
@@ -253,26 +259,33 @@ def _build_model_field_map(conn: sqlite3.Connection, field_name: str) -> dict[in
 
 
 def _get_words_from_deck(
-    conn: sqlite3.Connection, deck_id: int, field: int | str
+    conn: sqlite3.Connection, deck_ids: set[int], field: int | str
 ) -> set[str]:
     """
-    Return the set of words at the specified field for all notes in `deck_id`.
+    Return the set of words at the specified field for all notes in `deck_ids`.
 
+    `deck_ids` is a set of deck IDs (the named deck plus any sub-decks).
     When `field` is an int, it is used directly as a 0-based field index.
     When `field` is a str, it is treated as a field name and resolved per note type
     via `_build_model_field_map`. Notes whose note type does not contain the named
     field are skipped gracefully.
     """
+    if not deck_ids:
+        return set()
+
+    placeholders = ",".join("?" * len(deck_ids))
+    params = tuple(deck_ids)
+
     if isinstance(field, int):
         try:
             cursor = conn.execute(
-                """
+                f"""
                 SELECT DISTINCT n.flds
                 FROM notes n
                 JOIN cards c ON c.nid = n.id
-                WHERE c.did = ?
+                WHERE c.did IN ({placeholders})
                 """,
-                (deck_id,),
+                params,
             )
         except sqlite3.OperationalError as exc:
             logger.warning("Error querying Anki notes: %s", exc)
@@ -295,13 +308,13 @@ def _get_words_from_deck(
 
     try:
         cursor = conn.execute(
-            """
+            f"""
             SELECT n.mid, n.flds
             FROM notes n
             JOIN cards c ON c.nid = n.id
-            WHERE c.did = ?
+            WHERE c.did IN ({placeholders})
             """,
-            (deck_id,),
+            params,
         )
     except sqlite3.OperationalError as exc:
         logger.warning("Error querying Anki notes: %s", exc)

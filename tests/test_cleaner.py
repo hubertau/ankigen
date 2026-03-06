@@ -136,3 +136,39 @@ class TestCleanVocabularyFile:
         result = clean_vocabulary_file(input_file, "zh")
 
         assert result == ["投资理财", "惆怅", "一去不复返", "百感交集"]
+
+    def test_exclude_words_filters_anki_words(self, tmp_path):
+        """Words in exclude_words set are removed from the result."""
+        input_file = tmp_path / "words.txt"
+        input_file.write_text("안녕\n감사합니다\n잘 자요\n", encoding="utf-8")
+
+        result = clean_vocabulary_file(input_file, "ko", exclude_words={"안녕", "잘 자요"})
+
+        assert result == ["감사합니다"]
+
+    def test_exclude_words_none_no_filtering(self, tmp_path):
+        """Passing exclude_words=None returns all valid words unchanged."""
+        input_file = tmp_path / "words.txt"
+        input_file.write_text("안녕\n감사합니다\n", encoding="utf-8")
+
+        result = clean_vocabulary_file(input_file, "ko", exclude_words=None)
+
+        assert result == ["안녕", "감사합니다"]
+
+    def test_exclude_words_empty_set_no_filtering(self, tmp_path):
+        """Passing an empty exclude_words set returns all valid words unchanged."""
+        input_file = tmp_path / "words.txt"
+        input_file.write_text("안녕\n감사합니다\n", encoding="utf-8")
+
+        result = clean_vocabulary_file(input_file, "ko", exclude_words=set())
+
+        assert result == ["안녕", "감사합니다"]
+
+    def test_exclude_words_all_filtered_returns_empty(self, tmp_path):
+        """If all words are excluded, an empty list is returned."""
+        input_file = tmp_path / "words.txt"
+        input_file.write_text("안녕\n감사합니다\n", encoding="utf-8")
+
+        result = clean_vocabulary_file(input_file, "ko", exclude_words={"안녕", "감사합니다"})
+
+        assert result == []

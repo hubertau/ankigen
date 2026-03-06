@@ -165,6 +165,7 @@ def clean_and_write(
         output_path: Path to output file (None = overwrite input)
         lang: Target language code
         overwrite: If True, overwrite existing output file
+        exclude_words: Optional set of words to exclude (e.g. already in Anki)
 
     Returns:
         Path to the output file
