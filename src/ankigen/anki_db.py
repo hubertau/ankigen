@@ -5,8 +5,10 @@ import logging
 import os
 import sqlite3
 import tempfile
+import unicodedata
 import zipfile
 from pathlib import Path
+from typing import Any
 
 from ankigen.llm import Language
 
@@ -14,6 +16,11 @@ logger = logging.getLogger("ankigen.anki_db")
 
 # ASCII unit separator used by Anki to separate fields within a note
 _FIELD_SEP = chr(31)
+
+
+def normalize_anki_term(s: str) -> str:
+    """Normalize a string for comparison with words loaded from Anki (NFC + strip)."""
+    return unicodedata.normalize("NFC", s.strip())
 
 
 def get_anki_db_path() -> Path | None:
@@ -78,11 +85,15 @@ def load_anki_words(
                does not contain the named field are skipped gracefully.
 
     Returns:
-        Set of word strings from the specified deck and field.
+        Set of NFC-normalized word strings from the specified deck and field.
         Returns an empty set (with a warning) if the file is missing, the extension
         is unsupported, or the named deck is not found.
     """
     db_path = Path(db_path).expanduser()
+
+    if isinstance(field, int) and field < 0:
+        logger.warning("Field index is negative (%d); using 0.", field)
+        field = 0
 
     if not db_path.exists():
         logger.warning("Anki database not found: %s — skipping Anki filtering", db_path)
@@ -147,9 +158,7 @@ def _load_from_apkg(apkg_path: Path, deck_name: str, field: int | str) -> set[st
         return _load_from_anki2(tmp_path, deck_name, field)
 
 
-def _extract_words(
-    conn: sqlite3.Connection, deck_name: str, field: int | str
-) -> set[str]:
+def _extract_words(conn: sqlite3.Connection, deck_name: str, field: int | str) -> set[str]:
     """Core logic: find deck IDs (including sub-decks), then pull words from notes."""
     deck_ids = _get_deck_ids(conn, deck_name)
     if not deck_ids:
@@ -201,7 +210,7 @@ def _get_deck_ids(conn: sqlite3.Connection, deck_name: str) -> set[int]:
         cursor = conn.execute("SELECT decks FROM col LIMIT 1")
         row = cursor.fetchone()
         if row:
-            decks_json: dict = json.loads(row[0])
+            decks_json: dict[str, Any] = json.loads(row[0])
             for did_str, info in decks_json.items():
                 if isinstance(info, dict):
                     name = info.get("name", "")
@@ -231,7 +240,7 @@ def _build_model_field_map(conn: sqlite3.Connection, field_name: str) -> dict[in
         cursor = conn.execute("SELECT models FROM col LIMIT 1")
         row = cursor.fetchone()
         if row:
-            models_json: dict = json.loads(row[0])
+            models_json: dict[str, Any] = json.loads(row[0])
             for mid_str, model in models_json.items():
                 if not isinstance(model, dict):
                     continue
@@ -244,14 +253,15 @@ def _build_model_field_map(conn: sqlite3.Connection, field_name: str) -> dict[in
     except (sqlite3.OperationalError, json.JSONDecodeError, KeyError, TypeError):
         pass
 
-    # New schema: standalone fields table (ntid, ord, name, ...)
+    # New schema: standalone fields table (ntid, ord, name, ...).
+    # Anki uses a custom "unicase" collation on `name`; Python's sqlite3 does not
+    # register it, so `WHERE name = ?` raises OperationalError. Scan and match
+    # in Python instead.
     try:
-        cursor = conn.execute(
-            "SELECT ntid, ord FROM fields WHERE name = ?",
-            (field_name,),
-        )
-        for ntid, ord_ in cursor:
-            result[int(ntid)] = int(ord_)
+        cursor = conn.execute("SELECT ntid, ord, name FROM fields")
+        for ntid, ord_, fname in cursor:
+            if fname == field_name:
+                result[int(ntid)] = int(ord_)
     except sqlite3.OperationalError:
         pass
 
@@ -295,9 +305,11 @@ def _get_words_from_deck(
         for (flds,) in cursor:
             fields_list = flds.split(_FIELD_SEP)
             if field < len(fields_list):
-                word = fields_list[field].strip()
-                if word:
-                    words.add(word)
+                raw = fields_list[field].strip()
+                if raw:
+                    norm = normalize_anki_term(raw)
+                    if norm:
+                        words.add(norm)
         return words
 
     # Field name path
@@ -329,9 +341,11 @@ def _get_words_from_deck(
             continue
         fields_list = flds.split(_FIELD_SEP)
         if field_idx < len(fields_list):
-            word = fields_list[field_idx].strip()
-            if word:
-                words.add(word)
+            raw = fields_list[field_idx].strip()
+            if raw:
+                norm = normalize_anki_term(raw)
+                if norm:
+                    words.add(norm)
 
     if skipped_models:
         logger.debug(

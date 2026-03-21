@@ -4,6 +4,7 @@ import logging
 import re
 from pathlib import Path
 
+from ankigen.anki_db import normalize_anki_term
 from ankigen.llm import Language
 
 logger = logging.getLogger("ankigen.cleaner")
@@ -141,7 +142,7 @@ def clean_vocabulary_file(
 
     if exclude_words:
         before = len(cleaned_words)
-        cleaned_words = [w for w in cleaned_words if w not in exclude_words]
+        cleaned_words = [w for w in cleaned_words if normalize_anki_term(w) not in exclude_words]
         skipped_anki = before - len(cleaned_words)
         if skipped_anki:
             logger.info("Skipped %d words already present in Anki", skipped_anki)

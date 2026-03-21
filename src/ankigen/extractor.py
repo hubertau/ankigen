@@ -13,6 +13,7 @@ from openai import OpenAI
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
 
+from ankigen.anki_db import normalize_anki_term
 from ankigen.llm import (
     LANGUAGE_CONFIG,
     PROVIDER_CONFIG,
@@ -463,7 +464,7 @@ def process_watch_folder(
 
     if exclude_words:
         before = len(unique_words)
-        unique_words = [w for w in unique_words if w not in exclude_words]
+        unique_words = [w for w in unique_words if normalize_anki_term(w) not in exclude_words]
         skipped = before - len(unique_words)
         if skipped:
             logger.info(

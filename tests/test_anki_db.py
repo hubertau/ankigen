@@ -1,12 +1,12 @@
 """Tests for the anki_db module."""
 
 import json
+import logging
 import sqlite3
 import tempfile
+import unicodedata
 import zipfile
 from pathlib import Path
-
-import pytest
 
 from ankigen.anki_db import (
     _build_model_field_map,
@@ -16,6 +16,7 @@ from ankigen.anki_db import (
     get_anki_deck_name,
     get_anki_field,
     load_anki_words,
+    normalize_anki_term,
 )
 
 # ASCII unit separator used by Anki between fields
@@ -50,13 +51,15 @@ def _make_old_schema_db(
     if field_names is None:
         field_names = ["word", "translation"]
 
-    models_json = json.dumps({
-        str(_MODEL_ID): {
-            "id": _MODEL_ID,
-            "name": "Basic",
-            "flds": [{"name": n, "ord": i} for i, n in enumerate(field_names)],
+    models_json = json.dumps(
+        {
+            str(_MODEL_ID): {
+                "id": _MODEL_ID,
+                "name": "Basic",
+                "flds": [{"name": n, "ord": i} for i, n in enumerate(field_names)],
+            }
         }
-    })
+    )
 
     conn = sqlite3.connect(str(path))
     conn.executescript("""
@@ -319,7 +322,10 @@ class TestGetDeckIds:
             db_path,
             "Chinese",
             ["促使"],
-            extra_decks=[(1002, "Chinese::Vocabulary", ["归纳"]), (1003, "Chinese::Vocabulary::HSK1", ["披露"])],
+            extra_decks=[
+                (1002, "Chinese::Vocabulary", ["归纳"]),
+                (1003, "Chinese::Vocabulary::HSK1", ["披露"]),
+            ],
         )
         conn = sqlite3.connect(str(db_path))
         deck_ids = _get_deck_ids(conn, "Chinese")
@@ -356,7 +362,9 @@ class TestGetDeckIds:
 class TestBuildModelFieldMap:
     def test_old_schema_finds_field(self, tmp_path):
         db_path = tmp_path / "col.anki2"
-        _make_old_schema_db(db_path, "Chinese", ["促使"], field_names=["Hanzi", "Jyutping", "English"])
+        _make_old_schema_db(
+            db_path, "Chinese", ["促使"], field_names=["Hanzi", "Jyutping", "English"]
+        )
         conn = sqlite3.connect(str(db_path))
         result = _build_model_field_map(conn, "Hanzi")
         conn.close()
@@ -364,7 +372,9 @@ class TestBuildModelFieldMap:
 
     def test_old_schema_finds_non_first_field(self, tmp_path):
         db_path = tmp_path / "col.anki2"
-        _make_old_schema_db(db_path, "Chinese", ["促使"], field_names=["Hanzi", "Jyutping", "English"])
+        _make_old_schema_db(
+            db_path, "Chinese", ["促使"], field_names=["Hanzi", "Jyutping", "English"]
+        )
         conn = sqlite3.connect(str(db_path))
         result = _build_model_field_map(conn, "English")
         conn.close()
@@ -466,7 +476,10 @@ class TestGetWordsFromDeck:
             db_path,
             "Chinese",
             ["促使"],
-            extra_decks=[(1002, "Chinese::Vocabulary", ["归纳"]), (1003, "Chinese::Vocabulary::HSK1", ["披露"])],
+            extra_decks=[
+                (1002, "Chinese::Vocabulary", ["归纳"]),
+                (1003, "Chinese::Vocabulary::HSK1", ["披露"]),
+            ],
         )
         conn = sqlite3.connect(str(db_path))
         result = _get_words_from_deck(conn, {1001, 1002, 1003}, field=0)
@@ -638,3 +651,30 @@ class TestEnvHelpers:
     def test_get_anki_field_negative_falls_back_to_zero(self, monkeypatch):
         monkeypatch.setenv("ANKIGEN_ANKI_FIELD_KO", "-1")
         assert get_anki_field("ko") == 0
+
+
+class TestNormalizeAnkiTerm:
+    def test_combining_latin_unifies_with_precomposed(self):
+        assert normalize_anki_term("e\u0301") == normalize_anki_term("\u00e9")
+
+    def test_strips_surrounding_whitespace(self):
+        assert normalize_anki_term("  abc  ") == "abc"
+
+
+class TestLoadAnkiWordsFieldClampAndNfc:
+    def test_negative_field_index_clamped_like_zero(self, tmp_path, caplog):
+        words = ["促使"]
+        db_path = tmp_path / "collection.anki2"
+        _make_old_schema_db(db_path, "Chinese", words)
+        caplog.set_level(logging.WARNING)
+        result_neg = load_anki_words(db_path, "Chinese", field=-1)
+        result_zero = load_anki_words(db_path, "Chinese", field=0)
+        assert result_neg == result_zero == set(words)
+        assert "negative" in caplog.text.lower()
+
+    def test_note_field_nfd_normalized_to_nfc(self, tmp_path):
+        nfd_ga = unicodedata.normalize("NFD", "\uac00")
+        db_path = tmp_path / "collection.anki2"
+        _make_new_schema_db(db_path, "Korean", [nfd_ga], field_names=["Korean", "English"])
+        result = load_anki_words(db_path, "Korean", field="Korean")
+        assert result == {"\uac00"}

@@ -54,7 +54,24 @@ ANKIGEN_PROCESSED_DIR_KO=./processed/ko  # Override: Korean processed folder
 ANKIGEN_LOG_DIR=./logs              # Log directory (default: ./logs)
 ANKIGEN_LOG_LEVEL=DEBUG             # File log level (default: DEBUG)
 ANKIGEN_LOG_RETENTION=-1            # Days to keep logs (-1 = forever, default)
+
+# Anki filtering (optional — skip words already in a deck)
+# ANKIGEN_ANKI_DB=~/Library/Application Support/Anki2/User 1/collection.anki2
+# ANKIGEN_ANKI_DECK_ZH=Chinese::Vocabulary
+# ANKIGEN_ANKI_DECK_KO=Korean::Vocabulary
+# ANKIGEN_ANKI_FIELD_ZH=Hanzi   # or 0 for first field
+# ANKIGEN_ANKI_FIELD_KO=Korean
 ```
+
+### Anki database filtering (optional)
+
+When `ANKIGEN_ANKI_DB` and `ANKIGEN_ANKI_DECK_{LANG}` are set, **extract**, **clean**, and **generate** skip vocabulary that already appears in the chosen deck (including sub-decks). Words are compared using **Unicode NFC** normalization so equivalent composed/decomposed strings still match.
+
+**Live collection warning:** Reading `collection.anki2` while Anki is running often fails or flakes because of SQLite locking. Prefer quitting Anki first, or point `ANKIGEN_ANKI_DB` at an exported **`.apkg`** (or a copy of the collection) for reliable reads.
+
+CLI overrides (same flags on `generate`, `extract`, and `clean`): `--anki-db PATH`, `--anki-deck NAME`, `--anki-field INDEX_OR_NAME`.
+
+Run `ankigen status` to see resolved Anki-related paths and whether the database file exists.
 
 ## Usage
 
@@ -86,6 +103,9 @@ ankigen generate inputs/zh/words.txt
 | `--lang {zh,ko}` | Language: Chinese or Korean (default: zh) |
 | `-n, --sentences N` | Number of sentences per word (default: 3, 0 to skip) |
 | `-c, --clean` | Clean input before processing (removes translations, romanization) |
+| `--anki-db PATH` | Anki collection (`.anki2` / `.apkg`); overrides `ANKIGEN_ANKI_DB` |
+| `--anki-deck NAME` | Deck to scan (e.g. `Chinese::Vocab`); overrides env |
+| `--anki-field ARG` | Field index (e.g. `0`) or field name (e.g. `Hanzi`); overrides env |
 
 **Examples**:
 
@@ -153,6 +173,7 @@ Watch folder behavior:
 | `-a, --append` | Append to existing file (skips duplicates) |
 | `--overwrite` | Overwrite existing file |
 | `--no-move` | Don't move processed files (watch folder mode only) |
+| `--anki-db`, `--anki-deck`, `--anki-field` | Skip words already in Anki (see [Anki database filtering](#anki-database-filtering-optional)) |
 
 **Supported formats**: PDF, DOCX, PNG, JPG, JPEG, GIF, WEBP
 
@@ -186,10 +207,11 @@ ankigen clean inputs/ko/dirty.txt -o inputs/ko/clean.txt --lang ko
 | `-o, --output FILE` | Output file (default: overwrite input in-place) |
 | `--lang {zh,ko}` | Language (default: ko) |
 | `--overwrite` | Overwrite existing output file |
+| `--anki-db`, `--anki-deck`, `--anki-field` | Skip words already in Anki (see [Anki database filtering](#anki-database-filtering-optional)) |
 
 ### Status: Check configuration
 
-View your current configuration and verify all paths are set up correctly:
+View your current configuration, optional Anki filtering env vars, and verify paths exist:
 
 ```bash
 ankigen status

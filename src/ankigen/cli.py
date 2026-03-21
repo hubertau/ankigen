@@ -27,11 +27,18 @@ warnings.filterwarnings("ignore", message="pkg_resources is deprecated")
 import argparse
 import csv
 import logging
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
 
-from ankigen.anki_db import get_anki_db_path, get_anki_deck_name, get_anki_field, load_anki_words
+from ankigen.anki_db import (
+    get_anki_db_path,
+    get_anki_deck_name,
+    get_anki_field,
+    load_anki_words,
+    normalize_anki_term,
+)
 from ankigen.cleaner import clean_and_write, clean_vocabulary_file
 from ankigen.extractor import (
     extract_vocabulary_from_file,
@@ -46,6 +53,9 @@ from ankigen.logging_config import get_log_dir, get_log_level, get_log_retention
 
 # Configure logging
 logger = logging.getLogger("ankigen.cli")
+
+# Languages shown in `status` (typed for mypy vs get_anki_deck_name / get_anki_field)
+_STATUS_LANG_CODES: tuple[Language, Language] = ("zh", "ko")
 
 
 def get_jyutping(word: str) -> str:
@@ -154,6 +164,7 @@ def generate_csv(
     num_sentences: int,
     *,
     clean_input: bool = False,
+    exclude_words: set[str] | None = None,
 ) -> None:
     """
     Generate the output CSV from a word list.
@@ -164,12 +175,19 @@ def generate_csv(
         lang: Language code ('zh' or 'ko')
         num_sentences: Number of sentences to generate per word (0 to skip)
         clean_input: If True, clean the input before processing
+        exclude_words: Optional NFC-normalized terms to skip (e.g. from Anki)
     """
     if clean_input:
         logger.info("Cleaning input file before processing...")
-        words = clean_vocabulary_file(input_file, lang)
+        words = clean_vocabulary_file(input_file, lang, exclude_words=exclude_words)
     else:
         words = read_words(input_file)
+        if exclude_words:
+            before = len(words)
+            words = [w for w in words if normalize_anki_term(w) not in exclude_words]
+            skipped = before - len(words)
+            if skipped:
+                logger.info("Skipped %d words already present in Anki", skipped)
 
     logger.info("Found %d words in %s", len(words), input_file)
 
@@ -265,12 +283,14 @@ def cmd_generate(args: argparse.Namespace) -> None:
     # Determine output path
     output_file = get_output_path(args.input_file, args.lang, args.output)
 
+    exclude_words = _resolve_anki_words(args, args.lang)
     generate_csv(
         input_file=args.input_file,
         output_file=output_file,
         lang=args.lang,
         num_sentences=args.sentences,
         clean_input=args.clean,
+        exclude_words=exclude_words or None,
     )
 
 
@@ -337,7 +357,7 @@ def cmd_extract(args: argparse.Namespace) -> None:
     exclude_words = _resolve_anki_words(args, args.lang)
     if exclude_words:
         before = len(words)
-        words = [w for w in words if w not in exclude_words]
+        words = [w for w in words if normalize_anki_term(w) not in exclude_words]
         skipped = before - len(words)
         if skipped:
             logger.info("Skipped %d words already present in Anki", skipped)
@@ -409,7 +429,7 @@ def cmd_status(args: argparse.Namespace) -> None:
 
     # Check watch folders
     print("\n📁 WATCH FOLDERS (where to put files for extraction):")
-    for lang in ["zh", "ko"]:
+    for lang in _STATUS_LANG_CODES:
         path = get_watch_dir(lang)
         status = "✓" if path.exists() else "✗ (not created)"
         print(f"   {lang}: {path} {status}")
@@ -417,14 +437,14 @@ def cmd_status(args: argparse.Namespace) -> None:
     # Check output folder
     print("\n📤 OUTPUT FOLDERS (where extracted vocabulary goes):")
     output_base = get_output_dir()
-    for lang in ["zh", "ko"]:
+    for lang in _STATUS_LANG_CODES:
         path = output_base / lang
         status = "✓" if path.exists() else "(will be created)"
         print(f"   {lang}: {path} {status}")
 
     # Check processed folders
     print("\n📦 PROCESSED FOLDERS (where files move after extraction):")
-    for lang in ["zh", "ko"]:
+    for lang in _STATUS_LANG_CODES:
         path = get_processed_dir(lang)
         status = "✓" if path.exists() else "(will be created)"
         print(f"   {lang}: {path} {status}")
@@ -439,6 +459,25 @@ def cmd_status(args: argparse.Namespace) -> None:
     print(f"   Level: {level_name}")
     retention = get_log_retention()
     print(f"   Retention: {'forever' if retention < 0 else f'{retention} days'}")
+
+    print("\nANKI FILTERING (extract / clean / generate):")
+    if not os.environ.get("ANKIGEN_ANKI_DB", "").strip():
+        print("   ANKIGEN_ANKI_DB: (not set)")
+    else:
+        db_path = get_anki_db_path()
+        suffix = ""
+        if db_path is not None:
+            suffix = " — file exists" if db_path.exists() else " — file not found"
+        print(f"   ANKIGEN_ANKI_DB: {db_path}{suffix}")
+    for lang in _STATUS_LANG_CODES:
+        deck = get_anki_deck_name(lang)
+        field = get_anki_field(lang)
+        print(f"   ANKIGEN_ANKI_DECK_{lang.upper()}: {deck or '(not set)'}")
+        print(f"   ANKIGEN_ANKI_FIELD_{lang.upper()}: {field!r}")
+    print(
+        "\n   Note: Reading the live collection.anki2 while Anki is open may fail "
+        "(SQLite lock). Quit Anki or export an .apkg for reliable reads."
+    )
 
     # Show example flow
     print("\n" + "=" * 60)
@@ -522,6 +561,7 @@ def main() -> None:
         action="store_true",
         help="Clean input file before processing (removes translations, romanization, etc.)",
     )
+    _add_anki_args(gen_parser)
 
     # 'extract' subcommand
     ext_parser = subparsers.add_parser(
