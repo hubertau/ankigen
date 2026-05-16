@@ -14,6 +14,9 @@ Usage:
     ankigen clean inputs/ko/words.txt  # Clean a vocabulary file in-place
     ankigen clean inputs/ko/words.txt -o cleaned.txt  # Clean to new file
 
+    ankigen similar --lang ko  # Scan the configured Anki deck for near-duplicates
+    ankigen similar words.txt --lang ko  # Scan a word list instead
+
     ankigen status  # Show configuration and health check
 """
 
@@ -614,38 +617,80 @@ def cmd_clean(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def _sanitize_deck_name(deck_name: str) -> str:
+    """Turn an Anki deck name into a filesystem-friendly stem (Chinese::Vocab → chinese_vocab)."""
+    safe = "".join(c if c.isalnum() else "_" for c in deck_name)
+    return "_".join(filter(None, safe.split("_"))).lower() or "anki_deck"
+
+
 def cmd_similar(args: argparse.Namespace) -> None:
-    """Handle the 'similar' subcommand - report similar-but-not-duplicate terms."""
-    if not args.input_file.exists():
-        logger.error("Input file not found: %s", args.input_file)
-        sys.exit(1)
+    """Handle the 'similar' subcommand - report similar-but-not-duplicate terms.
 
-    words = read_words(args.input_file)
-    if not words:
-        logger.warning("No words found in %s", args.input_file)
-        return
-
+    Default mode scans an existing Anki deck for internal near-duplicates.
+    If an input file is given, that word list is scanned instead (and is
+    additionally cross-checked against the Anki deck when one is configured).
+    """
     anki_words = _resolve_anki_words(args, args.lang)
+    scan_anki = args.input_file is None
+
+    if scan_anki:
+        if not anki_words:
+            logger.error(
+                "No words to scan. Provide an input file, or configure an Anki deck "
+                "via --anki-db/--anki-deck (or ANKIGEN_ANKI_DB / ANKIGEN_ANKI_DECK_%s).",
+                args.lang.upper(),
+            )
+            sys.exit(1)
+        words = sorted(anki_words)
+        deck_name = args.anki_deck or get_anki_deck_name(args.lang) or "(deck)"
+        db_path = args.anki_db or get_anki_db_path()
+        # Within-deck scan: every term is already in Anki, so don't cross-check
+        # or tag, and pick the shortest member as the suggested keep.
+        cross_check: set[str] | None = None
+        anki_tag_set: set[str] = set()
+        default_stem = _sanitize_deck_name(deck_name)
+        source_line = f"Anki deck: {deck_name}   Cards: {len(words)}   Threshold: {args.threshold}"
+        extra_line = f"Database: {db_path}"
+        report_source = f"Anki deck '{deck_name}' ({db_path})"
+    else:
+        if not args.input_file.exists():
+            logger.error("Input file not found: %s", args.input_file)
+            sys.exit(1)
+        words = read_words(args.input_file)
+        if not words:
+            logger.warning("No words found in %s", args.input_file)
+            return
+        cross_check = anki_words or None
+        anki_tag_set = anki_words
+        source_line = (
+            f"Input: {args.input_file}   Terms: {len(words)}   Threshold: {args.threshold}"
+        )
+        extra_line = (
+            f"Anki cross-check: {len(anki_words)} card(s)" if anki_words else "Anki cross-check: (off)"
+        )
+        report_source = str(args.input_file)
+
     pairs = find_similar_pairs(
         words,
         args.lang,
         threshold=args.threshold,
-        anki_words=anki_words or None,
+        anki_words=cross_check,
     )
 
     if args.output is not None:
         out_path = args.output
     else:
         ext = ".similar.csv" if args.format == "csv" else ".similar.txt"
-        out_path = args.input_file.with_name(args.input_file.stem + ext)
+        if scan_anki:
+            out_path = Path(f"{default_stem}{ext}")
+        else:
+            out_path = args.input_file.with_name(args.input_file.stem + ext)
 
     print("=" * 60)
     print(f"SIMILAR VOCABULARY ({args.lang})")
     print("=" * 60)
-    print(f"\nInput: {args.input_file}   Terms: {len(words)}   Threshold: {args.threshold}")
-    print(
-        f"Anki cross-check: {len(anki_words)} card(s)" if anki_words else "Anki cross-check: (off)"
-    )
+    print(f"\n{source_line}")
+    print(extra_line)
 
     if not pairs:
         print("\nNo similar pairs found. Nothing to review.")
@@ -658,7 +703,7 @@ def cmd_similar(args: argparse.Namespace) -> None:
     for idx, members in enumerate(clusters, start=1):
         member_set = set(members)
         group_pairs = [p for p in pairs if p.a in member_set and p.b in member_set]
-        in_anki = {m for m in members if normalize_anki_term(m) in anki_words}
+        in_anki = {m for m in members if normalize_anki_term(m) in anki_tag_set}
         # Suggested keep: a card already in Anki, else the shortest term.
         keep = next(iter(sorted(in_anki))) if in_anki else min(members, key=lambda m: (len(m), m))
         print(f"▸ Group {idx}  (suggest keep: {keep})")
@@ -679,12 +724,12 @@ def cmd_similar(args: argparse.Namespace) -> None:
                 writer.writerow([p.a, p.b, p.reason, p.score, p.source])
     else:
         with open(out_path, "w", encoding="utf-8") as f:
-            f.write(f"Similar vocabulary report ({args.lang}) for {args.input_file}\n")
+            f.write(f"Similar vocabulary report ({args.lang}) for {report_source}\n")
             f.write(f"{len(pairs)} pair(s) across {len(clusters)} group(s)\n\n")
             for idx, members in enumerate(clusters, start=1):
                 member_set = set(members)
                 group_pairs = [p for p in pairs if p.a in member_set and p.b in member_set]
-                in_anki = {m for m in members if normalize_anki_term(m) in anki_words}
+                in_anki = {m for m in members if normalize_anki_term(m) in anki_tag_set}
                 keep = (
                     next(iter(sorted(in_anki)))
                     if in_anki
@@ -971,16 +1016,20 @@ def main() -> None:
     # 'similar' subcommand
     sim_parser = subparsers.add_parser(
         "similar",
-        help="Find similar-but-not-duplicate vocabulary",
+        help="Find similar-but-not-duplicate vocabulary in an Anki deck (or a word list)",
         description=(
-            "Detect near-duplicate, morphologically related, or contained terms "
-            "in a word list (and optionally vs an Anki deck) and report them grouped."
+            "Scan an existing Anki deck for near-duplicate, morphologically related, "
+            "or contained cards and report them grouped for cleanup. If an input file "
+            "is given, that word list is scanned instead and cross-checked against the "
+            "configured Anki deck."
         ),
     )
     sim_parser.add_argument(
         "input_file",
         type=Path,
-        help="Input text file with words (one per line)",
+        nargs="?",
+        default=None,
+        help="Optional word list to scan instead of the Anki deck (one word per line)",
     )
     sim_parser.add_argument(
         "--lang",
@@ -1000,7 +1049,7 @@ def main() -> None:
         "--output",
         type=Path,
         default=None,
-        help="Report file (default: <input>.similar.txt next to the input)",
+        help="Report file (default: <deck>.similar.txt, or <input>.similar.txt)",
     )
     sim_parser.add_argument(
         "--format",

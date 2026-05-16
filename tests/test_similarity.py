@@ -2,6 +2,8 @@
 
 import argparse
 
+import pytest
+
 from ankigen.similarity import (
     SimilarPair,
     _decompose_hangul,
@@ -191,3 +193,85 @@ class TestCmdSimilar:
 
         assert not (tmp_path / "words.similar.txt").exists()
         assert "No similar pairs found" in capsys.readouterr().out
+
+
+class TestSanitizeDeckName:
+    def test_subdeck_separator(self):
+        from ankigen.cli import _sanitize_deck_name
+
+        assert _sanitize_deck_name("Chinese::Vocab") == "chinese_vocab"
+
+    def test_spaces_and_punctuation(self):
+        from ankigen.cli import _sanitize_deck_name
+
+        assert _sanitize_deck_name("Korean (HSK 1)") == "korean_hsk_1"
+
+    def test_empty_fallback(self):
+        from ankigen.cli import _sanitize_deck_name
+
+        assert _sanitize_deck_name("::") == "anki_deck"
+
+
+class TestCmdSimilarAnkiScan:
+    """The primary use case: scan an existing Anki deck for internal near-dups."""
+
+    def _args(self, **kw) -> argparse.Namespace:
+        base = {
+            "input_file": None,
+            "lang": "ko",
+            "threshold": 0.80,
+            "output": None,
+            "format": "text",
+            "anki_db": None,
+            "anki_deck": "Korean::Vocab",
+            "anki_field": None,
+        }
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    def test_scans_deck_and_writes_report(self, tmp_path, monkeypatch, capsys):
+        import ankigen.cli as cli
+
+        monkeypatch.setattr(
+            cli, "_resolve_anki_words", lambda args, lang: {"가다", "가요", "갑니다", "방향"}
+        )
+        monkeypatch.chdir(tmp_path)
+
+        cli.cmd_similar(self._args())
+
+        report = tmp_path / "korean_vocab.similar.txt"
+        assert report.exists()
+        content = report.read_text(encoding="utf-8")
+        assert "가다" in content and "갑니다" in content
+        out = capsys.readouterr().out
+        assert "Anki deck: Korean::Vocab" in out
+        # Within-deck scan: no "[in Anki]" tags (every card is in Anki).
+        assert "[in Anki]" not in out
+
+    def test_csv_output_uses_deck_name(self, tmp_path, monkeypatch):
+        import ankigen.cli as cli
+
+        monkeypatch.setattr(cli, "_resolve_anki_words", lambda args, lang: {"가다", "가요"})
+        monkeypatch.chdir(tmp_path)
+
+        cli.cmd_similar(self._args(format="csv"))
+
+        assert (tmp_path / "korean_vocab.similar.csv").exists()
+
+    def test_no_anki_config_and_no_input_errors(self, monkeypatch):
+        import ankigen.cli as cli
+
+        monkeypatch.setattr(cli, "_resolve_anki_words", lambda args, lang: set())
+
+        with pytest.raises(SystemExit):
+            cli.cmd_similar(self._args(anki_deck=None))
+
+    def test_explicit_output_path_respected(self, tmp_path, monkeypatch):
+        import ankigen.cli as cli
+
+        monkeypatch.setattr(cli, "_resolve_anki_words", lambda args, lang: {"가다", "가요"})
+        out = tmp_path / "custom_report.txt"
+
+        cli.cmd_similar(self._args(output=out))
+
+        assert out.exists()
