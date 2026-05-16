@@ -11,7 +11,7 @@ Generate Anki vocabulary **and grammar** CSVs with LLM-powered example sentences
 - **Folder & directory inputs**: Run on the configured watch folder *or* point `extract` at any directory (with optional `--recursive`)
 - **Verbatim teacher examples**: Grammar mode preserves the example sentences from teacher notes and only asks the LLM to top up when there aren't enough
 - **Input cleaning**: Automatically remove translations, romanization, and annotations from input files
-- **Similarity review**: Surface near-duplicate, variant, and contained terms (within a list or vs an Anki deck)
+- **Similarity review**: Scan an Anki deck (or word list) for near-duplicate, variant, and contained terms
 - **Flexible providers**: OpenAI, Anthropic, OpenRouter, or local models (Ollama, vLLM)
 - **HTML formatting**: Keywords highlighted in red, sentences in blue
 - **Configurable**: Number of sentences, output paths, and more
@@ -284,17 +284,23 @@ ankigen clean inputs/ko/dirty.txt -o inputs/ko/clean.txt --lang ko
 
 ### Similar: Find near-duplicates and variants
 
-Exact duplicates are removed automatically during `clean`/`extract`. The `similar` command instead surfaces terms that are *close but not identical* so you can review them — it never modifies your word list.
+Exact duplicates are removed automatically during `clean`/`extract`. The `similar` command instead surfaces terms that are *close but not identical* so you can review them. It is **non-destructive** — it only reports, never modifies your deck or word list.
+
+Its primary use is **scanning an existing Anki deck** to help you find and clean up near-duplicate cards (OCR typos, conjugation variants, sub-string overlaps that accumulated over time):
 
 ```bash
-# Group similar terms in a word list
-ankigen similar inputs/ko/words.txt --lang ko
+# Scan an Anki deck for internal near-duplicates (primary use case)
+ankigen similar --lang ko --anki-db ~/collection.anki2 --anki-deck "Korean::Vocab"
 
-# Also compare against an existing Anki deck, write a CSV
-ankigen similar inputs/zh/words.txt --lang zh --format csv --anki-db ~/collection.anki2
+# With deck/db from .env, just:
+ankigen similar --lang ko
+
+# Optionally scan a word list instead; it is also cross-checked
+# against the configured Anki deck:
+ankigen similar inputs/ko/words.txt --lang ko
 ```
 
-It prints grouped clusters to the screen and writes a sidecar report next to the input (`<input>.similar.txt`). Each pair is tagged with a reason:
+It prints grouped clusters to the screen and writes a report file: `<deck>.similar.txt` in the current directory when scanning a deck, or `<input>.similar.txt` next to the input file. Each pair is tagged with a reason:
 
 | Reason | Meaning | Example |
 |--------|---------|---------|
@@ -307,11 +313,12 @@ It prints grouped clusters to the screen and writes a sidecar report next to the
 
 | Option | Description |
 |--------|-------------|
+| `input_file` | Optional word list to scan instead of the Anki deck (one word per line) |
 | `--lang {zh,ko}` | Language (default: zh) |
 | `--threshold FLOAT` | Minimum fuzzy similarity ratio, 0.0–1.0 (default: 0.80) |
-| `-o, --output FILE` | Report file (default: `<input>.similar.txt`) |
+| `-o, --output FILE` | Report file (default: `<deck>.similar.txt` or `<input>.similar.txt`) |
 | `--format {text,csv}` | `text` (grouped) or `csv` (pair rows). Default: text |
-| `--anki-db`, `--anki-deck`, `--anki-field` | Also flag terms similar to existing Anki cards (see [Anki database filtering](#anki-database-filtering-optional)) |
+| `--anki-db`, `--anki-deck`, `--anki-field` | Anki deck to scan (or cross-check against, in input-file mode); see [Anki database filtering](#anki-database-filtering-optional) |
 
 ### Status: Check configuration
 
