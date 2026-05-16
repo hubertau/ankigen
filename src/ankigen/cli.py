@@ -27,10 +27,18 @@ warnings.filterwarnings("ignore", message="pkg_resources is deprecated")
 import argparse
 import csv
 import logging
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
 
+from ankigen.anki_db import (
+    get_anki_db_path,
+    get_anki_deck_name,
+    get_anki_field,
+    load_anki_words,
+    normalize_anki_term,
+)
 from ankigen.cleaner import clean_and_write, clean_vocabulary_file
 from ankigen.extractor import (
     extract_vocabulary_from_file,
@@ -42,9 +50,13 @@ from ankigen.extractor import (
 from ankigen.formatter import format_sentences
 from ankigen.llm import Language, generate_sentences, translate_word
 from ankigen.logging_config import get_log_dir, get_log_level, get_log_retention, setup_logging
+from ankigen.similarity import cluster_pairs, find_similar_pairs
 
 # Configure logging
 logger = logging.getLogger("ankigen.cli")
+
+# Languages shown in `status` (typed for mypy vs get_anki_deck_name / get_anki_field)
+_STATUS_LANG_CODES: tuple[Language, Language] = ("zh", "ko")
 
 
 def get_jyutping(word: str) -> str:
@@ -153,6 +165,7 @@ def generate_csv(
     num_sentences: int,
     *,
     clean_input: bool = False,
+    exclude_words: set[str] | None = None,
 ) -> None:
     """
     Generate the output CSV from a word list.
@@ -163,12 +176,19 @@ def generate_csv(
         lang: Language code ('zh' or 'ko')
         num_sentences: Number of sentences to generate per word (0 to skip)
         clean_input: If True, clean the input before processing
+        exclude_words: Optional NFC-normalized terms to skip (e.g. from Anki)
     """
     if clean_input:
         logger.info("Cleaning input file before processing...")
-        words = clean_vocabulary_file(input_file, lang)
+        words = clean_vocabulary_file(input_file, lang, exclude_words=exclude_words)
     else:
         words = read_words(input_file)
+        if exclude_words:
+            before = len(words)
+            words = [w for w in words if normalize_anki_term(w) not in exclude_words]
+            skipped = before - len(words)
+            if skipped:
+                logger.info("Skipped %d words already present in Anki", skipped)
 
     logger.info("Found %d words in %s", len(words), input_file)
 
@@ -192,6 +212,68 @@ def generate_csv(
     logger.info("Output written to %s", output_file)
 
 
+def _add_anki_args(parser: argparse.ArgumentParser) -> None:
+    """Add --anki-db, --anki-deck, and --anki-field flags to a subcommand parser."""
+    parser.add_argument(
+        "--anki-db",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Path to Anki database (.anki2 or .apkg) for filtering already-known words. "
+        "Overrides ANKIGEN_ANKI_DB env var.",
+    )
+    parser.add_argument(
+        "--anki-deck",
+        type=str,
+        default=None,
+        metavar="DECK",
+        help="Anki deck name to check for existing words (e.g. 'Chinese::Vocab'). "
+        "Overrides ANKIGEN_ANKI_DECK_{LANG} env var.",
+    )
+    parser.add_argument(
+        "--anki-field",
+        type=str,
+        default=None,
+        metavar="FIELD",
+        help="Which note field contains the vocabulary word — either a 0-based integer "
+        "index (e.g. 0) or a field name (e.g. 'Hanzi'). "
+        "Overrides ANKIGEN_ANKI_FIELD_{LANG} env var.",
+    )
+
+
+def _resolve_anki_words(args: argparse.Namespace, lang: Language) -> set[str]:
+    """
+    Load the set of words already in Anki for the given language.
+
+    Reads db path from --anki-db (or ANKIGEN_ANKI_DB), deck name from --anki-deck
+    (or ANKIGEN_ANKI_DECK_{LANG}), and field index from --anki-field (or
+    ANKIGEN_ANKI_FIELD_{LANG}).  Returns an empty set if db or deck is not configured.
+    """
+    db_path: Path | None = args.anki_db or get_anki_db_path()
+    if not db_path:
+        return set()
+
+    deck_name: str | None = args.anki_deck or get_anki_deck_name(lang)
+    if not deck_name:
+        logger.warning(
+            "--anki-db provided but no deck name configured. "
+            "Use --anki-deck or set ANKIGEN_ANKI_DECK_%s in your .env file.",
+            lang.upper(),
+        )
+        return set()
+
+    # Resolve field: CLI flag (str) → try int, fall back to str; else use env/default
+    raw_field: str | None = args.anki_field
+    if raw_field is not None:
+        try:
+            field: int | str = int(raw_field)
+        except ValueError:
+            field = raw_field  # treat as field name
+    else:
+        field = get_anki_field(lang)
+    return load_anki_words(db_path, deck_name, field=field)
+
+
 def cmd_generate(args: argparse.Namespace) -> None:
     """Handle the 'generate' subcommand."""
     # Validate input file
@@ -202,12 +284,14 @@ def cmd_generate(args: argparse.Namespace) -> None:
     # Determine output path
     output_file = get_output_path(args.input_file, args.lang, args.output)
 
+    exclude_words = _resolve_anki_words(args, args.lang)
     generate_csv(
         input_file=args.input_file,
         output_file=output_file,
         lang=args.lang,
         num_sentences=args.sentences,
         clean_input=args.clean,
+        exclude_words=exclude_words or None,
     )
 
 
@@ -227,9 +311,11 @@ def cmd_extract(args: argparse.Namespace) -> None:
             )
             sys.exit(1)
 
+        exclude_words = _resolve_anki_words(args, args.lang)
         output_path, num_files = process_watch_folder(
             lang=args.lang,
             move_processed=not args.no_move,
+            exclude_words=exclude_words or None,
         )
 
         if num_files == 0:
@@ -267,6 +353,15 @@ def cmd_extract(args: argparse.Namespace) -> None:
         return
 
     logger.info("Extracted %d vocabulary words", len(words))
+
+    # Filter out words already in Anki
+    exclude_words = _resolve_anki_words(args, args.lang)
+    if exclude_words:
+        before = len(words)
+        words = [w for w in words if normalize_anki_term(w) not in exclude_words]
+        skipped = before - len(words)
+        if skipped:
+            logger.info("Skipped %d words already present in Anki", skipped)
 
     # Ensure output directory exists
     output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -312,16 +407,102 @@ def cmd_clean(args: argparse.Namespace) -> None:
         output_file = args.input_file
         overwrite = True  # Always overwrite when cleaning in-place
 
+    exclude_words = _resolve_anki_words(args, args.lang)
+
     try:
         clean_and_write(
             input_path=args.input_file,
             output_path=output_file,
             lang=args.lang,
             overwrite=overwrite,
+            exclude_words=exclude_words or None,
         )
     except FileExistsError as e:
         logger.error(str(e))
         sys.exit(1)
+
+
+def cmd_similar(args: argparse.Namespace) -> None:
+    """Handle the 'similar' subcommand - report similar-but-not-duplicate terms."""
+    if not args.input_file.exists():
+        logger.error("Input file not found: %s", args.input_file)
+        sys.exit(1)
+
+    words = read_words(args.input_file)
+    if not words:
+        logger.warning("No words found in %s", args.input_file)
+        return
+
+    anki_words = _resolve_anki_words(args, args.lang)
+    pairs = find_similar_pairs(
+        words,
+        args.lang,
+        threshold=args.threshold,
+        anki_words=anki_words or None,
+    )
+
+    if args.output is not None:
+        out_path = args.output
+    else:
+        ext = ".similar.csv" if args.format == "csv" else ".similar.txt"
+        out_path = args.input_file.with_name(args.input_file.stem + ext)
+
+    print("=" * 60)
+    print(f"SIMILAR VOCABULARY ({args.lang})")
+    print("=" * 60)
+    print(f"\nInput: {args.input_file}   Terms: {len(words)}   Threshold: {args.threshold}")
+    print(f"Anki cross-check: {len(anki_words)} card(s)" if anki_words else "Anki cross-check: (off)")
+
+    if not pairs:
+        print("\nNo similar pairs found. Nothing to review.")
+        return
+
+    clusters = cluster_pairs(pairs)
+    clusters.sort(key=len, reverse=True)
+    print(f"\nFound {len(pairs)} similar pair(s) across {len(clusters)} group(s).\n")
+
+    for idx, members in enumerate(clusters, start=1):
+        member_set = set(members)
+        group_pairs = [p for p in pairs if p.a in member_set and p.b in member_set]
+        in_anki = {m for m in members if normalize_anki_term(m) in anki_words}
+        # Suggested keep: a card already in Anki, else the shortest term.
+        keep = next(iter(sorted(in_anki))) if in_anki else min(members, key=lambda m: (len(m), m))
+        print(f"▸ Group {idx}  (suggest keep: {keep})")
+        for m in members:
+            tag = "  [in Anki]" if m in in_anki else ""
+            print(f"   {m}{tag}")
+        for p in sorted(group_pairs, key=lambda p: p.score, reverse=True):
+            src = " [anki]" if p.source == "anki" else ""
+            print(f"     {p.a} ~ {p.b}  {p.reason} {p.score}{src}")
+        print()
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if args.format == "csv":
+        with open(out_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["word_a", "word_b", "reason", "score", "source"])
+            for p in pairs:
+                writer.writerow([p.a, p.b, p.reason, p.score, p.source])
+    else:
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(f"Similar vocabulary report ({args.lang}) for {args.input_file}\n")
+            f.write(f"{len(pairs)} pair(s) across {len(clusters)} group(s)\n\n")
+            for idx, members in enumerate(clusters, start=1):
+                member_set = set(members)
+                group_pairs = [p for p in pairs if p.a in member_set and p.b in member_set]
+                in_anki = {m for m in members if normalize_anki_term(m) in anki_words}
+                keep = next(iter(sorted(in_anki))) if in_anki else min(members, key=lambda m: (len(m), m))
+                f.write(f"Group {idx} (suggest keep: {keep})\n")
+                for m in members:
+                    tag = "  [in Anki]" if m in in_anki else ""
+                    f.write(f"  {m}{tag}\n")
+                for p in sorted(group_pairs, key=lambda p: p.score, reverse=True):
+                    src = " [anki]" if p.source == "anki" else ""
+                    f.write(f"    {p.a} ~ {p.b}  {p.reason} {p.score}{src}\n")
+                f.write("\n")
+
+    logger.info("Similarity report written to %s", out_path)
+    print(f"Report written to {out_path}")
 
 
 def cmd_status(args: argparse.Namespace) -> None:
@@ -332,7 +513,7 @@ def cmd_status(args: argparse.Namespace) -> None:
 
     # Check watch folders
     print("\n📁 WATCH FOLDERS (where to put files for extraction):")
-    for lang in ["zh", "ko"]:
+    for lang in _STATUS_LANG_CODES:
         path = get_watch_dir(lang)
         status = "✓" if path.exists() else "✗ (not created)"
         print(f"   {lang}: {path} {status}")
@@ -340,14 +521,14 @@ def cmd_status(args: argparse.Namespace) -> None:
     # Check output folder
     print("\n📤 OUTPUT FOLDERS (where extracted vocabulary goes):")
     output_base = get_output_dir()
-    for lang in ["zh", "ko"]:
+    for lang in _STATUS_LANG_CODES:
         path = output_base / lang
         status = "✓" if path.exists() else "(will be created)"
         print(f"   {lang}: {path} {status}")
 
     # Check processed folders
     print("\n📦 PROCESSED FOLDERS (where files move after extraction):")
-    for lang in ["zh", "ko"]:
+    for lang in _STATUS_LANG_CODES:
         path = get_processed_dir(lang)
         status = "✓" if path.exists() else "(will be created)"
         print(f"   {lang}: {path} {status}")
@@ -362,6 +543,25 @@ def cmd_status(args: argparse.Namespace) -> None:
     print(f"   Level: {level_name}")
     retention = get_log_retention()
     print(f"   Retention: {'forever' if retention < 0 else f'{retention} days'}")
+
+    print("\nANKI FILTERING (extract / clean / generate):")
+    if not os.environ.get("ANKIGEN_ANKI_DB", "").strip():
+        print("   ANKIGEN_ANKI_DB: (not set)")
+    else:
+        db_path = get_anki_db_path()
+        suffix = ""
+        if db_path is not None:
+            suffix = " — file exists" if db_path.exists() else " — file not found"
+        print(f"   ANKIGEN_ANKI_DB: {db_path}{suffix}")
+    for lang in _STATUS_LANG_CODES:
+        deck = get_anki_deck_name(lang)
+        field = get_anki_field(lang)
+        print(f"   ANKIGEN_ANKI_DECK_{lang.upper()}: {deck or '(not set)'}")
+        print(f"   ANKIGEN_ANKI_FIELD_{lang.upper()}: {field!r}")
+    print(
+        "\n   Note: Reading the live collection.anki2 while Anki is open may fail "
+        "(SQLite lock). Quit Anki or export an .apkg for reliable reads."
+    )
 
     # Show example flow
     print("\n" + "=" * 60)
@@ -445,6 +645,7 @@ def main() -> None:
         action="store_true",
         help="Clean input file before processing (removes translations, romanization, etc.)",
     )
+    _add_anki_args(gen_parser)
 
     # 'extract' subcommand
     ext_parser = subparsers.add_parser(
@@ -492,6 +693,7 @@ def main() -> None:
         action="store_true",
         help="Don't move processed files (watch folder mode only)",
     )
+    _add_anki_args(ext_parser)
 
     # 'clean' subcommand
     clean_parser = subparsers.add_parser(
@@ -523,6 +725,50 @@ def main() -> None:
         action="store_true",
         help="Overwrite existing output file",
     )
+    _add_anki_args(clean_parser)
+
+    # 'similar' subcommand
+    sim_parser = subparsers.add_parser(
+        "similar",
+        help="Find similar-but-not-duplicate vocabulary",
+        description=(
+            "Detect near-duplicate, morphologically related, or contained terms "
+            "in a word list (and optionally vs an Anki deck) and report them grouped."
+        ),
+    )
+    sim_parser.add_argument(
+        "input_file",
+        type=Path,
+        help="Input text file with words (one per line)",
+    )
+    sim_parser.add_argument(
+        "--lang",
+        type=str,
+        choices=["zh", "ko"],
+        default="zh",
+        help="Language: zh (Chinese) or ko (Korean). Default: zh",
+    )
+    sim_parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.80,
+        help="Minimum fuzzy similarity ratio (0.0-1.0). Default: 0.80",
+    )
+    sim_parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=None,
+        help="Report file (default: <input>.similar.txt next to the input)",
+    )
+    sim_parser.add_argument(
+        "--format",
+        type=str,
+        choices=["text", "csv"],
+        default="text",
+        help="Report format: text (grouped) or csv (pair rows). Default: text",
+    )
+    _add_anki_args(sim_parser)
 
     # 'status' subcommand
     subparsers.add_parser(
@@ -543,6 +789,8 @@ def main() -> None:
         cmd_extract(args)
     elif args.command == "clean":
         cmd_clean(args)
+    elif args.command == "similar":
+        cmd_similar(args)
     elif args.command == "status":
         cmd_status(args)
     else:

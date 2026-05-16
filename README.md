@@ -8,6 +8,7 @@ Generate Anki vocabulary CSVs with LLM-powered example sentences and translation
 - **LLM-powered**: Generate natural example sentences and translations
 - **PDF & Image extraction**: Extract vocabulary from PDFs or images (OCR via GPT-4 Vision)
 - **Input cleaning**: Automatically remove translations, romanization, and annotations from input files
+- **Similarity review**: Surface near-duplicate, variant, and contained terms (within a list or vs an Anki deck)
 - **Flexible providers**: OpenAI, OpenRouter, or local models (Ollama, vLLM)
 - **HTML formatting**: Keywords highlighted in red, sentences in blue
 - **Configurable**: Number of sentences, output paths, and more
@@ -54,7 +55,24 @@ ANKIGEN_PROCESSED_DIR_KO=./processed/ko  # Override: Korean processed folder
 ANKIGEN_LOG_DIR=./logs              # Log directory (default: ./logs)
 ANKIGEN_LOG_LEVEL=DEBUG             # File log level (default: DEBUG)
 ANKIGEN_LOG_RETENTION=-1            # Days to keep logs (-1 = forever, default)
+
+# Anki filtering (optional — skip words already in a deck)
+# ANKIGEN_ANKI_DB=~/Library/Application Support/Anki2/User 1/collection.anki2
+# ANKIGEN_ANKI_DECK_ZH=Chinese::Vocabulary
+# ANKIGEN_ANKI_DECK_KO=Korean::Vocabulary
+# ANKIGEN_ANKI_FIELD_ZH=Hanzi   # or 0 for first field
+# ANKIGEN_ANKI_FIELD_KO=Korean
 ```
+
+### Anki database filtering (optional)
+
+When `ANKIGEN_ANKI_DB` and `ANKIGEN_ANKI_DECK_{LANG}` are set, **extract**, **clean**, and **generate** skip vocabulary that already appears in the chosen deck (including sub-decks). Words are compared using **Unicode NFC** normalization so equivalent composed/decomposed strings still match.
+
+**Live collection warning:** Reading `collection.anki2` while Anki is running often fails or flakes because of SQLite locking. Prefer quitting Anki first, or point `ANKIGEN_ANKI_DB` at an exported **`.apkg`** (or a copy of the collection) for reliable reads.
+
+CLI overrides (same flags on `generate`, `extract`, and `clean`): `--anki-db PATH`, `--anki-deck NAME`, `--anki-field INDEX_OR_NAME`.
+
+Run `ankigen status` to see resolved Anki-related paths and whether the database file exists.
 
 ## Usage
 
@@ -86,6 +104,9 @@ ankigen generate inputs/zh/words.txt
 | `--lang {zh,ko}` | Language: Chinese or Korean (default: zh) |
 | `-n, --sentences N` | Number of sentences per word (default: 3, 0 to skip) |
 | `-c, --clean` | Clean input before processing (removes translations, romanization) |
+| `--anki-db PATH` | Anki collection (`.anki2` / `.apkg`); overrides `ANKIGEN_ANKI_DB` |
+| `--anki-deck NAME` | Deck to scan (e.g. `Chinese::Vocab`); overrides env |
+| `--anki-field ARG` | Field index (e.g. `0`) or field name (e.g. `Hanzi`); overrides env |
 
 **Examples**:
 
@@ -153,6 +174,7 @@ Watch folder behavior:
 | `-a, --append` | Append to existing file (skips duplicates) |
 | `--overwrite` | Overwrite existing file |
 | `--no-move` | Don't move processed files (watch folder mode only) |
+| `--anki-db`, `--anki-deck`, `--anki-field` | Skip words already in Anki (see [Anki database filtering](#anki-database-filtering-optional)) |
 
 **Supported formats**: PDF, DOCX, PNG, JPG, JPEG, GIF, WEBP
 
@@ -186,10 +208,42 @@ ankigen clean inputs/ko/dirty.txt -o inputs/ko/clean.txt --lang ko
 | `-o, --output FILE` | Output file (default: overwrite input in-place) |
 | `--lang {zh,ko}` | Language (default: ko) |
 | `--overwrite` | Overwrite existing output file |
+| `--anki-db`, `--anki-deck`, `--anki-field` | Skip words already in Anki (see [Anki database filtering](#anki-database-filtering-optional)) |
+
+### Similar: Find near-duplicates and variants
+
+Exact duplicates are removed automatically during `clean`/`extract`. The `similar` command instead surfaces terms that are *close but not identical* so you can review them — it never modifies your word list.
+
+```bash
+# Group similar terms in a word list
+ankigen similar inputs/ko/words.txt --lang ko
+
+# Also compare against an existing Anki deck, write a CSV
+ankigen similar inputs/zh/words.txt --lang zh --format csv --anki-db ~/collection.anki2
+```
+
+It prints grouped clusters to the screen and writes a sidecar report next to the input (`<input>.similar.txt`). Each pair is tagged with a reason:
+
+| Reason | Meaning | Example |
+|--------|---------|---------|
+| `near-identical` | One unit different — likely an OCR/transcription typo | `测试` / `测式` |
+| `containment` | One term is contained in the other | `学习` / `学习方法` |
+| `shared-stem` | Same Korean stem, or high Chinese character overlap | `가다` / `가요` / `갑니다` |
+| `fuzzy` | Generic closeness above `--threshold` | — |
+
+**Options**:
+
+| Option | Description |
+|--------|-------------|
+| `--lang {zh,ko}` | Language (default: zh) |
+| `--threshold FLOAT` | Minimum fuzzy similarity ratio, 0.0–1.0 (default: 0.80) |
+| `-o, --output FILE` | Report file (default: `<input>.similar.txt`) |
+| `--format {text,csv}` | `text` (grouped) or `csv` (pair rows). Default: text |
+| `--anki-db`, `--anki-deck`, `--anki-field` | Also flag terms similar to existing Anki cards (see [Anki database filtering](#anki-database-filtering-optional)) |
 
 ### Status: Check configuration
 
-View your current configuration and verify all paths are set up correctly:
+View your current configuration, optional Anki filtering env vars, and verify paths exist:
 
 ```bash
 ankigen status
@@ -307,9 +361,10 @@ uv run mypy src/
 ankigen/
 ├── src/ankigen/
 │   ├── __init__.py
-│   ├── cli.py            # CLI entry point (generate, extract, clean)
+│   ├── cli.py            # CLI entry point (generate, extract, clean, similar)
 │   ├── cleaner.py        # Input file cleaning
 │   ├── extractor.py      # PDF/image extraction, OCR, and watch folder
+│   ├── similarity.py     # Near-duplicate / variant detection
 │   ├── formatter.py      # HTML sentence formatting
 │   ├── llm.py            # LLM client (OpenAI-compatible)
 │   ├── logging_config.py # Logging setup with file rotation
@@ -318,6 +373,7 @@ ankigen/
 │   ├── conftest.py       # Test fixtures
 │   ├── test_cleaner.py
 │   ├── test_extractor.py
+│   ├── test_similarity.py
 │   ├── test_formatter.py
 │   └── test_llm.py
 ├── logs/                 # Daily log files (gitignored)

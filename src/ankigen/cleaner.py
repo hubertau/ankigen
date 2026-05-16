@@ -4,6 +4,7 @@ import logging
 import re
 from pathlib import Path
 
+from ankigen.anki_db import normalize_anki_term
 from ankigen.llm import Language
 
 logger = logging.getLogger("ankigen.cleaner")
@@ -80,13 +81,18 @@ def clean_line(line: str, lang: Language) -> str | None:
     return cleaned
 
 
-def clean_vocabulary_file(input_path: Path, lang: Language) -> list[str]:
+def clean_vocabulary_file(
+    input_path: Path,
+    lang: Language,
+    exclude_words: set[str] | None = None,
+) -> list[str]:
     """
     Clean a vocabulary file and return cleaned words.
 
     Args:
         input_path: Path to the input file
         lang: Target language code
+        exclude_words: Optional set of words to exclude (e.g. already in Anki)
 
     Returns:
         List of cleaned vocabulary words
@@ -134,6 +140,13 @@ def clean_vocabulary_file(input_path: Path, lang: Language) -> list[str]:
             removed_count,
         )
 
+    if exclude_words:
+        before = len(cleaned_words)
+        cleaned_words = [w for w in cleaned_words if normalize_anki_term(w) not in exclude_words]
+        skipped_anki = before - len(cleaned_words)
+        if skipped_anki:
+            logger.info("Skipped %d words already present in Anki", skipped_anki)
+
     return cleaned_words
 
 
@@ -143,6 +156,7 @@ def clean_and_write(
     lang: Language,
     *,
     overwrite: bool = False,
+    exclude_words: set[str] | None = None,
 ) -> Path:
     """
     Clean a vocabulary file and write the result.
@@ -152,6 +166,7 @@ def clean_and_write(
         output_path: Path to output file (None = overwrite input)
         lang: Target language code
         overwrite: If True, overwrite existing output file
+        exclude_words: Optional set of words to exclude (e.g. already in Anki)
 
     Returns:
         Path to the output file
@@ -166,7 +181,7 @@ def clean_and_write(
             f"Output file already exists: {output_path}. Use --overwrite to replace."
         )
 
-    cleaned_words = clean_vocabulary_file(input_path, lang)
+    cleaned_words = clean_vocabulary_file(input_path, lang, exclude_words=exclude_words)
 
     # Ensure output directory exists
     output_path.parent.mkdir(parents=True, exist_ok=True)

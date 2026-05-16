@@ -13,6 +13,7 @@ from openai import OpenAI
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
 
+from ankigen.anki_db import normalize_anki_term
 from ankigen.llm import (
     LANGUAGE_CONFIG,
     PROVIDER_CONFIG,
@@ -402,6 +403,7 @@ def process_watch_folder(
     lang: Language = "zh",
     *,
     move_processed: bool = True,
+    exclude_words: set[str] | None = None,
 ) -> tuple[Path | None, int]:
     """
     Process all supported files from the language-specific watch folder.
@@ -413,6 +415,7 @@ def process_watch_folder(
     Args:
         lang: Language of the content (determines which watch subfolder to use)
         move_processed: If True, move processed files to processed directory
+        exclude_words: Optional set of words to skip (e.g. already in Anki)
 
     Returns:
         Tuple of (output_path, number_of_files_processed)
@@ -458,6 +461,17 @@ def process_watch_folder(
             seen.add(word)
 
     logger.info("Total: %d unique words from %d files", len(unique_words), len(processed_files))
+
+    if exclude_words:
+        before = len(unique_words)
+        unique_words = [w for w in unique_words if normalize_anki_term(w) not in exclude_words]
+        skipped = before - len(unique_words)
+        if skipped:
+            logger.info(
+                "Skipped %d words already present in Anki (%d remaining)",
+                skipped,
+                len(unique_words),
+            )
 
     # Determine output path: {output_dir}/{lang}/{YYYYMMDD}.txt
     today = datetime.now().strftime("%Y%m%d")
