@@ -9,7 +9,7 @@ Generate Anki vocabulary CSVs with LLM-powered example sentences and translation
 - **PDF & Image extraction**: Extract vocabulary from PDFs or images (OCR via GPT-4 Vision)
 - **Input cleaning**: Automatically remove translations, romanization, and annotations from input files
 - **Similarity review**: Surface near-duplicate, variant, and contained terms (within a list or vs an Anki deck)
-- **Flexible providers**: OpenAI, OpenRouter, or local models (Ollama, vLLM)
+- **Flexible providers**: OpenAI, Anthropic, OpenRouter, or local models (Ollama, vLLM)
 - **HTML formatting**: Keywords highlighted in red, sentences in blue
 - **Configurable**: Number of sentences, output paths, and more
 
@@ -33,7 +33,7 @@ cp .env.example .env
 Create a `.env` file with your settings:
 
 ```bash
-# LLM Provider: openai, openrouter, or local
+# LLM Provider: openai, anthropic, openrouter, or local
 LLM_PROVIDER=openrouter
 
 # API key
@@ -41,6 +41,8 @@ LLM_API_KEY=sk-or-...
 
 # Model name
 LLM_MODEL=google/gemini-2.0-flash-001
+# For Anthropic provider, use native Anthropic model names
+# e.g. claude-sonnet-4-6
 
 # Watch folder settings (optional, have sensible defaults)
 ANKIGEN_WATCH_DIR=./watch           # Base watch folder (uses subfolders: watch/zh/, watch/ko/)

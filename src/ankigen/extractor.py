@@ -7,6 +7,7 @@ import shutil
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Any, cast
 
 from docx import Document
 from openai import OpenAI
@@ -18,7 +19,8 @@ from ankigen.llm import (
     LANGUAGE_CONFIG,
     PROVIDER_CONFIG,
     Language,
-    get_client,
+    generate_structured_response,
+    get_anthropic_client,
     get_model,
     get_provider,
 )
@@ -203,8 +205,8 @@ def extract_text_from_image(path: Path, lang: Language = "zh") -> str:
     media_type = media_types.get(suffix, "image/png")
     logger.debug("Image type: %s, base64 size: %d bytes", media_type, len(image_data))
 
-    # Use raw OpenAI client for vision (instructor doesn't support vision well)
-    # But respect the provider configuration (e.g., OpenRouter)
+    # Use raw OpenAI-compatible client for vision where supported.
+    # Anthropic uses its native SDK path below.
     provider = get_provider()
     config = PROVIDER_CONFIG[provider]
     base_url = os.getenv("LLM_BASE_URL") or config["base_url"]
@@ -220,50 +222,87 @@ def extract_text_from_image(path: Path, lang: Language = "zh") -> str:
         if app_name:
             default_headers["X-Title"] = app_name
 
-    client = OpenAI(
-        base_url=base_url,
-        api_key=api_key,
-        default_headers=default_headers if default_headers else None,
-    )
-
     lang_name = LANGUAGE_CONFIG[lang]["name"]
 
-    # Use configured model, with vision-capable fallback
-    # OpenRouter needs provider prefix (e.g., "openai/gpt-4o")
-    model = os.getenv("LLM_VISION_MODEL") or (
-        "openai/gpt-4o" if provider == "openrouter" else "gpt-4o"
-    )
+    # Use configured model, with vision-capable fallback per provider.
+    if provider == "openrouter":
+        model = os.getenv("LLM_VISION_MODEL") or "openai/gpt-4o"
+    elif provider == "anthropic":
+        model = os.getenv("LLM_VISION_MODEL") or "claude-sonnet-4-6"
+    else:
+        model = os.getenv("LLM_VISION_MODEL") or "gpt-4o"
+
     logger.debug("Calling %s for %s OCR via %s", model, lang_name, provider)
 
     start_time = time.time()
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
+    if provider == "anthropic":
+        anthropic_client = get_anthropic_client()
+        anthropic_content: list[dict[str, Any]] = [
             {
-                "role": "system",
-                "content": f"You are an OCR assistant. Extract all {lang_name} text from the image. "
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": image_data,
+                },
+            },
+            {
+                "type": "text",
+                "text": f"Extract all {lang_name} text from this image.",
+            },
+        ]
+        anthropic_response = anthropic_client.messages.create(
+            model=model,
+            max_tokens=4096,
+            system=(
+                f"You are an OCR assistant. Extract all {lang_name} text from the image. "
                 "Preserve the original text exactly as it appears. "
-                "Do not translate or interpret the text, just transcribe it.",
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:{media_type};base64,{image_data}"},
-                    },
-                    {
-                        "type": "text",
-                        "text": f"Extract all {lang_name} text from this image.",
-                    },
-                ],
-            },
-        ],
-        max_tokens=4096,
-    )
-    elapsed = time.time() - start_time
+                "Do not translate or interpret the text, just transcribe it."
+            ),
+            messages=[
+                {
+                    "role": "user",
+                    "content": cast(Any, anthropic_content),
+                }
+            ],
+        )
+        extracted_text = "\n".join(
+            block.text for block in anthropic_response.content if block.type == "text"
+        ).strip()
+    else:
+        openai_client = OpenAI(
+            base_url=base_url,
+            api_key=api_key,
+            default_headers=default_headers if default_headers else None,
+        )
+        openai_response = openai_client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": f"You are an OCR assistant. Extract all {lang_name} text from the image. "
+                    "Preserve the original text exactly as it appears. "
+                    "Do not translate or interpret the text, just transcribe it.",
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{media_type};base64,{image_data}"},
+                        },
+                        {
+                            "type": "text",
+                            "text": f"Extract all {lang_name} text from this image.",
+                        },
+                    ],
+                },
+            ],
+            max_tokens=4096,
+        )
+        extracted_text = openai_response.choices[0].message.content or ""
 
-    extracted_text = response.choices[0].message.content or ""
+    elapsed = time.time() - start_time
     logger.debug("OCR completed in %.2fs", elapsed)
     logger.info("Extracted %d characters from image", len(extracted_text))
     return extracted_text
@@ -282,33 +321,26 @@ def identify_vocabulary(text: str, lang: Language = "zh") -> list[str]:
     """
     logger.debug("Identifying vocabulary from %d characters", len(text))
 
-    client = get_client()
     model = get_model()
     lang_name = LANGUAGE_CONFIG[lang]["name"]
 
     logger.debug("Calling %s for %s vocabulary identification", model, lang_name)
     start_time = time.time()
 
-    response = client.chat.completions.create(
-        model=model,
+    response = generate_structured_response(
         response_model=VocabularyResponse,
-        messages=[
-            {
-                "role": "system",
-                "content": f"You are a {lang_name} language expert. "
-                f"Extract important vocabulary words from the given text. "
-                f"Focus on words that would be useful for language learners: "
-                f"nouns, verbs, adjectives, adverbs, and common expressions. "
-                f"Exclude very common words (like 'the', 'is', 'a' equivalents). "
-                f"Return each word in its dictionary/base form. "
-                f"IMPORTANT: Return ONLY the {lang_name} characters/script. "
-                f"Do NOT include any romanization (pinyin, romaja, etc.), pronunciation guides, or parenthetical annotations.",
-            },
-            {
-                "role": "user",
-                "content": f"Extract vocabulary words from this {lang_name} text:\n\n{text}",
-            },
-        ],
+        system_prompt=(
+            f"You are a {lang_name} language expert. "
+            "Extract important vocabulary words from the given text. "
+            "Focus on words that would be useful for language learners: "
+            "nouns, verbs, adjectives, adverbs, and common expressions. "
+            "Exclude very common words (like 'the', 'is', 'a' equivalents). "
+            "Return each word in its dictionary/base form. "
+            f"IMPORTANT: Return ONLY the {lang_name} characters/script. "
+            "Do NOT include any romanization (pinyin, romaja, etc.), "
+            "pronunciation guides, or parenthetical annotations."
+        ),
+        user_prompt=f"Extract vocabulary words from this {lang_name} text:\n\n{text}",
     )
 
     elapsed = time.time() - start_time

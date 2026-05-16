@@ -1,13 +1,17 @@
 """LLM client for generating sentences and translations."""
 
+import json
 import logging
 import os
+import re
 import time
 from typing import Literal
 
 import instructor
+from anthropic import Anthropic
 from dotenv import load_dotenv
 from openai import OpenAI
+from pydantic import BaseModel
 
 from ankigen.models import TranslationResponse, create_sentence_response
 
@@ -26,13 +30,17 @@ PROVIDER_CONFIG = {
         "base_url": "https://openrouter.ai/api/v1",
         "default_model": "openai/gpt-4o-mini",
     },
+    "anthropic": {
+        "base_url": "https://api.anthropic.com",
+        "default_model": "claude-sonnet-4-6",
+    },
     "local": {
         "base_url": "http://localhost:11434/v1",
         "default_model": "llama3",
     },
 }
 
-Provider = Literal["openai", "openrouter", "local"]
+Provider = Literal["openai", "openrouter", "anthropic", "local"]
 
 # Language configurations
 LANGUAGE_CONFIG = {
@@ -62,6 +70,12 @@ def get_provider() -> Provider:
 def get_client() -> instructor.Instructor:
     """Initialize and return the instructor-wrapped OpenAI client."""
     provider = get_provider()
+    if provider == "anthropic":
+        raise ValueError(
+            "LLM_PROVIDER=anthropic uses the Anthropic SDK directly. "
+            "Use generate_structured_response() for structured calls."
+        )
+
     config = PROVIDER_CONFIG[provider]
 
     # Use explicit base_url if set, otherwise use provider default
@@ -92,14 +106,89 @@ def get_client() -> instructor.Instructor:
     return instructor.from_openai(client)
 
 
+def get_anthropic_client() -> Anthropic:
+    """Initialize and return an Anthropic client."""
+    api_key = os.getenv("LLM_API_KEY", "")
+    base_url = os.getenv("LLM_BASE_URL") or PROVIDER_CONFIG["anthropic"]["base_url"]
+    return Anthropic(api_key=api_key, base_url=base_url)
+
+
 def get_model() -> str:
     """Get the model name from environment, with provider-aware defaults."""
+    provider = get_provider()
     model = os.getenv("LLM_MODEL")
     if model:
+        if provider == "anthropic":
+            if model.startswith("anthropic/"):
+                model = model.split("/", 1)[1]
+
+            anthropic_aliases = {
+                "claude-3.5-sonnet": "claude-sonnet-4-6",
+                "claude-3-5-sonnet-latest": "claude-sonnet-4-6",
+                "claude-3.5-haiku": "claude-haiku-4-5-20251001",
+                "claude-3-5-haiku-latest": "claude-haiku-4-5-20251001",
+            }
+            return anthropic_aliases.get(model, model)
         return model
 
-    provider = get_provider()
     return PROVIDER_CONFIG[provider]["default_model"]
+
+
+def _extract_json_payload(text: str) -> str:
+    """Extract a JSON object from model output, including fenced responses."""
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
+        stripped = re.sub(r"\s*```$", "", stripped)
+
+    match = re.search(r"\{.*\}", stripped, flags=re.DOTALL)
+    if match:
+        return match.group(0)
+    return stripped
+
+
+def generate_structured_response[ResponseModelT: BaseModel](
+    *,
+    response_model: type[ResponseModelT],
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int = 4096,
+) -> ResponseModelT:
+    """
+    Generate a structured response for either OpenAI-compatible or Anthropic providers.
+    """
+    provider = get_provider()
+    model = get_model()
+
+    if provider == "anthropic":
+        schema = json.dumps(response_model.model_json_schema(), ensure_ascii=False)
+        anthropic_client = get_anthropic_client()
+        response = anthropic_client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            system=(
+                f"{system_prompt}\n\n"
+                "Return ONLY a valid JSON object with no markdown fences.\n"
+                f"JSON schema:\n{schema}"
+            ),
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+
+        text_blocks = [block.text for block in response.content if block.type == "text"]
+        raw_text = "\n".join(text_blocks).strip()
+        return response_model.model_validate_json(_extract_json_payload(raw_text))
+
+    openai_client = get_client()
+    # instructor dynamically patches return types from response_model;
+    # generic type inference is limited for static analysis.
+    return openai_client.chat.completions.create(  # type: ignore[no-any-return]
+        model=model,
+        response_model=response_model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    )
 
 
 def generate_sentences(word: str, lang: Language = "zh", num_sentences: int = 3) -> list[str]:
@@ -114,7 +203,6 @@ def generate_sentences(word: str, lang: Language = "zh", num_sentences: int = 3)
     Returns:
         List of example sentences
     """
-    client = get_client()
     model = get_model()
     config = LANGUAGE_CONFIG[lang]
     SentenceResponse = create_sentence_response(num_sentences)
@@ -122,19 +210,13 @@ def generate_sentences(word: str, lang: Language = "zh", num_sentences: int = 3)
     logger.debug("Generating %d sentences for '%s' using %s", num_sentences, word, model)
     start_time = time.time()
 
-    response = client.chat.completions.create(
-        model=model,
+    response = generate_structured_response(
         response_model=SentenceResponse,
-        messages=[
-            {
-                "role": "system",
-                "content": f"You are a helpful {config['name']} language tutor. Generate natural, useful example sentences.",
-            },
-            {
-                "role": "user",
-                "content": config["sentence_prompt"].format(word=word, num_sentences=num_sentences),
-            },
-        ],
+        system_prompt=(
+            f"You are a helpful {config['name']} language tutor. "
+            "Generate natural, useful example sentences."
+        ),
+        user_prompt=config["sentence_prompt"].format(word=word, num_sentences=num_sentences),
     )
 
     elapsed = time.time() - start_time
@@ -156,26 +238,19 @@ def translate_word(word: str, lang: Language = "zh") -> str:
     Returns:
         English translation with part of speech
     """
-    client = get_client()
     model = get_model()
     config = LANGUAGE_CONFIG[lang]
 
     logger.debug("Translating '%s' (%s) using %s", word, lang, model)
     start_time = time.time()
 
-    response = client.chat.completions.create(
-        model=model,
+    response = generate_structured_response(
         response_model=TranslationResponse,
-        messages=[
-            {
-                "role": "system",
-                "content": f"You are a {config['name']}-English translator. Provide accurate, concise translations.",
-            },
-            {
-                "role": "user",
-                "content": config["translation_prompt"].format(word=word),
-            },
-        ],
+        system_prompt=(
+            f"You are a {config['name']}-English translator. "
+            "Provide accurate, concise translations."
+        ),
+        user_prompt=config["translation_prompt"].format(word=word),
     )
 
     elapsed = time.time() - start_time
