@@ -1,7 +1,5 @@
 """Tests for the LLM module (with mocking)."""
 
-from unittest.mock import MagicMock
-
 import pytest
 
 from ankigen.llm import generate_sentences, get_model, translate_word
@@ -13,29 +11,29 @@ class TestGenerateSentences:
 
     def test_generate_sentences_chinese(self, mocker, mock_sentences_zh):
         """Test sentence generation for Chinese."""
-        # Create mock response
         SentenceResponse = create_sentence_response(3)
         mock_response = SentenceResponse(sentences=mock_sentences_zh)
 
-        # Mock the client
-        mock_client = MagicMock()
-        mock_client.chat.completions.create.return_value = mock_response
-        mocker.patch("ankigen.llm.get_client", return_value=mock_client)
+        mock_generate = mocker.patch(
+            "ankigen.llm.generate_structured_response",
+            return_value=mock_response,
+        )
 
         result = generate_sentences("促使", lang="zh", num_sentences=3)
 
         assert result == mock_sentences_zh
         assert len(result) == 3
-        mock_client.chat.completions.create.assert_called_once()
+        mock_generate.assert_called_once()
 
     def test_generate_sentences_korean(self, mocker, mock_sentences_ko):
         """Test sentence generation for Korean."""
         SentenceResponse = create_sentence_response(3)
         mock_response = SentenceResponse(sentences=mock_sentences_ko)
 
-        mock_client = MagicMock()
-        mock_client.chat.completions.create.return_value = mock_response
-        mocker.patch("ankigen.llm.get_client", return_value=mock_client)
+        mocker.patch(
+            "ankigen.llm.generate_structured_response",
+            return_value=mock_response,
+        )
 
         result = generate_sentences("편한", lang="ko", num_sentences=3)
 
@@ -48,9 +46,10 @@ class TestGenerateSentences:
         SentenceResponse = create_sentence_response(2)
         mock_response = SentenceResponse(sentences=sentences)
 
-        mock_client = MagicMock()
-        mock_client.chat.completions.create.return_value = mock_response
-        mocker.patch("ankigen.llm.get_client", return_value=mock_client)
+        mocker.patch(
+            "ankigen.llm.generate_structured_response",
+            return_value=mock_response,
+        )
 
         result = generate_sentences("test", lang="zh", num_sentences=2)
 
@@ -61,16 +60,16 @@ class TestGenerateSentences:
         SentenceResponse = create_sentence_response(3)
         mock_response = SentenceResponse(sentences=mock_sentences_zh)
 
-        mock_client = MagicMock()
-        mock_client.chat.completions.create.return_value = mock_response
-        mocker.patch("ankigen.llm.get_client", return_value=mock_client)
+        mock_generate = mocker.patch(
+            "ankigen.llm.generate_structured_response",
+            return_value=mock_response,
+        )
 
         generate_sentences("促使", lang="zh", num_sentences=3)
 
-        # Check that the call included Chinese in the prompt
-        call_args = mock_client.chat.completions.create.call_args
-        messages = call_args.kwargs["messages"]
-        assert any("Chinese" in msg["content"] for msg in messages)
+        call_kwargs = mock_generate.call_args.kwargs
+        assert "Chinese" in call_kwargs["system_prompt"]
+        assert "Chinese" in call_kwargs["user_prompt"]
 
 
 class TestTranslateWord:
@@ -80,22 +79,24 @@ class TestTranslateWord:
         """Test translation of Chinese word."""
         mock_response = TranslationResponse(translation=mock_translation_zh)
 
-        mock_client = MagicMock()
-        mock_client.chat.completions.create.return_value = mock_response
-        mocker.patch("ankigen.llm.get_client", return_value=mock_client)
+        mock_generate = mocker.patch(
+            "ankigen.llm.generate_structured_response",
+            return_value=mock_response,
+        )
 
         result = translate_word("促使", lang="zh")
 
         assert result == mock_translation_zh
-        mock_client.chat.completions.create.assert_called_once()
+        mock_generate.assert_called_once()
 
     def test_translate_korean_word(self, mocker, mock_translation_ko):
         """Test translation of Korean word."""
         mock_response = TranslationResponse(translation=mock_translation_ko)
 
-        mock_client = MagicMock()
-        mock_client.chat.completions.create.return_value = mock_response
-        mocker.patch("ankigen.llm.get_client", return_value=mock_client)
+        mocker.patch(
+            "ankigen.llm.generate_structured_response",
+            return_value=mock_response,
+        )
 
         result = translate_word("편한", lang="ko")
 

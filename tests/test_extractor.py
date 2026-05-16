@@ -100,22 +100,24 @@ class TestIdentifyVocabulary:
         """Test vocabulary identification for Chinese text."""
         mock_response = VocabularyResponse(words=sample_chinese_words)
 
-        mock_client = MagicMock()
-        mock_client.chat.completions.create.return_value = mock_response
-        mocker.patch("ankigen.extractor.get_client", return_value=mock_client)
+        mock_generate = mocker.patch(
+            "ankigen.extractor.generate_structured_response",
+            return_value=mock_response,
+        )
 
         result = identify_vocabulary("这是一段中文文本", lang="zh")
 
         assert result == sample_chinese_words
-        mock_client.chat.completions.create.assert_called_once()
+        mock_generate.assert_called_once()
 
     def test_identify_vocabulary_korean(self, mocker, sample_korean_words):
         """Test vocabulary identification for Korean text."""
         mock_response = VocabularyResponse(words=sample_korean_words)
 
-        mock_client = MagicMock()
-        mock_client.chat.completions.create.return_value = mock_response
-        mocker.patch("ankigen.extractor.get_client", return_value=mock_client)
+        mocker.patch(
+            "ankigen.extractor.generate_structured_response",
+            return_value=mock_response,
+        )
 
         result = identify_vocabulary("이것은 한국어 텍스트입니다", lang="ko")
 
@@ -125,15 +127,16 @@ class TestIdentifyVocabulary:
         """Test that correct language is used in prompt."""
         mock_response = VocabularyResponse(words=sample_chinese_words)
 
-        mock_client = MagicMock()
-        mock_client.chat.completions.create.return_value = mock_response
-        mocker.patch("ankigen.extractor.get_client", return_value=mock_client)
+        mock_generate = mocker.patch(
+            "ankigen.extractor.generate_structured_response",
+            return_value=mock_response,
+        )
 
         identify_vocabulary("Text content", lang="zh")
 
-        call_args = mock_client.chat.completions.create.call_args
-        messages = call_args.kwargs["messages"]
-        assert any("Chinese" in msg["content"] for msg in messages)
+        call_kwargs = mock_generate.call_args.kwargs
+        assert "Chinese" in call_kwargs["system_prompt"]
+        assert "Chinese" in call_kwargs["user_prompt"]
 
 
 class TestExtractVocabularyFromFile:
