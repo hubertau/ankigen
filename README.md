@@ -1,12 +1,15 @@
 # ankigen
 
-Generate Anki vocabulary CSVs with LLM-powered example sentences and translations.
+Generate Anki vocabulary **and grammar** CSVs with LLM-powered example sentences and translations.
 
 ## Features
 
 - **Multi-language support**: Chinese (with Jyutping) and Korean
 - **LLM-powered**: Generate natural example sentences and translations
-- **PDF & Image extraction**: Extract vocabulary from PDFs or images (OCR via GPT-4 Vision)
+- **Two card types**: vocabulary words *and* grammar patterns (`--mode grammar`/`all`)
+- **PDF, DOCX & Image extraction**: Extract from PDFs, Word documents, or images (OCR via GPT-4 Vision)
+- **Folder & directory inputs**: Run on the configured watch folder *or* point `extract` at any directory (with optional `--recursive`)
+- **Verbatim teacher examples**: Grammar mode preserves the example sentences from teacher notes and only asks the LLM to top up when there aren't enough
 - **Input cleaning**: Automatically remove translations, romanization, and annotations from input files
 - **Similarity review**: Surface near-duplicate, variant, and contained terms (within a list or vs an Anki deck)
 - **Flexible providers**: OpenAI, Anthropic, OpenRouter, or local models (Ollama, vLLM)
@@ -80,7 +83,15 @@ Run `ankigen status` to see resolved Anki-related paths and whether the database
 
 ankigen uses subcommands for different operations:
 
-### Generate: Create Anki CSV from word list
+### Generate: Create Anki CSV from a word list or grammar JSONL
+
+`generate` understands three modes via `--mode`:
+
+| `--mode` | Input | Output | Anki note shape |
+|----------|-------|--------|-----------------|
+| `vocab` (default) | `.txt` (one word per line) | `outputs/{lang}/output_{stem}.csv` | Hanzi/Korean, Jyutping (zh only), English, Sentence |
+| `grammar` (auto-detected from `.jsonl`) | `_grammar.jsonl` | `outputs/{lang}/output_{stem}_grammar.csv` | **Pattern, Meaning, Explanation, Examples** (4 cols) |
+| `all` | Either of the two — sibling is inferred | Both CSVs | both |
 
 ```bash
 # Create a word list (one word per line)
@@ -92,29 +103,45 @@ echo "促使
 ankigen generate inputs/zh/words.txt
 ```
 
-**Output**: `outputs/zh/output_words.csv`
+**Vocab output** (`outputs/zh/output_words.csv`):
 
 | Hanzi | Jyutping | English | Sentence |
 |-------|----------|---------|----------|
 | 促使 | cuk1sai2 | Verb: to urge, to spur | (HTML formatted sentences) |
 
+**Grammar output** (`outputs/ko/output_20260516_grammar.csv`):
+
+| Pattern | Meaning | Explanation | Examples |
+|---------|---------|-------------|----------|
+| ~게 되다 | To end up doing / change of state | Used to express a change of state caused by external circumstances. | (HTML: each verbatim teacher example highlighted, with English translation underneath) |
+
+The Examples column preserves the teacher's verbatim sentences from the source DOCX. If a pattern has fewer than `-n` examples, the LLM tops up the rest.
+
 **Options**:
 
 | Option | Description |
 |--------|-------------|
-| `-o, --output FILE` | Custom output file path |
+| `-o, --output FILE` | Custom output file path. Ignored in `--mode all`. |
 | `--lang {zh,ko}` | Language: Chinese or Korean (default: zh) |
-| `-n, --sentences N` | Number of sentences per word (default: 3, 0 to skip) |
-| `-c, --clean` | Clean input before processing (removes translations, romanization) |
+| `--mode {vocab,grammar,all}` | What to generate (default: vocab; `.jsonl` inputs auto-detect grammar) |
+| `-n, --sentences N` | Number of sentences/examples per card (default: 3, 0 to skip). In grammar mode this is the *target* — verbatim teacher examples are kept and the LLM is only called for the missing ones. |
+| `-c, --clean` | Clean input before processing (removes translations, romanization). No-op in grammar mode. |
 | `--anki-db PATH` | Anki collection (`.anki2` / `.apkg`); overrides `ANKIGEN_ANKI_DB` |
-| `--anki-deck NAME` | Deck to scan (e.g. `Chinese::Vocab`); overrides env |
-| `--anki-field ARG` | Field index (e.g. `0`) or field name (e.g. `Hanzi`); overrides env |
+| `--anki-deck NAME` | Deck to scan (e.g. `Chinese::Vocab`, `Korean::Grammar`); overrides env |
+| `--anki-field ARG` | Field index (e.g. `0`) or field name (e.g. `Hanzi`, `Pattern`); overrides env |
 
 **Examples**:
 
 ```bash
 # Korean vocabulary
 ankigen generate inputs/ko/words.txt --lang ko
+
+# Korean grammar (mode auto-detected from .jsonl extension)
+ankigen generate inputs/ko/20260516_grammar.jsonl --lang ko
+
+# Both at once — pass either sibling and the other is found automatically
+ankigen generate inputs/ko/20260516.txt --mode all --lang ko
+# → outputs/ko/output_20260516.csv  AND  outputs/ko/output_20260516_grammar.csv
 
 # Only translations (no sentences)
 ankigen generate words.txt -n 0
@@ -126,57 +153,100 @@ ankigen generate messy_words.txt --lang ko --clean
 ankigen generate words.txt -o my_vocab.csv
 ```
 
-### Extract: Get vocabulary from PDFs or images
+### Extract: Get vocabulary or grammar from PDFs / DOCX / images
 
-Extract vocabulary words from documents using PDF text extraction or OCR (via GPT-4 Vision).
+Extract vocabulary words *or* grammar patterns from documents using PDF text extraction, native DOCX parsing, or OCR (via GPT-4 Vision).
+
+`extract` supports three modes via `--mode`:
+
+| `--mode` | What it produces | Files moved to `processed/` after run? |
+|----------|--------------------------------------------------|---------------------------------------|
+| `vocab` (default) | One word per line `.txt` | No |
+| `grammar` | JSONL with one grammar item per line | No |
+| `all` | Both files in one pass (single text-extraction pass per file is reused for both LLM calls) | Yes (use `--no-move` to opt out) |
+
+> **Heads-up (behavior change):** previously, watch-folder `extract` always moved files. Now only `--mode all` moves them, so you can run `vocab` and `grammar` on the same folder without losing the source. To get the old behavior, use `ankigen extract --mode all --lang ko`.
 
 **Single file mode**:
 
-```bash
-# Extract from PDF
-ankigen extract textbook.pdf --lang zh -o inputs/zh/vocab.txt
+By default, single-file extracts go to a **dated** file in `{ANKIGEN_OUTPUT_DIR}/{lang}/` so multiple extracts on the same day accumulate (with dedupe) into the same file — matching watch/folder mode:
 
-# Extract from image (uses GPT-4 Vision for OCR)
-ankigen extract screenshot.png --lang ko -o inputs/ko/words.txt
+| Mode | Default output |
+|------|----------------|
+| vocab | `inputs/{lang}/{YYYYMMDD}.txt` |
+| grammar | `inputs/{lang}/{YYYYMMDD}_grammar.jsonl` |
+| all | both of the above |
 
-# Append to existing file (skips duplicates)
-ankigen extract page2.pdf --lang zh -o inputs/zh/vocab.txt --append
-
-# Overwrite existing file
-ankigen extract new_doc.pdf --lang zh -o inputs/zh/vocab.txt --overwrite
-```
-
-**Watch folder mode** (batch processing):
-
-When run without a file argument, processes all PDFs/images from the language-specific watch folder:
+Pass `-o` to override; pass `--overwrite` to wipe instead of append.
 
 ```bash
-# Process all files in watch/zh/
-ankigen extract --lang zh
+# Vocab from a PDF — appends to today's inputs/zh/{YYYYMMDD}.txt (dedupe)
+ankigen extract textbook.pdf --lang zh
 
-# Process all files in watch/ko/
-ankigen extract --lang ko
+# Vocab from an image (uses GPT-4 Vision for OCR)
+ankigen extract screenshot.png --lang ko
 
-# Process without moving files to processed folder
-ankigen extract --lang zh --no-move
+# Grammar from a teacher's DOCX → appends to today's grammar JSONL
+ankigen extract notes.docx --lang ko --mode grammar
+# → inputs/ko/{YYYYMMDD}_grammar.jsonl
+
+# Both in one shot (single text-extraction pass, reused for both LLM calls)
+ankigen extract notes.docx --lang ko --mode all
+# → inputs/ko/{YYYYMMDD}.txt  AND  inputs/ko/{YYYYMMDD}_grammar.jsonl
+
+# Custom output path
+ankigen extract page2.pdf --lang zh -o inputs/zh/chapter1.txt
+
+# Wipe the dated file before this run
+ankigen extract new_doc.pdf --lang zh --overwrite
 ```
 
-Watch folder behavior:
-1. Reads all PDF/image files from `{ANKIGEN_WATCH_DIR}/{lang}/` (e.g., `watch/zh/`)
-2. Extracts vocabulary and combines into `{ANKIGEN_OUTPUT_DIR}/{lang}/{YYYYMMDD}.txt`
-3. Moves processed files to `{ANKIGEN_PROCESSED_DIR}/{lang}/` (e.g., `processed/zh/`)
-4. Automatically deduplicates if output file already exists
+**Folder mode** (point at any directory):
+
+```bash
+# Process every supported file in a folder
+ankigen extract ~/Downloads/teacher_notes/ --lang ko --mode grammar
+
+# Recurse into subdirectories
+ankigen extract ~/Downloads/teacher_notes/ --lang ko --mode all --recursive
+```
+
+**Watch folder mode** (batch processing without a path argument):
+
+When run without an `input_file`, processes all supported files from the language-specific watch folder:
+
+```bash
+# Vocab only — leaves files in watch/ko/ so you can run grammar after
+ankigen extract --lang ko --mode vocab
+
+# Grammar only — also leaves files in place
+ankigen extract --lang ko --mode grammar
+
+# Do both, then move source files to processed/ko/
+ankigen extract --lang ko --mode all
+
+# Same as above but keep the source files
+ankigen extract --lang ko --mode all --no-move
+```
+
+Watch / folder behavior:
+1. Reads all supported files from the directory (the configured `{ANKIGEN_WATCH_DIR}/{lang}/` or whichever directory you pass on the command line).
+2. Combines extracted output into `{ANKIGEN_OUTPUT_DIR}/{lang}/{YYYYMMDD}.txt` (vocab) and/or `{ANKIGEN_OUTPUT_DIR}/{lang}/{YYYYMMDD}_grammar.jsonl` (grammar).
+3. With `--mode all` only, moves each successfully-processed source file to `{ANKIGEN_PROCESSED_DIR}/{lang}/` (use `--no-move` to opt out).
+4. Re-runs on the same day append+dedupe instead of overwriting.
 
 **Options**:
 
 | Option | Description |
 |--------|-------------|
-| `-o, --output FILE` | Output text file (default: inputs/{lang}/{input_stem}.txt or {YYYYMMDD}.txt) |
+| `-o, --output FILE` | Output file (single-file mode). Default mirrors watch/folder mode: `inputs/{lang}/{YYYYMMDD}.txt` for vocab or `inputs/{lang}/{YYYYMMDD}_grammar.jsonl` for grammar — multiple single-file extracts on the same day append+dedupe into the same dated file. Ignored in `--mode all` and folder/watch modes. |
 | `--lang {zh,ko}` | Language of the content (default: zh) |
-| `-a, --append` | Append to existing file (skips duplicates) |
-| `--overwrite` | Overwrite existing file |
-| `--no-move` | Don't move processed files (watch folder mode only) |
-| `--anki-db`, `--anki-deck`, `--anki-field` | Skip words already in Anki (see [Anki database filtering](#anki-database-filtering-optional)) |
+| `--mode {vocab,grammar,all}` | What to extract (default: vocab) |
+| `-a, --append` | Kept for backward compatibility. Append+dedupe is now the default when the output file exists. |
+| `--overwrite` | Wipe the output file before writing (defeats the default append+dedupe). |
+| `--no-move` | Don't move processed files (only meaningful in folder/watch mode with `--mode all`) |
+| `--recursive` | When the input is a directory, also walk subdirectories |
+| `--anki-db`, `--anki-deck`, `--anki-field` | Skip words/patterns already in Anki (see [Anki database filtering](#anki-database-filtering-optional)) |
 
 **Supported formats**: PDF, DOCX, PNG, JPG, JPEG, GIF, WEBP
 
@@ -310,19 +380,44 @@ mkdir -p watch/zh watch/ko
 cp chinese_textbook.pdf watch/zh/
 cp korean_vocabulary.png watch/ko/
 
-# 3. Process each language separately
-ankigen extract --lang zh
-ankigen extract --lang ko
+# 3. Process each language. Use --mode all to extract both vocab AND grammar
+#    in one shared text-extraction pass and move source files to processed/
+ankigen extract --lang zh --mode all
+ankigen extract --lang ko --mode all
 
 # 4. Files are moved to processed/zh/ and processed/ko/
-#    Vocabulary saved to inputs/zh/20251207.txt and inputs/ko/20251207.txt
+#    Vocabulary saved to inputs/zh/20260516.txt and inputs/ko/20260516.txt
+#    Grammar saved to inputs/zh/20260516_grammar.jsonl etc.
 
-# 5. Generate Anki CSVs
-ankigen generate inputs/zh/20251207.txt
-ankigen generate inputs/ko/20251207.txt --lang ko
+# 5. Generate Anki CSVs (also in --mode all to handle both card types)
+ankigen generate inputs/zh/20260516.txt --mode all
+ankigen generate inputs/ko/20260516.txt --lang ko --mode all
 
 # 6. Add more files to watch/{lang}/ and repeat daily
 ```
+
+### Grammar workflow (teacher class notes)
+
+For teacher-style DOCX notes that contain grammar patterns with worked examples:
+
+```bash
+# 1. Extract grammar items (verbatim teacher examples preserved). Multiple
+#    single-file runs on the same day all append+dedupe into the same dated file.
+ankigen extract ~/Downloads/notes_february.docx --lang ko --mode grammar
+ankigen extract ~/Downloads/notes_march.docx --lang ko --mode grammar
+# → inputs/ko/{YYYYMMDD}_grammar.jsonl  (one file, both docs' patterns)
+
+# 2. (Optional) Hand-edit the JSONL to fix patterns or remove noise
+
+# 3. Generate the 4-column Anki grammar CSV
+ankigen generate inputs/ko/{YYYYMMDD}_grammar.jsonl --lang ko -n 5
+# → outputs/ko/output_{YYYYMMDD}_grammar.csv
+#   Columns: Pattern | Meaning | Explanation | Examples
+```
+
+In `generate --mode grammar`, `-n` is the *target* number of examples per card:
+verbatim teacher examples are kept as-is and the LLM is only asked to top up the
+missing slots.
 
 ## Development
 
@@ -365,16 +460,18 @@ ankigen/
 │   ├── __init__.py
 │   ├── cli.py            # CLI entry point (generate, extract, clean, similar)
 │   ├── cleaner.py        # Input file cleaning
-│   ├── extractor.py      # PDF/image extraction, OCR, and watch folder
+│   ├── extractor.py      # PDF/DOCX/image extraction, OCR, watch & ad-hoc folder
+│   ├── grammar.py        # Grammar extraction, JSONL round-trip, 4-column CSV
 │   ├── similarity.py     # Near-duplicate / variant detection
 │   ├── formatter.py      # HTML sentence formatting
 │   ├── llm.py            # LLM client (OpenAI-compatible)
 │   ├── logging_config.py # Logging setup with file rotation
-│   └── models.py         # Pydantic response models
+│   └── models.py         # Pydantic response models (vocab + grammar)
 ├── tests/
 │   ├── conftest.py       # Test fixtures
 │   ├── test_cleaner.py
 │   ├── test_extractor.py
+│   ├── test_grammar.py
 │   ├── test_similarity.py
 │   ├── test_formatter.py
 │   └── test_llm.py

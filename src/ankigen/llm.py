@@ -13,7 +13,12 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from pydantic import BaseModel
 
-from ankigen.models import TranslationResponse, create_sentence_response
+from ankigen.models import (
+    GrammarExample,
+    TranslationResponse,
+    create_grammar_example_response,
+    create_sentence_response,
+)
 
 logger = logging.getLogger("ankigen.llm")
 
@@ -48,11 +53,60 @@ LANGUAGE_CONFIG = {
         "name": "Chinese",
         "sentence_prompt": "Generate exactly {num_sentences} natural example sentences in Chinese using the word '{word}'. The sentences should demonstrate different usages and contexts of the word. Return only the sentences, no translations or explanations.",
         "translation_prompt": "Translate the Chinese word '{word}' to English. Include the part of speech and any common meanings or usages. Do NOT include pinyin or the original Chinese characters. Be concise.",
+        "grammar_extraction_system": (
+            "You are a Chinese language expert helping a learner build Anki grammar cards "
+            "from a teacher's class notes. Identify each distinct grammatical construction "
+            "(pattern / sentence-final ending / collocation) the teacher introduces or "
+            "explains. Skip vocabulary lists, free-form student-correction sections, and "
+            "speaking-practice sections that do NOT introduce a new grammar pattern. "
+            "For every construction, capture the teacher's example sentences VERBATIM in "
+            "Chinese, alongside any English translations the teacher provides. Keep the "
+            "explanation short (1-3 sentences) and prefer the teacher's wording when present. "
+            "Return the canonical Chinese pattern as the `pattern` field — never English."
+        ),
+        "grammar_extraction_user": (
+            "Extract every grammatical construction taught in this Chinese class-notes "
+            "document. Heading lines may be prefixed with [H1]/[H2]/[H3] markers; treat "
+            "Heading 2/3 lines as strong signals that a new grammar point starts. Preserve "
+            "Chinese example sentences exactly as written (do not translate them, do not "
+            "rewrite them).\n\n{text}"
+        ),
+        "grammar_example_topup_prompt": (
+            "Generate exactly {num_examples} natural Chinese example sentences that use the "
+            "grammar pattern '{pattern}'. Each example should clearly demonstrate the pattern "
+            "and feel like something a teacher would write for a learner. For every example, "
+            "also provide a short English translation. Do NOT include pinyin."
+        ),
     },
     "ko": {
         "name": "Korean",
         "sentence_prompt": "Generate exactly {num_sentences} natural example sentences in Korean using the word '{word}'. The sentences should demonstrate different usages and contexts of the word. Return only the sentences, no translations or explanations.",
         "translation_prompt": "Translate the Korean word '{word}' to English. Include the part of speech and any common meanings or usages. Do NOT include romanization or the original Korean characters. Be concise.",
+        "grammar_extraction_system": (
+            "You are a Korean language expert helping a learner build Anki grammar cards "
+            "from a teacher's class notes. Identify each distinct grammatical construction "
+            "(particle, ending, pattern, collocation) the teacher introduces or explains. "
+            "Skip vocabulary lists ('오늘의 단어'), free-form student-correction sections, "
+            "and speaking-practice sections that do NOT introduce a new grammar pattern. "
+            "For every construction, capture the teacher's example sentences VERBATIM in "
+            "Korean, alongside any English translations the teacher provides. Keep the "
+            "explanation short (1-3 sentences) and prefer the teacher's wording when present. "
+            "Return the canonical Korean pattern as the `pattern` field — never English. "
+            "Use a leading '~' for endings/particles when appropriate (e.g. '~게 되다')."
+        ),
+        "grammar_extraction_user": (
+            "Extract every grammatical construction taught in this Korean class-notes "
+            "document. Heading lines may be prefixed with [H1]/[H2]/[H3] markers; treat "
+            "Heading 2/3 lines as strong signals that a new grammar point starts. Preserve "
+            "Korean example sentences exactly as written (do not translate them, do not "
+            "rewrite them).\n\n{text}"
+        ),
+        "grammar_example_topup_prompt": (
+            "Generate exactly {num_examples} natural Korean example sentences that use the "
+            "grammar pattern '{pattern}'. Each example should clearly demonstrate the pattern "
+            "and feel like something a teacher would write for a learner. For every example, "
+            "also provide a short English translation. Do NOT include romanization."
+        ),
     },
 }
 
@@ -263,3 +317,56 @@ def translate_word(word: str, lang: Language = "zh") -> str:
         translation[:50] if len(translation) > 50 else translation,
     )
     return translation  # type: ignore[no-any-return]
+
+
+def generate_grammar_examples(
+    pattern: str,
+    lang: Language = "ko",
+    num_examples: int = 3,
+) -> list[GrammarExample]:
+    """
+    Generate fresh example sentences for a grammar pattern via the LLM.
+
+    Used to "top up" the verbatim teacher examples when the source doc has fewer
+    than the desired number of examples per card.
+
+    Args:
+        pattern: The grammar pattern (e.g. '~게 되다', '에 + 씩').
+        lang: Language code ('zh' for Chinese, 'ko' for Korean).
+        num_examples: Number of examples to generate.
+
+    Returns:
+        List of GrammarExample (target + english).
+    """
+    if num_examples <= 0:
+        return []
+
+    model = get_model()
+    config = LANGUAGE_CONFIG[lang]
+    ResponseModel = create_grammar_example_response(num_examples)
+
+    logger.debug(
+        "Generating %d grammar example(s) for '%s' using %s",
+        num_examples,
+        pattern,
+        model,
+    )
+    start_time = time.time()
+
+    response = generate_structured_response(
+        response_model=ResponseModel,
+        system_prompt=(
+            f"You are a helpful {config['name']} language tutor. "
+            "Generate natural, useful example sentences for grammar patterns, "
+            "with clear English translations."
+        ),
+        user_prompt=config["grammar_example_topup_prompt"].format(  # type: ignore[index]
+            pattern=pattern,
+            num_examples=num_examples,
+        ),
+    )
+
+    elapsed = time.time() - start_time
+    examples = response.examples  # type: ignore[attr-defined]
+    logger.debug("Generated %d grammar example(s) in %.2fs", len(examples), elapsed)
+    return examples  # type: ignore[no-any-return]
