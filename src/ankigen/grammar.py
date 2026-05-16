@@ -7,8 +7,10 @@ Pipeline mirrors the vocab pipeline but at the level of grammatical construction
 2. ``write_grammar_jsonl`` / ``read_grammar_jsonl`` round-trip a list of
    :class:`~ankigen.models.GrammarItem` to/from JSONL — one item per line.
 3. ``generate_grammar_csv`` reads the JSONL, tops up examples with the LLM if the
-   teacher did not provide enough, HTML-formats them, and writes a 4-column
-   Anki CSV: Pattern | Meaning | Explanation | Examples.
+   teacher did not provide enough, HTML-formats them, and writes a 3-column
+   Anki CSV: Pattern | Meaning | Examples. The ``Meaning`` cell combines the
+   short ``meaning`` gloss (bolded) with the longer ``explanation`` on the
+   next line.
 """
 
 from __future__ import annotations
@@ -31,7 +33,7 @@ from ankigen.models import GrammarExample, GrammarExtractionResponse, GrammarIte
 
 logger = logging.getLogger("ankigen.grammar")
 
-GRAMMAR_CSV_FIELDNAMES = ["Pattern", "Meaning", "Explanation", "Examples"]
+GRAMMAR_CSV_FIELDNAMES = ["Pattern", "Meaning", "Examples"]
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +200,19 @@ def _merge_examples(
     return verbatim + topup
 
 
+def format_grammar_meaning(meaning: str, explanation: str) -> str:
+    """
+    Combine the LLM's short ``meaning`` gloss with the longer ``explanation`` into
+    a single Anki cell. When both are present, the meaning is bolded and the
+    explanation follows on the next line; otherwise the non-empty field is
+    returned as plain text.
+    """
+    m, e = meaning.strip(), explanation.strip()
+    if m and e:
+        return f"<b>{m}</b><br>{e}"
+    return m or e
+
+
 def format_grammar_examples(examples: list[GrammarExample], pattern: str) -> str:
     """
     Render examples as inline HTML for an Anki cell.
@@ -239,7 +254,7 @@ def generate_grammar_csv(
     exclude_patterns: set[str] | None = None,
 ) -> None:
     """
-    Generate the 4-column grammar Anki CSV from a JSONL file.
+    Generate the 3-column grammar Anki CSV from a JSONL file.
 
     Args:
         input_path: Path to the JSONL file written by ``extract --mode grammar``.
@@ -271,8 +286,7 @@ def generate_grammar_csv(
             writer.writerow(
                 {
                     "Pattern": item.pattern,
-                    "Meaning": item.meaning,
-                    "Explanation": item.explanation,
+                    "Meaning": format_grammar_meaning(item.meaning, item.explanation),
                     "Examples": examples_html,
                 }
             )
@@ -300,6 +314,7 @@ __all__ = [
     "extract_grammar_items",
     "extract_grammar_from_file",
     "format_grammar_examples",
+    "format_grammar_meaning",
     "generate_grammar_csv",
     "grammar_csv_path_for_stem",
     "grammar_jsonl_path_for_stem",

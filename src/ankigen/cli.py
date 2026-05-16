@@ -666,7 +666,9 @@ def cmd_similar(args: argparse.Namespace) -> None:
             f"Input: {args.input_file}   Terms: {len(words)}   Threshold: {args.threshold}"
         )
         extra_line = (
-            f"Anki cross-check: {len(anki_words)} card(s)" if anki_words else "Anki cross-check: (off)"
+            f"Anki cross-check: {len(anki_words)} card(s)"
+            if anki_words
+            else "Anki cross-check: (off)"
         )
         report_source = str(args.input_file)
 
@@ -895,9 +897,9 @@ def main() -> None:
         choices=["vocab", "grammar", "all"],
         default="vocab",
         help=(
-            "What to generate: vocab (default), grammar (4-column Pattern/Meaning/"
-            "Explanation/Examples CSV from a JSONL), or all (both — sibling file "
-            "is inferred from the given path). `.jsonl` inputs auto-detect grammar."
+            "What to generate: vocab (default), grammar (3-column Pattern/Meaning/"
+            "Examples CSV from a JSONL), or all (both — sibling file is inferred "
+            "from the given path). `.jsonl` inputs auto-detect grammar."
         ),
     )
     _add_anki_args(gen_parser)
