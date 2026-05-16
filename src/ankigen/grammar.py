@@ -17,11 +17,13 @@ from __future__ import annotations
 
 import csv
 import logging
+import os
 import time
 import unicodedata
 from pathlib import Path
 
 from ankigen.anki_db import normalize_anki_term
+from ankigen.chunking import estimate_tokens, split_text_for_extraction
 from ankigen.extractor import extract_source_text
 from ankigen.hanja_lookup import resolve_hanja
 from ankigen.llm import (
@@ -36,10 +38,77 @@ logger = logging.getLogger("ankigen.grammar")
 
 GRAMMAR_CSV_FIELDNAMES = ["Pattern", "Hanja", "Meaning", "Examples"]
 
+_DEFAULT_CHUNK_TOKENS = 20_000
+
 
 # ---------------------------------------------------------------------------
 # Extraction
 # ---------------------------------------------------------------------------
+
+
+def _get_chunk_tokens() -> int:
+    """Read ``ANKIGEN_LLM_CHUNK_TOKENS`` (default 20k) for extract chunking."""
+    raw = os.getenv("ANKIGEN_LLM_CHUNK_TOKENS")
+    if not raw:
+        return _DEFAULT_CHUNK_TOKENS
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid ANKIGEN_LLM_CHUNK_TOKENS=%r; using default %d",
+            raw,
+            _DEFAULT_CHUNK_TOKENS,
+        )
+        return _DEFAULT_CHUNK_TOKENS
+    return max(1, value)
+
+
+def _merge_grammar_items(chunks: list[list[GrammarItem]]) -> list[GrammarItem]:
+    """Merge grammar items across chunks, deduping by NFC-normalised pattern.
+
+    When the same pattern appears in multiple chunks, the first occurrence's
+    ``meaning`` / ``explanation`` / ``hanja`` is kept and example lists are
+    concatenated (deduped by NFC-normalised ``target``). Output order follows
+    the first appearance of each pattern.
+    """
+    by_key: dict[str, GrammarItem] = {}
+    order: list[str] = []
+    seen_examples: dict[str, set[str]] = {}
+
+    for chunk in chunks:
+        for item in chunk:
+            key = _normalise_pattern(item.pattern)
+            if key not in by_key:
+                # First sighting: deep-ish copy via Pydantic to avoid mutating
+                # the caller's list and to dedupe its own example list.
+                deduped_examples: list[GrammarExample] = []
+                target_seen: set[str] = set()
+                for ex in item.examples:
+                    norm = unicodedata.normalize("NFC", ex.target.strip())
+                    if norm and norm not in target_seen:
+                        target_seen.add(norm)
+                        deduped_examples.append(ex)
+                by_key[key] = item.model_copy(update={"examples": deduped_examples})
+                seen_examples[key] = target_seen
+                order.append(key)
+                continue
+
+            # Existing pattern: append any new examples, dedup by NFC target.
+            existing = by_key[key]
+            target_seen = seen_examples[key]
+            added: list[GrammarExample] = list(existing.examples)
+            for ex in item.examples:
+                norm = unicodedata.normalize("NFC", ex.target.strip())
+                if norm and norm not in target_seen:
+                    target_seen.add(norm)
+                    added.append(ex)
+            # Backfill hanja if first chunk left it empty but a later one has it.
+            updated_hanja = existing.hanja
+            if not updated_hanja.strip() and item.hanja.strip():
+                updated_hanja = item.hanja
+            by_key[key] = existing.model_copy(update={"examples": added, "hanja": updated_hanja})
+
+    return [by_key[k] for k in order]
 
 
 def extract_grammar_items(text: str, lang: Language = "ko") -> list[GrammarItem]:
@@ -48,6 +117,12 @@ def extract_grammar_items(text: str, lang: Language = "ko") -> list[GrammarItem]
 
     Heading markers (``[H1]``, ``[H2]``, ``[H3]``) in the input are passed
     through and used as structural hints by the prompt.
+
+    Long inputs are automatically split into chunks (each under
+    ``ANKIGEN_LLM_CHUNK_TOKENS`` tokens) so a single call never exceeds the
+    provider's per-minute input-token budget. Grammar items are merged across
+    chunks: items sharing an NFC-normalised pattern are coalesced and their
+    example lists are concatenated and deduped.
     """
     if not text.strip():
         return []
@@ -56,17 +131,31 @@ def extract_grammar_items(text: str, lang: Language = "ko") -> list[GrammarItem]
     system_prompt = config["grammar_extraction_system"]
     user_prompt_template = config["grammar_extraction_user"]
 
+    chunks = split_text_for_extraction(text, _get_chunk_tokens())
+    if len(chunks) > 1:
+        logger.info(
+            "Splitting grammar extract into %d chunks (~%d tokens total) to respect rate limit",
+            len(chunks),
+            estimate_tokens(text),
+        )
+
     logger.debug("Identifying grammar items from %d characters (%s)", len(text), lang)
     start_time = time.time()
 
-    response = generate_structured_response(
-        response_model=GrammarExtractionResponse,
-        system_prompt=system_prompt,
-        user_prompt=user_prompt_template.format(text=text),
-    )
+    chunk_items: list[list[GrammarItem]] = []
+    for idx, chunk in enumerate(chunks, start=1):
+        if len(chunks) > 1:
+            logger.info("Identifying grammar items from chunk %d/%d", idx, len(chunks))
+        response = generate_structured_response(
+            response_model=GrammarExtractionResponse,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt_template.format(text=chunk),
+        )
+        chunk_items.append(list(response.items))
+
+    items = _merge_grammar_items(chunk_items)
 
     elapsed = time.time() - start_time
-    items = list(response.items)
     logger.debug("Grammar identification completed in %.2fs", elapsed)
     logger.info("Identified %d grammar item(s)", len(items))
     return items

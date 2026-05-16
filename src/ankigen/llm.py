@@ -5,6 +5,8 @@ import logging
 import os
 import re
 import time
+from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -14,6 +16,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from pydantic import BaseModel
 
+from ankigen.chunking import estimate_tokens
 from ankigen.models import (
     GrammarExample,
     KoreanTranslationResponse,
@@ -229,6 +232,160 @@ def _extract_json_payload(text: str) -> str:
     return stripped
 
 
+# ---------------------------------------------------------------------------
+# Rate-limit plumbing
+#
+# Two layers, both invoked from ``generate_structured_response``:
+#
+# 1. ``_TokenBucket`` — rolling 60-second window of ``(timestamp, tokens)``
+#    events. Before each call we ask whether sending ``estimate`` extra
+#    tokens would push the recent sum above ``ANKIGEN_LLM_RATE_LIMIT_TPM``;
+#    if so we sleep until the oldest entry falls out of the window.
+# 2. ``_with_429_retry`` — backstop in case the proactive estimate is off
+#    or the provider counts tokens differently. Retries
+#    ``ANKIGEN_LLM_MAX_RETRIES`` times with exponential backoff.
+# ---------------------------------------------------------------------------
+
+
+_DEFAULT_TPM = 30_000
+_DEFAULT_MAX_RETRIES = 4
+_WINDOW_SECONDS = 60.0
+
+
+class _TokenBucket:
+    """Tracks the running token cost over the past ``window`` seconds."""
+
+    def __init__(self, window: float = _WINDOW_SECONDS) -> None:
+        self._window = window
+        self._events: deque[tuple[float, int]] = deque()
+
+    def _purge(self, now: float) -> None:
+        cutoff = now - self._window
+        while self._events and self._events[0][0] <= cutoff:
+            self._events.popleft()
+
+    def recent_tokens(self, now: float | None = None) -> int:
+        now = time.monotonic() if now is None else now
+        self._purge(now)
+        return sum(tokens for _, tokens in self._events)
+
+    def sleep_needed(self, estimate: int, tpm_limit: int, now: float | None = None) -> float:
+        """How long to sleep before adding ``estimate`` tokens stays under ``tpm_limit``.
+
+        Returns ``0`` when there's room. Returns ``self._window`` (or less) when
+        the bucket is currently saturated; the caller is expected to sleep that
+        long, then proceed.
+        """
+        if tpm_limit <= 0:
+            return 0.0
+        now = time.monotonic() if now is None else now
+        self._purge(now)
+        running = sum(tokens for _, tokens in self._events)
+        if running + estimate <= tpm_limit:
+            return 0.0
+        # Oldest event is the first one to fall out of the window.
+        oldest_ts, _ = self._events[0]
+        # Sleep until that event falls out of the rolling window, plus a tiny
+        # safety margin so we don't immediately re-trip the same boundary.
+        return max(0.0, self._window - (now - oldest_ts) + 0.5)
+
+    def record(self, tokens: int, now: float | None = None) -> None:
+        if tokens <= 0:
+            return
+        now = time.monotonic() if now is None else now
+        self._events.append((now, tokens))
+
+    def reset(self) -> None:
+        self._events.clear()
+
+
+# Module-level singleton bucket. Reset between tests via :func:`_reset_token_bucket`.
+_token_bucket = _TokenBucket()
+
+
+def _reset_token_bucket() -> None:
+    """Test-only helper to clear the rolling-window state."""
+    _token_bucket.reset()
+
+
+def _get_tpm_limit() -> int:
+    raw = os.getenv("ANKIGEN_LLM_RATE_LIMIT_TPM")
+    if not raw:
+        return _DEFAULT_TPM
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid ANKIGEN_LLM_RATE_LIMIT_TPM=%r; using default %d", raw, _DEFAULT_TPM)
+        return _DEFAULT_TPM
+    return max(0, value)
+
+
+def _get_max_retries() -> int:
+    raw = os.getenv("ANKIGEN_LLM_MAX_RETRIES")
+    if not raw:
+        return _DEFAULT_MAX_RETRIES
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid ANKIGEN_LLM_MAX_RETRIES=%r; using default %d", raw, _DEFAULT_MAX_RETRIES
+        )
+        return _DEFAULT_MAX_RETRIES
+    return max(0, value)
+
+
+def _throttle_for_tokens(estimate: int) -> None:
+    """Sleep proactively if sending ``estimate`` tokens would breach the TPM ceiling."""
+    tpm = _get_tpm_limit()
+    if tpm <= 0:
+        return
+    sleep_for = _token_bucket.sleep_needed(estimate, tpm)
+    if sleep_for > 0:
+        logger.info(
+            "Rate limit pacing: sleeping %.1fs (estimated %d tokens for next call, "
+            "%d/%d in last 60s)",
+            sleep_for,
+            estimate,
+            _token_bucket.recent_tokens(),
+            tpm,
+        )
+        time.sleep(sleep_for)
+
+
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    """Best-effort detection of a 429 / rate-limit error across SDKs."""
+    name = exc.__class__.__name__.lower()
+    if "ratelimit" in name:
+        return True
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    if status == 429:
+        return True
+    message = str(exc).lower()
+    return "rate limit" in message or "429" in message or "tokens per minute" in message
+
+
+def _with_429_retry[T](fn: Callable[[], T]) -> T:
+    """Run ``fn``; on rate-limit errors, sleep and retry with exponential backoff."""
+    max_retries = _get_max_retries()
+    attempt = 0
+    while True:
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001 — provider SDKs raise heterogeneous types
+            if not _is_rate_limit_error(exc) or attempt >= max_retries:
+                raise
+            backoff = min(5.0 * (3.0**attempt), 90.0)
+            logger.warning(
+                "Rate-limit error from provider (attempt %d/%d): %s — retrying in %.1fs",
+                attempt + 1,
+                max_retries,
+                exc,
+                backoff,
+            )
+            time.sleep(backoff)
+            attempt += 1
+
+
 def generate_structured_response[ResponseModelT: BaseModel](
     *,
     response_model: type[ResponseModelT],
@@ -238,39 +395,56 @@ def generate_structured_response[ResponseModelT: BaseModel](
 ) -> ResponseModelT:
     """
     Generate a structured response for either OpenAI-compatible or Anthropic providers.
+
+    Calls are paced against ``ANKIGEN_LLM_RATE_LIMIT_TPM`` (rolling-60s token
+    bucket) and retried on rate-limit errors up to ``ANKIGEN_LLM_MAX_RETRIES``
+    times with exponential backoff.
     """
     provider = get_provider()
     model = get_model()
 
-    if provider == "anthropic":
-        schema = json.dumps(response_model.model_json_schema(), ensure_ascii=False)
-        anthropic_client = get_anthropic_client()
-        response = anthropic_client.messages.create(
+    # Estimate tokens for the proactive bucket: prompts + the worst-case reply
+    # budget. The estimator is intentionally conservative (upper bound).
+    estimate = estimate_tokens(system_prompt) + estimate_tokens(user_prompt) + max_tokens
+    _throttle_for_tokens(estimate)
+
+    def _call() -> ResponseModelT:
+        if provider == "anthropic":
+            schema = json.dumps(response_model.model_json_schema(), ensure_ascii=False)
+            anthropic_client = get_anthropic_client()
+            response = anthropic_client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=(
+                    f"{system_prompt}\n\n"
+                    "Return ONLY a valid JSON object with no markdown fences.\n"
+                    f"JSON schema:\n{schema}"
+                ),
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+
+            text_blocks = [block.text for block in response.content if block.type == "text"]
+            raw_text = "\n".join(text_blocks).strip()
+            return response_model.model_validate_json(_extract_json_payload(raw_text))
+
+        openai_client = get_client()
+        # instructor dynamically patches return types from response_model;
+        # generic type inference is limited for static analysis.
+        return openai_client.chat.completions.create(  # type: ignore[no-any-return]
             model=model,
-            max_tokens=max_tokens,
-            system=(
-                f"{system_prompt}\n\n"
-                "Return ONLY a valid JSON object with no markdown fences.\n"
-                f"JSON schema:\n{schema}"
-            ),
-            messages=[{"role": "user", "content": user_prompt}],
+            response_model=response_model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
         )
 
-        text_blocks = [block.text for block in response.content if block.type == "text"]
-        raw_text = "\n".join(text_blocks).strip()
-        return response_model.model_validate_json(_extract_json_payload(raw_text))
-
-    openai_client = get_client()
-    # instructor dynamically patches return types from response_model;
-    # generic type inference is limited for static analysis.
-    return openai_client.chat.completions.create(  # type: ignore[no-any-return]
-        model=model,
-        response_model=response_model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    )
+    try:
+        return _with_429_retry(_call)
+    finally:
+        # Record the estimate either way — a failed-but-retried call still
+        # consumed tokens against the provider's bucket.
+        _token_bucket.record(estimate)
 
 
 def generate_sentences(word: str, lang: Language = "zh", num_sentences: int = 3) -> list[str]:

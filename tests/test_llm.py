@@ -135,6 +135,111 @@ class TestTranslateWord:
         assert mock_generate.call_args.kwargs["response_model"] is KoreanTranslationResponse
 
 
+class TestTokenBucket:
+    """Proactive rolling-60s token-bucket throttle."""
+
+    def setup_method(self) -> None:
+        from ankigen.llm import _reset_token_bucket
+
+        _reset_token_bucket()
+
+    def test_no_sleep_when_under_limit(self, mocker, monkeypatch) -> None:
+        from ankigen import llm
+
+        monkeypatch.setenv("ANKIGEN_LLM_RATE_LIMIT_TPM", "10000")
+        sleep = mocker.patch("ankigen.llm.time.sleep")
+        llm._throttle_for_tokens(estimate=500)
+        sleep.assert_not_called()
+
+    def test_sleeps_when_over_limit(self, mocker, monkeypatch) -> None:
+        from ankigen import llm
+
+        monkeypatch.setenv("ANKIGEN_LLM_RATE_LIMIT_TPM", "1000")
+        # Pre-load the bucket near the cap.
+        llm._token_bucket.record(900)
+        sleep = mocker.patch("ankigen.llm.time.sleep")
+        llm._throttle_for_tokens(estimate=200)  # 900 + 200 > 1000 → sleep
+        sleep.assert_called_once()
+        # The sleep duration is positive and bounded by the 60s window + margin.
+        slept = sleep.call_args.args[0]
+        assert 0 < slept <= 61
+
+    def test_zero_tpm_disables_throttle(self, mocker, monkeypatch) -> None:
+        from ankigen import llm
+
+        monkeypatch.setenv("ANKIGEN_LLM_RATE_LIMIT_TPM", "0")
+        llm._token_bucket.record(1_000_000)
+        sleep = mocker.patch("ankigen.llm.time.sleep")
+        llm._throttle_for_tokens(estimate=1_000_000)
+        sleep.assert_not_called()
+
+
+class TestRateLimitRetry:
+    """Reactive 429-retry safety net."""
+
+    def setup_method(self) -> None:
+        from ankigen.llm import _reset_token_bucket
+
+        _reset_token_bucket()
+
+    def test_retries_on_rate_limit_error(self, mocker, monkeypatch) -> None:
+        from ankigen import llm
+
+        monkeypatch.setenv("ANKIGEN_LLM_MAX_RETRIES", "2")
+        mocker.patch("ankigen.llm.time.sleep")
+
+        class _Boom(Exception):
+            pass
+
+        _Boom.__name__ = "RateLimitError"
+        call_count = {"n": 0}
+
+        def flaky() -> str:
+            call_count["n"] += 1
+            if call_count["n"] < 2:
+                raise _Boom("429 rate limit exceeded")
+            return "ok"
+
+        result = llm._with_429_retry(flaky)
+        assert result == "ok"
+        assert call_count["n"] == 2
+
+    def test_exhausts_retries_and_reraises(self, mocker, monkeypatch) -> None:
+        from ankigen import llm
+
+        monkeypatch.setenv("ANKIGEN_LLM_MAX_RETRIES", "1")
+        mocker.patch("ankigen.llm.time.sleep")
+
+        class _Boom(Exception):
+            pass
+
+        _Boom.__name__ = "RateLimitError"
+
+        def always_fail() -> str:
+            raise _Boom("429 tokens per minute exceeded")
+
+        with pytest.raises(_Boom):
+            llm._with_429_retry(always_fail)
+
+    def test_non_rate_limit_error_is_not_retried(self, mocker, monkeypatch) -> None:
+        from ankigen import llm
+
+        monkeypatch.setenv("ANKIGEN_LLM_MAX_RETRIES", "5")
+        sleep = mocker.patch("ankigen.llm.time.sleep")
+        calls = {"n": 0}
+
+        def bad() -> str:
+            calls["n"] += 1
+            # Message must NOT contain "rate limit"/"429"/"tokens per minute".
+            raise ValueError("validation failed: bad input shape")
+
+        with pytest.raises(ValueError):
+            llm._with_429_retry(bad)
+
+        assert calls["n"] == 1  # no retry for non-rate-limit errors
+        sleep.assert_not_called()
+
+
 class TestProviderConfig:
     """Tests for provider configuration."""
 

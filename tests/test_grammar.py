@@ -205,6 +205,103 @@ class TestExtractGrammarItems:
         mock_generate.assert_not_called()
 
 
+class TestExtractGrammarItemsChunking:
+    """Long inputs are split into chunks and items are merged across them."""
+
+    def test_long_input_splits_into_multiple_calls(self, mocker) -> None:
+        mocker.patch(
+            "ankigen.grammar.split_text_for_extraction",
+            return_value=["chunk-1", "chunk-2"],
+        )
+
+        chunk1 = GrammarExtractionResponse(
+            items=[
+                GrammarItem(
+                    pattern="~게 되다",
+                    meaning="end up doing",
+                    examples=[GrammarExample(target="예문 A", english="A")],
+                )
+            ]
+        )
+        chunk2 = GrammarExtractionResponse(
+            items=[
+                GrammarItem(
+                    pattern="~기 위해서",
+                    meaning="in order to",
+                    examples=[GrammarExample(target="예문 B", english="B")],
+                )
+            ]
+        )
+        mock_generate = mocker.patch(
+            "ankigen.grammar.generate_structured_response",
+            side_effect=[chunk1, chunk2],
+        )
+
+        result = extract_grammar_items("doc", lang="ko")
+        assert mock_generate.call_count == 2
+        assert [it.pattern for it in result] == ["~게 되다", "~기 위해서"]
+
+    def test_duplicate_pattern_across_chunks_merges_examples(self, mocker) -> None:
+        mocker.patch(
+            "ankigen.grammar.split_text_for_extraction",
+            return_value=["chunk-1", "chunk-2"],
+        )
+
+        chunk1 = GrammarExtractionResponse(
+            items=[
+                GrammarItem(
+                    pattern="~게 되다",
+                    meaning="change of state",
+                    hanja="",
+                    examples=[
+                        GrammarExample(target="공통 예문", english="Shared example"),
+                        GrammarExample(target="첫 번째 예문", english="First only"),
+                    ],
+                )
+            ]
+        )
+        chunk2 = GrammarExtractionResponse(
+            items=[
+                GrammarItem(
+                    pattern="~게 되다",  # duplicate pattern; NFC-normalised key matches
+                    meaning="LATER VERSION (should be ignored)",
+                    hanja="LATER HANJA",
+                    examples=[
+                        GrammarExample(target="공통 예문", english="Shared example"),
+                        GrammarExample(target="두 번째 예문", english="Second only"),
+                    ],
+                )
+            ]
+        )
+        mocker.patch(
+            "ankigen.grammar.generate_structured_response",
+            side_effect=[chunk1, chunk2],
+        )
+
+        result = extract_grammar_items("doc", lang="ko")
+        assert len(result) == 1
+        merged = result[0]
+        # Meaning + initial fields come from the first chunk.
+        assert merged.meaning == "change of state"
+        # Hanja is backfilled from the later chunk because the first was empty.
+        assert merged.hanja == "LATER HANJA"
+        # Examples deduped by NFC target: 3 unique total (not 4).
+        targets = [ex.target for ex in merged.examples]
+        assert targets == ["공통 예문", "첫 번째 예문", "두 번째 예문"]
+
+    def test_short_input_remains_one_call(self, mocker) -> None:
+        mocker.patch(
+            "ankigen.grammar.split_text_for_extraction",
+            return_value=["one chunk"],
+        )
+        mock_generate = mocker.patch(
+            "ankigen.grammar.generate_structured_response",
+            return_value=GrammarExtractionResponse(items=_sample_items()),
+        )
+        extract_grammar_items("[H2] short doc", lang="ko")
+        assert mock_generate.call_count == 1
+
+
 class TestGenerateGrammarCsv:
     """Verbatim-first, top-up-with-LLM-as-needed merge logic."""
 

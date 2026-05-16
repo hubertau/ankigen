@@ -69,6 +69,18 @@ ANKIGEN_LOG_RETENTION=-1            # Days to keep logs (-1 = forever, default)
 # ANKIGEN_ANKI_FIELD_KO=Korean
 ```
 
+### Rate limiting (extract only)
+
+Long source documents are auto-split into chunks before being sent to the LLM so a single call never blows past the provider's per-minute input-token budget. Three optional env vars tune the behavior; defaults match a 30k TPM ceiling.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ANKIGEN_LLM_RATE_LIMIT_TPM` | `30000` | Proactive rolling-60s input-token ceiling. ankigen estimates each call's token cost and sleeps before sending if the recent sum would exceed this. Set to `0` to disable proactive pacing. |
+| `ANKIGEN_LLM_CHUNK_TOKENS` | `20000` | Target tokens per chunked LLM call during `extract`. Long inputs are split on `[H1]`/`[H2]`/`[H3]` heading and paragraph boundaries to fit under this size, then results are merged with dedupe. Keep below `ANKIGEN_LLM_RATE_LIMIT_TPM` so a single chunk can't trip the limit. |
+| `ANKIGEN_LLM_MAX_RETRIES` | `4` | How many times to retry an LLM call that returns a 429 / rate-limit error before giving up. Each retry uses exponential backoff (5s, 15s, 45s, 90s, capped). |
+
+These knobs only affect the `extract` flow — the per-word `generate` calls already make one small request per word and don't need batching.
+
 ### Anki database filtering (optional)
 
 When `ANKIGEN_ANKI_DB` and `ANKIGEN_ANKI_DECK_{LANG}` are set, **extract**, **clean**, and **generate** skip vocabulary that already appears in the chosen deck (including sub-decks). Words are compared using **Unicode NFC** normalization so equivalent composed/decomposed strings still match.
