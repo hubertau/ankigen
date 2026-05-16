@@ -31,6 +31,7 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import cast
 
 from ankigen.anki_db import (
     get_anki_db_path,
@@ -41,13 +42,19 @@ from ankigen.anki_db import (
 )
 from ankigen.cleaner import clean_and_write, clean_vocabulary_file
 from ankigen.extractor import (
+    ExtractMode,
     extract_vocabulary_from_file,
     get_output_dir,
     get_processed_dir,
     get_watch_dir,
-    process_watch_folder,
+    process_folder,
 )
 from ankigen.formatter import format_sentences
+from ankigen.grammar import (
+    extract_grammar_from_file,
+    generate_grammar_csv,
+    write_grammar_jsonl,
+)
 from ankigen.llm import Language, generate_sentences, translate_word
 from ankigen.logging_config import get_log_dir, get_log_level, get_log_retention, setup_logging
 from ankigen.similarity import cluster_pairs, find_similar_pairs
@@ -274,16 +281,106 @@ def _resolve_anki_words(args: argparse.Namespace, lang: Language) -> set[str]:
     return load_anki_words(db_path, deck_name, field=field)
 
 
+def _resolve_generate_mode(input_file: Path, requested: str) -> ExtractMode:
+    """
+    Resolve the generate mode, auto-detecting from a `.jsonl` extension.
+
+    Defaults to ``vocab``. Explicit ``grammar`` or ``all`` are honoured.
+    """
+    mode: ExtractMode = cast(ExtractMode, requested)
+    if mode == "vocab" and input_file.suffix.lower() == ".jsonl":
+        logger.info("Auto-detected grammar mode from %s extension", input_file.suffix)
+        mode = "grammar"
+    return mode
+
+
+def _infer_sibling_for_generate_all(input_file: Path) -> tuple[Path, Path]:
+    """
+    From either a vocab `.txt` or a grammar `_grammar.jsonl` file, return
+    ``(vocab_path, grammar_path)`` — the input itself plus its inferred sibling.
+    """
+    suffix = input_file.suffix.lower()
+    stem = input_file.stem
+    if suffix == ".txt" and not stem.endswith("_grammar"):
+        return input_file, input_file.with_name(f"{stem}_grammar.jsonl")
+    if suffix == ".jsonl" and stem.endswith("_grammar"):
+        vocab_stem = stem.removesuffix("_grammar")
+        return input_file.with_name(f"{vocab_stem}.txt"), input_file
+    raise ValueError(
+        f"Cannot infer sibling for `--mode all` from {input_file}: expected a "
+        f"vocab `.txt` or a grammar `_grammar.jsonl` file."
+    )
+
+
 def cmd_generate(args: argparse.Namespace) -> None:
     """Handle the 'generate' subcommand."""
-    # Validate input file
     if not args.input_file.exists():
         logger.error("Input file not found: %s", args.input_file)
         sys.exit(1)
 
-    # Determine output path
-    output_file = get_output_path(args.input_file, args.lang, args.output)
+    mode: ExtractMode = cast(ExtractMode, args.mode)
+    if mode != "all":
+        mode = _resolve_generate_mode(args.input_file, args.mode)
 
+    if mode == "all":
+        try:
+            vocab_path, grammar_path = _infer_sibling_for_generate_all(args.input_file)
+        except ValueError as exc:
+            logger.error(str(exc))
+            sys.exit(1)
+
+        if args.output is not None:
+            logger.warning("--output is ignored in --mode all (using default sibling paths)")
+
+        ran_any = False
+        if vocab_path.exists():
+            ran_any = True
+            output_file = get_output_path(vocab_path, args.lang, None)
+            exclude_words = _resolve_anki_words(args, args.lang)
+            generate_csv(
+                input_file=vocab_path,
+                output_file=output_file,
+                lang=args.lang,
+                num_sentences=args.sentences,
+                clean_input=args.clean,
+                exclude_words=exclude_words or None,
+            )
+        else:
+            logger.warning("Vocab sibling not found: %s — skipping vocab CSV", vocab_path)
+
+        if grammar_path.exists():
+            ran_any = True
+            grammar_csv = get_output_path(grammar_path, args.lang, None)
+            exclude_patterns = _resolve_anki_words(args, args.lang)
+            generate_grammar_csv(
+                input_path=grammar_path,
+                output_path=grammar_csv,
+                lang=args.lang,
+                num_examples=args.sentences,
+                exclude_patterns=exclude_patterns or None,
+            )
+        else:
+            logger.warning("Grammar sibling not found: %s — skipping grammar CSV", grammar_path)
+
+        if not ran_any:
+            logger.error("Neither vocab nor grammar input found for --mode all")
+            sys.exit(1)
+        return
+
+    if mode == "grammar":
+        output_file = get_output_path(args.input_file, args.lang, args.output)
+        exclude_patterns = _resolve_anki_words(args, args.lang)
+        generate_grammar_csv(
+            input_path=args.input_file,
+            output_path=output_file,
+            lang=args.lang,
+            num_examples=args.sentences,
+            exclude_patterns=exclude_patterns or None,
+        )
+        return
+
+    # vocab mode (default / current behaviour)
+    output_file = get_output_path(args.input_file, args.lang, args.output)
     exclude_words = _resolve_anki_words(args, args.lang)
     generate_csv(
         input_file=args.input_file,
@@ -295,12 +392,112 @@ def cmd_generate(args: argparse.Namespace) -> None:
     )
 
 
+def _default_vocab_output(lang: Language) -> Path:
+    """Default single-file vocab output: ``{output_dir}/{lang}/{YYYYMMDD}.txt``.
+
+    Mirrors watch/folder mode so multiple single-file extracts on the same day
+    accumulate into one dated file.
+    """
+    today = datetime.now().strftime("%Y%m%d")
+    return get_output_dir() / lang / f"{today}.txt"
+
+
+def _default_grammar_output(lang: Language) -> Path:
+    """Default single-file grammar output: ``{output_dir}/{lang}/{YYYYMMDD}_grammar.jsonl``."""
+    today = datetime.now().strftime("%Y%m%d")
+    return get_output_dir() / lang / f"{today}_grammar.jsonl"
+
+
+def _extract_single_file_vocab(args: argparse.Namespace, output_file: Path | None) -> None:
+    """
+    Vocab extraction for a single input file.
+
+    Default output path is ``{output_dir}/{lang}/{YYYYMMDD}.txt`` (same as
+    watch-folder mode). When the destination exists, behaviour is:
+
+    - ``--overwrite`` → wipe and rewrite.
+    - otherwise → auto-append + dedupe (no error). ``--append`` is the default
+      now and is kept only for backward compatibility.
+    """
+    if output_file is None:
+        output_file = _default_vocab_output(args.lang)
+
+    words = extract_vocabulary_from_file(args.input_file, args.lang)
+    if not words:
+        logger.warning("No vocabulary words extracted from %s", args.input_file)
+        return
+    logger.info("Extracted %d vocabulary words", len(words))
+
+    exclude_words = _resolve_anki_words(args, args.lang)
+    if exclude_words:
+        before = len(words)
+        words = [w for w in words if normalize_anki_term(w) not in exclude_words]
+        skipped = before - len(words)
+        if skipped:
+            logger.info("Skipped %d words already present in Anki", skipped)
+
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if output_file.exists() and not args.overwrite:
+        existing_words = set(read_words(output_file))
+        new_words = [w for w in words if w not in existing_words]
+        if not new_words:
+            logger.info("All extracted words already exist in %s", output_file)
+            return
+        logger.info(
+            "Appending %d new words to %s (skipping %d duplicates)",
+            len(new_words),
+            output_file,
+            len(words) - len(new_words),
+        )
+        with open(output_file, "a", encoding="utf-8") as f:
+            for word in new_words:
+                f.write(word + "\n")
+    else:
+        with open(output_file, "w", encoding="utf-8") as f:
+            for word in words:
+                f.write(word + "\n")
+        logger.info("Wrote %d words to %s", len(words), output_file)
+
+
+def _extract_single_file_grammar(args: argparse.Namespace, output_file: Path | None) -> None:
+    """
+    Grammar extraction for a single input file → JSONL.
+
+    Default output path is ``{output_dir}/{lang}/{YYYYMMDD}_grammar.jsonl`` (same
+    as watch-folder mode). When the destination exists, behaviour is:
+
+    - ``--overwrite`` → wipe and rewrite.
+    - otherwise → auto-append + dedupe by NFC-normalised pattern.
+    """
+    if output_file is None:
+        output_file = _default_grammar_output(args.lang)
+
+    items = extract_grammar_from_file(args.input_file, args.lang)
+    if not items:
+        logger.warning("No grammar items extracted from %s", args.input_file)
+        return
+    logger.info("Extracted %d grammar item(s)", len(items))
+
+    exclude_patterns = _resolve_anki_words(args, args.lang)
+    if exclude_patterns:
+        before = len(items)
+        items = [it for it in items if normalize_anki_term(it.pattern) not in exclude_patterns]
+        skipped = before - len(items)
+        if skipped:
+            logger.info("Skipped %d grammar pattern(s) already present in Anki", skipped)
+
+    write_grammar_jsonl(items, output_file, append=not args.overwrite)
+
+
 def cmd_extract(args: argparse.Namespace) -> None:
     """Handle the 'extract' subcommand."""
-    # Watch folder mode: no input file specified
+    mode: ExtractMode = cast(ExtractMode, args.mode)
+
+    # No path → watch folder mode
     if args.input_file is None:
         watch_dir = get_watch_dir(args.lang)
-        logger.info("Processing watch folder: %s", watch_dir)
+        logger.info("Processing watch folder: %s (mode=%s)", watch_dir, mode)
 
         if not watch_dir.exists():
             logger.error(
@@ -311,84 +508,79 @@ def cmd_extract(args: argparse.Namespace) -> None:
             )
             sys.exit(1)
 
-        exclude_words = _resolve_anki_words(args, args.lang)
-        output_path, num_files = process_watch_folder(
-            lang=args.lang,
-            move_processed=not args.no_move,
-            exclude_words=exclude_words or None,
+        exclude_words = _resolve_anki_words(args, args.lang) if mode in ("vocab", "all") else None
+        exclude_patterns = (
+            _resolve_anki_words(args, args.lang) if mode in ("grammar", "all") else None
         )
 
-        if num_files == 0:
-            logger.info("No files to process in watch folder")
-        elif output_path:
-            logger.info("Processed %d files, output: %s", num_files, output_path)
+        move_override: bool | None = False if args.no_move else None
+
+        result = process_folder(
+            lang=args.lang,
+            source_dir=None,
+            mode=mode,
+            move_processed=move_override,
+            recursive=args.recursive,
+            exclude_words=exclude_words or None,
+            exclude_patterns=exclude_patterns or None,
+        )
+        _log_folder_result(result, mode)
         return
 
-    # Single file mode: validate input file
+    # Path given: directory or file?
     if not args.input_file.exists():
-        logger.error("Input file not found: %s", args.input_file)
+        logger.error("Input path not found: %s", args.input_file)
         sys.exit(1)
 
-    # Determine output path
-    output_file: Path = args.output
-    if output_file is None:
-        # Default: same name as input but with .txt extension in inputs/{lang}/
-        output_file = Path("inputs") / args.lang / f"{args.input_file.stem}.txt"
-
-    # Check if output file exists and handle accordingly
-    if output_file.exists():
-        if not args.append and not args.overwrite:
-            logger.error(
-                "Output file already exists: %s\n"
-                "Use --append to add to existing file, or --overwrite to replace it.",
-                output_file,
-            )
-            sys.exit(1)
-
-    # Extract vocabulary
-    words = extract_vocabulary_from_file(args.input_file, args.lang)
-
-    if not words:
-        logger.warning("No vocabulary words extracted from %s", args.input_file)
+    if args.input_file.is_dir():
+        logger.info("Processing folder: %s (mode=%s)", args.input_file, mode)
+        exclude_words = _resolve_anki_words(args, args.lang) if mode in ("vocab", "all") else None
+        exclude_patterns = (
+            _resolve_anki_words(args, args.lang) if mode in ("grammar", "all") else None
+        )
+        move_override = False if args.no_move else None
+        result = process_folder(
+            lang=args.lang,
+            source_dir=args.input_file,
+            mode=mode,
+            move_processed=move_override,
+            recursive=args.recursive,
+            exclude_words=exclude_words or None,
+            exclude_patterns=exclude_patterns or None,
+        )
+        _log_folder_result(result, mode)
         return
 
-    logger.info("Extracted %d vocabulary words", len(words))
+    # Single file mode
+    if mode == "all":
+        if args.output is not None:
+            logger.warning("--output is ignored in --mode all (using default paths)")
+        _extract_single_file_vocab(args, None)
+        _extract_single_file_grammar(args, None)
+        return
 
-    # Filter out words already in Anki
-    exclude_words = _resolve_anki_words(args, args.lang)
-    if exclude_words:
-        before = len(words)
-        words = [w for w in words if normalize_anki_term(w) not in exclude_words]
-        skipped = before - len(words)
-        if skipped:
-            logger.info("Skipped %d words already present in Anki", skipped)
+    if mode == "grammar":
+        _extract_single_file_grammar(args, args.output)
+        return
 
-    # Ensure output directory exists
-    output_file.parent.mkdir(parents=True, exist_ok=True)
+    _extract_single_file_vocab(args, args.output)
 
-    # Write or append to output file
-    if args.append and output_file.exists():
-        # Read existing words to avoid duplicates
-        existing_words = set(read_words(output_file))
-        new_words = [w for w in words if w not in existing_words]
-        if not new_words:
-            logger.info("All extracted words already exist in %s", output_file)
-            return
-        logger.info(
-            "Adding %d new words (skipping %d duplicates)",
-            len(new_words),
-            len(words) - len(new_words),
-        )
-        with open(output_file, "a", encoding="utf-8") as f:
-            for word in new_words:
-                f.write(word + "\n")
-    else:
-        # Overwrite or create new file
-        with open(output_file, "w", encoding="utf-8") as f:
-            for word in words:
-                f.write(word + "\n")
 
-    logger.info("Output written to %s", output_file)
+def _log_folder_result(result: object, mode: ExtractMode) -> None:
+    """Pretty-log the folder/watch run summary."""
+    # `result` is a FolderResult NamedTuple from extractor.py.
+    # Avoiding the import here would require restructuring; cast for mypy.
+    from ankigen.extractor import FolderResult
+
+    assert isinstance(result, FolderResult)
+    if result.num_files == 0:
+        logger.info("No files to process")
+        return
+    logger.info("Processed %d file(s) (mode=%s)", result.num_files, mode)
+    if result.vocab_path is not None:
+        logger.info("Vocab output:   %s", result.vocab_path)
+    if result.grammar_path is not None:
+        logger.info("Grammar output: %s", result.grammar_path)
 
 
 def cmd_clean(args: argparse.Namespace) -> None:
@@ -451,7 +643,9 @@ def cmd_similar(args: argparse.Namespace) -> None:
     print(f"SIMILAR VOCABULARY ({args.lang})")
     print("=" * 60)
     print(f"\nInput: {args.input_file}   Terms: {len(words)}   Threshold: {args.threshold}")
-    print(f"Anki cross-check: {len(anki_words)} card(s)" if anki_words else "Anki cross-check: (off)")
+    print(
+        f"Anki cross-check: {len(anki_words)} card(s)" if anki_words else "Anki cross-check: (off)"
+    )
 
     if not pairs:
         print("\nNo similar pairs found. Nothing to review.")
@@ -491,7 +685,11 @@ def cmd_similar(args: argparse.Namespace) -> None:
                 member_set = set(members)
                 group_pairs = [p for p in pairs if p.a in member_set and p.b in member_set]
                 in_anki = {m for m in members if normalize_anki_term(m) in anki_words}
-                keep = next(iter(sorted(in_anki))) if in_anki else min(members, key=lambda m: (len(m), m))
+                keep = (
+                    next(iter(sorted(in_anki)))
+                    if in_anki
+                    else min(members, key=lambda m: (len(m), m))
+                )
                 f.write(f"Group {idx} (suggest keep: {keep})\n")
                 for m in members:
                     tag = "  [in Anki]" if m in in_anki else ""
@@ -643,7 +841,19 @@ def main() -> None:
         "-c",
         "--clean",
         action="store_true",
-        help="Clean input file before processing (removes translations, romanization, etc.)",
+        help="Clean input file before processing (removes translations, romanization, etc.). "
+        "No-op in grammar mode.",
+    )
+    gen_parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["vocab", "grammar", "all"],
+        default="vocab",
+        help=(
+            "What to generate: vocab (default), grammar (4-column Pattern/Meaning/"
+            "Explanation/Examples CSV from a JSONL), or all (both — sibling file "
+            "is inferred from the given path). `.jsonl` inputs auto-detect grammar."
+        ),
     )
     _add_anki_args(gen_parser)
 
@@ -661,14 +871,23 @@ def main() -> None:
         type=Path,
         nargs="?",
         default=None,
-        help="Input file: PDF, DOCX, or image (optional; if omitted, processes watch folder)",
+        help=(
+            "Input file (PDF/DOCX/image), a directory of such files, or omitted "
+            "to process the configured watch folder."
+        ),
     )
     ext_parser.add_argument(
         "-o",
         "--output",
         type=Path,
         default=None,
-        help="Output text file (default: inputs/{lang}/{input_stem}.txt or {YYYYMMDD}.txt for watch folder)",
+        help=(
+            "Output file (single-file mode). Default mirrors watch/folder mode: "
+            "{output_dir}/{lang}/{YYYYMMDD}.txt for vocab, "
+            "{output_dir}/{lang}/{YYYYMMDD}_grammar.jsonl for grammar — multiple "
+            "single-file extracts on the same day append+dedupe into the same "
+            "dated file. Ignored in --mode all and folder/watch modes."
+        ),
     )
     ext_parser.add_argument(
         "--lang",
@@ -678,20 +897,42 @@ def main() -> None:
         help="Language of the content: zh (Chinese) or ko (Korean). Default: zh",
     )
     ext_parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["vocab", "grammar", "all"],
+        default="vocab",
+        help=(
+            "What to extract: vocab (default; one word per line in .txt), "
+            "grammar (grammar items in JSONL), or all (both — only this mode "
+            "moves files in folder/watch mode unless --no-move is given)."
+        ),
+    )
+    ext_parser.add_argument(
         "-a",
         "--append",
         action="store_true",
-        help="Append to existing output file (skips duplicates)",
+        help=(
+            "Kept for backward compatibility — append+dedupe is now the default "
+            "when the output file already exists."
+        ),
     )
     ext_parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="Overwrite existing output file",
+        help=("Wipe the output file before writing (defeats the default append+dedupe behaviour)."),
     )
     ext_parser.add_argument(
         "--no-move",
         action="store_true",
-        help="Don't move processed files (watch folder mode only)",
+        help=(
+            "Don't move processed files. Only meaningful in folder/watch mode "
+            "with --mode all (the only mode that moves by default)."
+        ),
+    )
+    ext_parser.add_argument(
+        "--recursive",
+        action="store_true",
+        help="When the input is a directory, also walk into subdirectories.",
     )
     _add_anki_args(ext_parser)
 

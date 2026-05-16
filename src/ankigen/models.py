@@ -26,3 +26,81 @@ class TranslationResponse(BaseModel):
         ...,
         description="English translation of the word, including part of speech and multiple meanings if applicable",
     )
+
+
+# ---------------------------------------------------------------------------
+# Grammar models
+# ---------------------------------------------------------------------------
+
+
+class GrammarExample(BaseModel):
+    """A single example sentence for a grammatical construction."""
+
+    target: str = Field(
+        ...,
+        description="The example sentence in the target language (e.g., Korean or Chinese)",
+    )
+    english: str = Field(
+        default="",
+        description="English translation of the example sentence (may be empty if not provided)",
+    )
+
+
+class GrammarItem(BaseModel):
+    """A single grammar/construction item extracted from teacher notes."""
+
+    pattern: str = Field(
+        ...,
+        description=(
+            "The grammatical pattern/construction itself, in the target language "
+            "(e.g. '~게 되다', '에 + 씩'). Use the canonical form a learner would "
+            "look up; do NOT include English translations in this field."
+        ),
+    )
+    meaning: str = Field(
+        ...,
+        description=(
+            "Short English gloss of what the pattern means / how it is used "
+            "(1 sentence, like a part-of-speech-style note)."
+        ),
+    )
+    explanation: str = Field(
+        default="",
+        description=(
+            "1-3 sentence usage notes. Prefer copying the teacher's notes "
+            "verbatim if the source document explains the pattern."
+        ),
+    )
+    examples: list[GrammarExample] = Field(
+        default_factory=list,
+        description=(
+            "Example sentences from the teacher's notes (verbatim). "
+            "Each example pairs a target-language sentence with an English translation "
+            "if the doc provides one."
+        ),
+    )
+
+
+class GrammarExtractionResponse(BaseModel):
+    """Response model for extracting grammar items from a document."""
+
+    items: list[GrammarItem] = Field(
+        default_factory=list,
+        description="Distinct grammatical constructions found in the document.",
+    )
+
+
+def create_grammar_example_response(num_examples: int = 3) -> type[BaseModel]:
+    """Factory to create a GrammarExampleResponse model with a fixed example count."""
+
+    class GrammarExampleResponse(BaseModel):
+        """Response model for top-up generation of grammar example sentences."""
+
+        examples: list[GrammarExample] = Field(
+            ...,
+            min_length=num_examples,
+            max_length=num_examples,
+            description=f"Exactly {num_examples} example sentences for the grammar pattern",
+        )
+
+    return GrammarExampleResponse

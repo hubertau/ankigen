@@ -1,5 +1,7 @@
 """Text extraction and vocabulary identification from PDFs, images, and Word documents."""
 
+from __future__ import annotations
+
 import base64
 import logging
 import os
@@ -7,7 +9,7 @@ import shutil
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, NamedTuple, cast
 
 from docx import Document
 from openai import OpenAI
@@ -24,6 +26,8 @@ from ankigen.llm import (
     get_model,
     get_provider,
 )
+
+ExtractMode = Literal["vocab", "grammar", "all"]
 
 logger = logging.getLogger("ankigen.extractor")
 
@@ -131,12 +135,16 @@ def extract_text_from_pdf(path: Path) -> str:
     return full_text
 
 
-def extract_text_from_docx(path: Path) -> str:
+def extract_text_from_docx(path: Path, *, with_headings: bool = False) -> str:
     """
     Extract text content from a Word document (.docx).
 
     Args:
         path: Path to the .docx file
+        with_headings: If True, prefix each Heading 1/2/3 paragraph with
+            ``[H1] ``/``[H2] ``/``[H3] `` markers so downstream LLM prompts
+            can use document structure as a signal. Body paragraphs and
+            tables are unchanged.
 
     Returns:
         Extracted text content
@@ -151,13 +159,23 @@ def extract_text_from_docx(path: Path) -> str:
     start_time = time.time()
     doc = Document(str(path))
 
-    # Extract text from paragraphs
     text_parts: list[str] = []
     for para in doc.paragraphs:
-        if para.text.strip():
+        if not para.text.strip():
+            continue
+        if with_headings:
+            style_name = para.style.name if para.style is not None else ""
+            if style_name.startswith("Heading 1"):
+                text_parts.append(f"[H1] {para.text}")
+            elif style_name.startswith("Heading 2"):
+                text_parts.append(f"[H2] {para.text}")
+            elif style_name.startswith("Heading 3"):
+                text_parts.append(f"[H3] {para.text}")
+            else:
+                text_parts.append(para.text)
+        else:
             text_parts.append(para.text)
 
-    # Also extract text from tables
     for table in doc.tables:
         for row in table.rows:
             row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
@@ -373,6 +391,36 @@ def get_file_type(path: Path) -> str:
         )
 
 
+def extract_source_text(
+    path: Path,
+    lang: Language = "zh",
+    *,
+    with_headings: bool = False,
+) -> str:
+    """
+    Extract raw text from a PDF, DOCX, or image file.
+
+    Centralised so vocab and grammar pipelines can share a single text-extraction
+    pass over the same file (cheaper for OCR especially).
+
+    Args:
+        path: Source file.
+        lang: Content language (only used for OCR prompts).
+        with_headings: When the source is a DOCX, include [H1]/[H2]/[H3] markers
+            so LLM prompts can detect document structure. No effect on PDF/images.
+
+    Returns:
+        Extracted text. May be empty if the file has no extractable text.
+    """
+    file_type = get_file_type(path)
+    if file_type == "pdf":
+        return extract_text_from_pdf(path)
+    elif file_type == "docx":
+        return extract_text_from_docx(path, with_headings=with_headings)
+    else:
+        return extract_text_from_image(path, lang)
+
+
 def extract_vocabulary_from_file(path: Path, lang: Language = "zh") -> list[str]:
     """
     Extract vocabulary words from a PDF, Word document, or image file.
@@ -389,14 +437,7 @@ def extract_vocabulary_from_file(path: Path, lang: Language = "zh") -> list[str]
     Returns:
         List of vocabulary words
     """
-    file_type = get_file_type(path)
-
-    if file_type == "pdf":
-        text = extract_text_from_pdf(path)
-    elif file_type == "docx":
-        text = extract_text_from_docx(path)
-    else:  # image
-        text = extract_text_from_image(path, lang)
+    text = extract_source_text(path, lang)
 
     if not text.strip():
         logger.warning("No text extracted from %s", path)
@@ -405,7 +446,7 @@ def extract_vocabulary_from_file(path: Path, lang: Language = "zh") -> list[str]
     return identify_vocabulary(text, lang)
 
 
-def get_supported_files(directory: Path) -> list[Path]:
+def get_supported_files(directory: Path, *, recursive: bool = False) -> list[Path]:
     """
     Get all supported files (PDFs, Word docs, and images) from a directory.
 
@@ -413,6 +454,7 @@ def get_supported_files(directory: Path) -> list[Path]:
 
     Args:
         directory: Directory to scan
+        recursive: If True, walk into subdirectories as well
 
     Returns:
         List of paths to supported files
@@ -420,9 +462,10 @@ def get_supported_files(directory: Path) -> list[Path]:
     if not directory.exists():
         return []
 
+    iterator = directory.rglob("*") if recursive else directory.iterdir()
+
     files: list[Path] = []
-    for path in directory.iterdir():
-        # Skip hidden files and temp files (e.g., .DS_Store, ~$document.docx)
+    for path in iterator:
         if path.name.startswith(".") or path.name.startswith("~"):
             continue
         if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS:
@@ -431,91 +474,39 @@ def get_supported_files(directory: Path) -> list[Path]:
     return sorted(files)
 
 
-def process_watch_folder(
-    lang: Language = "zh",
-    *,
-    move_processed: bool = True,
-    exclude_words: set[str] | None = None,
-) -> tuple[Path | None, int]:
-    """
-    Process all supported files from the language-specific watch folder.
+class FolderResult(NamedTuple):
+    """Outcome of a folder/watch run, per pipeline."""
 
-    Extracts vocabulary from all PDFs/images in {watch_dir}/{lang}/,
-    combines into a single output file named with today's date,
-    and optionally moves processed files to {processed_dir}/{lang}/.
+    vocab_path: Path | None
+    grammar_path: Path | None
+    num_files: int
 
-    Args:
-        lang: Language of the content (determines which watch subfolder to use)
-        move_processed: If True, move processed files to processed directory
-        exclude_words: Optional set of words to skip (e.g. already in Anki)
 
-    Returns:
-        Tuple of (output_path, number_of_files_processed)
-        output_path is None if no files were processed
-    """
-    # Use language-specific directories
-    watch_dir = get_watch_dir(lang)
-    output_dir = get_output_dir()
-    processed_dir = get_processed_dir(lang)
-
-    # Find all supported files
-    files = get_supported_files(watch_dir)
+def _move_files(files: list[Path], processed_dir: Path) -> None:
+    """Move ``files`` into ``processed_dir`` with conflict-safe renaming."""
     if not files:
-        logger.info("No files found in watch folder: %s", watch_dir)
-        return None, 0
-
-    logger.info("Found %d files to process in %s", len(files), watch_dir)
-
-    # Collect all vocabulary words
-    all_words: list[str] = []
-    processed_files: list[Path] = []
-
+        return
+    processed_dir.mkdir(parents=True, exist_ok=True)
     for file_path in files:
-        try:
-            logger.info("Processing: %s", file_path.name)
-            words = extract_vocabulary_from_file(file_path, lang)
-            all_words.extend(words)
-            processed_files.append(file_path)
-            logger.info("Extracted %d words from %s", len(words), file_path.name)
-        except Exception as e:
-            logger.error("Failed to process %s: %s", file_path.name, e)
+        dest = processed_dir / file_path.name
+        if dest.exists():
+            stem = file_path.stem
+            suffix = file_path.suffix
+            counter = 1
+            while dest.exists():
+                dest = processed_dir / f"{stem}_{counter}{suffix}"
+                counter += 1
+        shutil.move(str(file_path), str(dest))
+        logger.debug("Moved %s to %s", file_path.name, dest)
+    logger.info("Moved %d files to %s", len(files), processed_dir)
 
-    if not all_words:
-        logger.warning("No vocabulary extracted from any files")
-        return None, len(processed_files)
 
-    # Deduplicate while preserving order
-    seen: set[str] = set()
-    unique_words: list[str] = []
-    for word in all_words:
-        if word not in seen:
-            unique_words.append(word)
-            seen.add(word)
-
-    logger.info("Total: %d unique words from %d files", len(unique_words), len(processed_files))
-
-    if exclude_words:
-        before = len(unique_words)
-        unique_words = [w for w in unique_words if normalize_anki_term(w) not in exclude_words]
-        skipped = before - len(unique_words)
-        if skipped:
-            logger.info(
-                "Skipped %d words already present in Anki (%d remaining)",
-                skipped,
-                len(unique_words),
-            )
-
-    # Determine output path: {output_dir}/{lang}/{YYYYMMDD}.txt
-    today = datetime.now().strftime("%Y%m%d")
-    output_path = output_dir / lang / f"{today}.txt"
+def _write_vocab_output(unique_words: list[str], output_path: Path) -> None:
+    """Write vocab words, append+dedupe if file already exists."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Append to existing file if it exists (deduplicating)
     if output_path.exists():
-        existing_words = set()
         with open(output_path, encoding="utf-8") as f:
             existing_words = {line.strip() for line in f if line.strip()}
-
         new_words = [w for w in unique_words if w not in existing_words]
         if new_words:
             logger.info(
@@ -533,24 +524,198 @@ def process_watch_folder(
         with open(output_path, "w", encoding="utf-8") as f:
             for word in unique_words:
                 f.write(word + "\n")
+    logger.info("Vocab output written to %s", output_path)
 
-    logger.info("Output written to %s", output_path)
 
-    # Move processed files
+def process_folder(
+    lang: Language = "zh",
+    *,
+    source_dir: Path | None = None,
+    mode: ExtractMode = "vocab",
+    move_processed: bool | None = None,
+    recursive: bool = False,
+    exclude_words: set[str] | None = None,
+    exclude_patterns: set[str] | None = None,
+) -> FolderResult:
+    """
+    Process all supported files from a directory (watch folder or ad-hoc).
+
+    Routing by ``mode``:
+
+    - ``vocab`` — produces ``{output_dir}/{lang}/{YYYYMMDD}.txt`` (append+dedupe).
+    - ``grammar`` — produces ``{output_dir}/{lang}/{YYYYMMDD}_grammar.jsonl``
+      (append+dedupe by NFC-normalised pattern).
+    - ``all`` — runs both pipelines, sharing one text-extraction pass per file
+      (cheaper for OCR especially). Files are only counted as "processed" if
+      both passes succeed.
+
+    Move semantics (default):
+
+    - ``move_processed=None`` → move iff ``mode == "all"``. So plain ``vocab``
+      and ``grammar`` runs leave files in place (you may want to run the other
+      pass on them next).
+    - Pass ``move_processed=True/False`` to override.
+
+    Args:
+        lang: Content language (also picks watch / processed sub-folder).
+        source_dir: Directory to scan. ``None`` → use the configured watch dir
+            for this language.
+        mode: Which pipeline(s) to run.
+        move_processed: Override move behaviour. Default depends on ``mode``.
+        recursive: When ``True``, walk subdirectories of ``source_dir``.
+        exclude_words: NFC-normalised words to skip in the vocab pass.
+        exclude_patterns: NFC-normalised patterns to skip in the grammar pass.
+    """
+    # Lazy import to avoid an extractor↔grammar circular dependency at import time.
+    from ankigen.grammar import (
+        extract_grammar_items,
+        write_grammar_jsonl,
+    )
+
+    if move_processed is None:
+        move_processed = mode == "all"
+
+    if source_dir is None:
+        source_dir = get_watch_dir(lang)
+    output_dir = get_output_dir()
+    processed_dir = get_processed_dir(lang)
+
+    files = get_supported_files(source_dir, recursive=recursive)
+    if not files:
+        logger.info("No files found in %s", source_dir)
+        return FolderResult(None, None, 0)
+
+    logger.info("Found %d files to process in %s (mode=%s)", len(files), source_dir, mode)
+
+    today = datetime.now().strftime("%Y%m%d")
+
+    all_words: list[str] = []
+    all_grammar_items: list[Any] = []  # list[GrammarItem]; Any avoids import cycle
+    processed_files: list[Path] = []
+
+    for file_path in files:
+        try:
+            logger.info("Processing: %s", file_path.name)
+
+            text = extract_source_text(
+                file_path,
+                lang,
+                with_headings=(mode in ("grammar", "all")),
+            )
+            if not text.strip():
+                logger.warning("No text extracted from %s", file_path.name)
+                continue
+
+            file_succeeded = True
+
+            if mode in ("vocab", "all"):
+                try:
+                    words = identify_vocabulary(text, lang)
+                    all_words.extend(words)
+                    logger.info("Extracted %d words from %s", len(words), file_path.name)
+                except Exception as exc:
+                    logger.error("Vocab extraction failed for %s: %s", file_path.name, exc)
+                    file_succeeded = False
+
+            if mode in ("grammar", "all"):
+                try:
+                    items = extract_grammar_items(text, lang)
+                    all_grammar_items.extend(items)
+                    logger.info("Extracted %d grammar item(s) from %s", len(items), file_path.name)
+                except Exception as exc:
+                    logger.error("Grammar extraction failed for %s: %s", file_path.name, exc)
+                    file_succeeded = False
+
+            if file_succeeded:
+                processed_files.append(file_path)
+        except Exception as exc:  # belt-and-braces around the whole per-file block
+            logger.error("Failed to process %s: %s", file_path.name, exc)
+
+    vocab_output: Path | None = None
+    grammar_output: Path | None = None
+
+    if mode in ("vocab", "all"):
+        if all_words:
+            seen: set[str] = set()
+            unique_words: list[str] = []
+            for word in all_words:
+                if word not in seen:
+                    unique_words.append(word)
+                    seen.add(word)
+
+            logger.info(
+                "Total: %d unique words from %d files",
+                len(unique_words),
+                len(processed_files),
+            )
+
+            if exclude_words:
+                before = len(unique_words)
+                unique_words = [
+                    w for w in unique_words if normalize_anki_term(w) not in exclude_words
+                ]
+                skipped = before - len(unique_words)
+                if skipped:
+                    logger.info(
+                        "Skipped %d words already present in Anki (%d remaining)",
+                        skipped,
+                        len(unique_words),
+                    )
+
+            vocab_output = output_dir / lang / f"{today}.txt"
+            _write_vocab_output(unique_words, vocab_output)
+        else:
+            logger.warning("No vocabulary extracted from any files")
+
+    if mode in ("grammar", "all"):
+        if all_grammar_items:
+            if exclude_patterns:
+                before = len(all_grammar_items)
+                all_grammar_items = [
+                    it
+                    for it in all_grammar_items
+                    if normalize_anki_term(it.pattern) not in exclude_patterns
+                ]
+                skipped = before - len(all_grammar_items)
+                if skipped:
+                    logger.info("Skipped %d grammar pattern(s) already present in Anki", skipped)
+
+            grammar_output = output_dir / lang / f"{today}_grammar.jsonl"
+            write_grammar_jsonl(all_grammar_items, grammar_output, append=True)
+        else:
+            logger.warning("No grammar items extracted from any files")
+
     if move_processed and processed_files:
-        processed_dir.mkdir(parents=True, exist_ok=True)
-        for file_path in processed_files:
-            dest = processed_dir / file_path.name
-            # Handle name conflicts
-            if dest.exists():
-                stem = file_path.stem
-                suffix = file_path.suffix
-                counter = 1
-                while dest.exists():
-                    dest = processed_dir / f"{stem}_{counter}{suffix}"
-                    counter += 1
-            shutil.move(str(file_path), str(dest))
-            logger.debug("Moved %s to %s", file_path.name, dest)
-        logger.info("Moved %d files to %s", len(processed_files), processed_dir)
+        _move_files(processed_files, processed_dir)
+    elif processed_files and not move_processed:
+        logger.info(
+            "Leaving %d processed file(s) in place (move disabled for mode=%s)",
+            len(processed_files),
+            mode,
+        )
 
-    return output_path, len(processed_files)
+    return FolderResult(vocab_output, grammar_output, len(processed_files))
+
+
+def process_watch_folder(
+    lang: Language = "zh",
+    *,
+    move_processed: bool = True,
+    exclude_words: set[str] | None = None,
+) -> tuple[Path | None, int]:
+    """
+    Backwards-compatible wrapper around :func:`process_folder`.
+
+    Preserves the original signature (vocab-only, watch dir, returns
+    ``(output_path, num_files)``) so external callers and tests built against
+    the previous API keep working. Defaults to vocab mode and the configured
+    watch folder.
+    """
+    result = process_folder(
+        lang=lang,
+        source_dir=None,
+        mode="vocab",
+        move_processed=move_processed,
+        exclude_words=exclude_words,
+    )
+    return result.vocab_path, result.num_files
