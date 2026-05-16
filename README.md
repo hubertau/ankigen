@@ -90,7 +90,7 @@ ankigen uses subcommands for different operations:
 | `--mode` | Input | Output | Anki note shape |
 |----------|-------|--------|-----------------|
 | `vocab` (default) | `.txt` (one word per line) | `outputs/{lang}/output_{stem}.csv` | Hanzi/Korean, Jyutping (zh only), English, Sentence |
-| `grammar` (auto-detected from `.jsonl`) | `_grammar.jsonl` | `outputs/{lang}/output_{stem}_grammar.csv` | **Pattern, Meaning, Explanation, Examples** (4 cols) |
+| `grammar` (auto-detected from `.jsonl`) | `_grammar.jsonl` | `outputs/{lang}/output_{stem}_grammar.csv` | **Pattern, Meaning, Examples** (3 cols; Meaning bolds the short gloss with the longer explanation on the next line) |
 | `all` | Either of the two — sibling is inferred | Both CSVs | both |
 
 ```bash
@@ -111,9 +111,13 @@ ankigen generate inputs/zh/words.txt
 
 **Grammar output** (`outputs/ko/output_20260516_grammar.csv`):
 
-| Pattern | Meaning | Explanation | Examples |
-|---------|---------|-------------|----------|
-| ~게 되다 | To end up doing / change of state | Used to express a change of state caused by external circumstances. | (HTML: each verbatim teacher example highlighted, with English translation underneath) |
+| Pattern | Meaning | Examples |
+|---------|---------|----------|
+| ~게 되다 | `<b>To end up doing / change of state</b><br>Used to express a change of state caused by external circumstances.` | (HTML: each verbatim teacher example highlighted, with English translation underneath) |
+
+The Meaning column merges the LLM's short gloss (bolded) with its longer
+explanation (next line) so each Anki card has a single "what does this pattern
+mean?" cell.
 
 The Examples column preserves the teacher's verbatim sentences from the source DOCX. If a pattern has fewer than `-n` examples, the LLM tops up the rest.
 
@@ -416,10 +420,11 @@ ankigen extract ~/Downloads/notes_march.docx --lang ko --mode grammar
 
 # 2. (Optional) Hand-edit the JSONL to fix patterns or remove noise
 
-# 3. Generate the 4-column Anki grammar CSV
+# 3. Generate the 3-column Anki grammar CSV
 ankigen generate inputs/ko/{YYYYMMDD}_grammar.jsonl --lang ko -n 5
 # → outputs/ko/output_{YYYYMMDD}_grammar.csv
-#   Columns: Pattern | Meaning | Explanation | Examples
+#   Columns: Pattern | Meaning | Examples
+#   (Meaning bolds the short gloss with the longer explanation on the next line)
 ```
 
 In `generate --mode grammar`, `-n` is the *target* number of examples per card:
@@ -468,7 +473,7 @@ ankigen/
 │   ├── cli.py            # CLI entry point (generate, extract, clean, similar)
 │   ├── cleaner.py        # Input file cleaning
 │   ├── extractor.py      # PDF/DOCX/image extraction, OCR, watch & ad-hoc folder
-│   ├── grammar.py        # Grammar extraction, JSONL round-trip, 4-column CSV
+│   ├── grammar.py        # Grammar extraction, JSONL round-trip, 3-column CSV
 │   ├── similarity.py     # Near-duplicate / variant detection
 │   ├── formatter.py      # HTML sentence formatting
 │   ├── llm.py            # LLM client (OpenAI-compatible)

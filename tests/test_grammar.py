@@ -10,6 +10,7 @@ from ankigen.grammar import (
     GRAMMAR_CSV_FIELDNAMES,
     extract_grammar_items,
     format_grammar_examples,
+    format_grammar_meaning,
     generate_grammar_csv,
     read_grammar_jsonl,
     write_grammar_jsonl,
@@ -232,10 +233,14 @@ class TestGenerateGrammarCsv:
 
         topup.assert_not_called()
         text = out_csv.read_text(encoding="utf-8")
-        assert "Pattern,Meaning,Explanation,Examples" in text
+        assert "Pattern,Meaning,Examples" in text
+        assert "Explanation" not in text.splitlines()[0]
         assert "~게 되다" in text
         assert "A입니다." in text
         assert "B입니다." in text
+        # The combined Meaning cell should bold the short meaning and place the
+        # explanation on the next line.
+        assert "<b>change of state</b><br>..." in text
 
     def test_topup_called_when_verbatim_short(self, tmp_path: Path, mocker) -> None:
         items = [
@@ -311,8 +316,49 @@ class TestGenerateGrammarCsv:
         assert "~게 되다" in text
         assert "에 + 씩" not in text
 
-    def test_csv_columns_are_pattern_meaning_explanation_examples(self) -> None:
-        assert GRAMMAR_CSV_FIELDNAMES == ["Pattern", "Meaning", "Explanation", "Examples"]
+    def test_csv_columns_are_pattern_meaning_examples(self) -> None:
+        assert GRAMMAR_CSV_FIELDNAMES == ["Pattern", "Meaning", "Examples"]
+
+
+class TestFormatGrammarMeaning:
+    def test_combines_meaning_and_explanation_with_bold_and_break(self) -> None:
+        html = format_grammar_meaning(
+            "Per X, each",
+            "Describes a regularly repeating action.",
+        )
+        assert html == "<b>Per X, each</b><br>Describes a regularly repeating action."
+
+    def test_meaning_only_returns_plain_text(self) -> None:
+        assert format_grammar_meaning("In order to", "") == "In order to"
+        assert format_grammar_meaning("In order to", "   ") == "In order to"
+
+    def test_explanation_only_returns_plain_explanation(self) -> None:
+        assert format_grammar_meaning("", "Usage notes here.") == "Usage notes here."
+
+    def test_both_empty_returns_empty_string(self) -> None:
+        assert format_grammar_meaning("", "") == ""
+        assert format_grammar_meaning("   ", "\t") == ""
+
+    def test_used_in_generated_csv_when_explanation_empty(self, tmp_path: Path, mocker) -> None:
+        items = [
+            GrammarItem(
+                pattern="~기 위해서",
+                meaning="In order to",
+                explanation="",
+                examples=[GrammarExample(target="공부하기 위해서", english="In order to study.")],
+            )
+        ]
+        jsonl = tmp_path / "g.jsonl"
+        write_grammar_jsonl(items, jsonl)
+        mocker.patch("ankigen.grammar.generate_grammar_examples", return_value=[])
+
+        out_csv = tmp_path / "out.csv"
+        generate_grammar_csv(jsonl, out_csv, lang="ko", num_examples=1)
+
+        text = out_csv.read_text(encoding="utf-8")
+        assert "In order to" in text
+        # No bold/<br> when explanation is empty.
+        assert "<b>In order to</b>" not in text
 
 
 class TestProcessFolderModes:
