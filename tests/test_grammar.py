@@ -233,7 +233,7 @@ class TestGenerateGrammarCsv:
 
         topup.assert_not_called()
         text = out_csv.read_text(encoding="utf-8")
-        assert "Pattern,Meaning,Examples" in text
+        assert "Pattern,Hanja,Meaning,Examples" in text
         assert "Explanation" not in text.splitlines()[0]
         assert "~게 되다" in text
         assert "A입니다." in text
@@ -316,8 +316,90 @@ class TestGenerateGrammarCsv:
         assert "~게 되다" in text
         assert "에 + 씩" not in text
 
-    def test_csv_columns_are_pattern_meaning_examples(self) -> None:
-        assert GRAMMAR_CSV_FIELDNAMES == ["Pattern", "Meaning", "Examples"]
+    def test_csv_columns_include_hanja(self) -> None:
+        assert GRAMMAR_CSV_FIELDNAMES == ["Pattern", "Hanja", "Meaning", "Examples"]
+
+    def test_hanja_field_round_trips_through_jsonl(self, tmp_path: Path) -> None:
+        items = [
+            GrammarItem(
+                pattern="박사 과정을 밟다",
+                meaning="To be pursuing a doctoral program",
+                hanja="博士 課程",
+                examples=[GrammarExample(target="박사 과정을 밟고 있어요.", english="")],
+            )
+        ]
+        out = tmp_path / "g.jsonl"
+        write_grammar_jsonl(items, out)
+        loaded = read_grammar_jsonl(out)
+        assert loaded[0].hanja == "博士 課程"
+
+    def test_hanja_default_empty_for_legacy_jsonl(self, tmp_path: Path) -> None:
+        """Old JSONL rows without a `hanja` field load cleanly."""
+        out = tmp_path / "g.jsonl"
+        out.write_text(
+            '{"pattern":"~게 되다","meaning":"x","explanation":"","examples":[]}\n',
+            encoding="utf-8",
+        )
+        loaded = read_grammar_jsonl(out)
+        assert loaded[0].hanja == ""
+
+    def test_hanja_written_to_csv_from_item(self, tmp_path: Path, mocker) -> None:
+        items = [
+            GrammarItem(
+                pattern="박사 과정을 밟다",
+                meaning="To pursue a PhD",
+                hanja="博士 課程",
+                examples=[GrammarExample(target="박사 과정을 밟고 있어요.", english="")],
+            )
+        ]
+        jsonl = tmp_path / "g.jsonl"
+        write_grammar_jsonl(items, jsonl)
+        mocker.patch("ankigen.grammar.generate_grammar_examples", return_value=[])
+
+        out_csv = tmp_path / "out.csv"
+        generate_grammar_csv(jsonl, out_csv, lang="ko", num_examples=1)
+        text = out_csv.read_text(encoding="utf-8")
+        assert "博士 課程" in text
+
+    def test_hanja_resolved_from_embedded_chars_when_item_empty(
+        self, tmp_path: Path, mocker
+    ) -> None:
+        """If the pattern itself contains Hanja chars, they fill the Hanja column."""
+        items = [
+            GrammarItem(
+                pattern="飮食 + 을/를 먹다",
+                meaning="To eat food",
+                hanja="",
+                examples=[GrammarExample(target="음식을 먹어요.", english="")],
+            )
+        ]
+        jsonl = tmp_path / "g.jsonl"
+        write_grammar_jsonl(items, jsonl)
+        mocker.patch("ankigen.grammar.generate_grammar_examples", return_value=[])
+
+        out_csv = tmp_path / "out.csv"
+        generate_grammar_csv(jsonl, out_csv, lang="ko", num_examples=1)
+        text = out_csv.read_text(encoding="utf-8")
+        # Embedded 飮食 should bubble up via resolve_hanja.
+        assert "飮食" in text
+
+    def test_hanja_is_empty_for_chinese(self, tmp_path: Path, mocker) -> None:
+        items = [
+            GrammarItem(
+                pattern="不…就…",
+                meaning="If not X then Y",
+                hanja="should be ignored for zh",
+                examples=[GrammarExample(target="不学就不会。", english="")],
+            )
+        ]
+        jsonl = tmp_path / "g.jsonl"
+        write_grammar_jsonl(items, jsonl)
+        mocker.patch("ankigen.grammar.generate_grammar_examples", return_value=[])
+
+        out_csv = tmp_path / "out.csv"
+        generate_grammar_csv(jsonl, out_csv, lang="zh", num_examples=1)
+        text = out_csv.read_text(encoding="utf-8")
+        assert "should be ignored for zh" not in text
 
 
 class TestFormatGrammarMeaning:

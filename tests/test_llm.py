@@ -2,8 +2,12 @@
 
 import pytest
 
-from ankigen.llm import generate_sentences, get_model, translate_word
-from ankigen.models import TranslationResponse, create_sentence_response
+from ankigen.llm import TranslationResult, generate_sentences, get_model, translate_word
+from ankigen.models import (
+    KoreanTranslationResponse,
+    TranslationResponse,
+    create_sentence_response,
+)
 
 
 class TestGenerateSentences:
@@ -86,12 +90,17 @@ class TestTranslateWord:
 
         result = translate_word("促使", lang="zh")
 
-        assert result == mock_translation_zh
+        assert isinstance(result, TranslationResult)
+        assert result.translation == mock_translation_zh
+        assert result.hanja == ""  # Chinese never returns Hanja
         mock_generate.assert_called_once()
 
     def test_translate_korean_word(self, mocker, mock_translation_ko):
         """Test translation of Korean word."""
-        mock_response = TranslationResponse(translation=mock_translation_ko)
+        mock_response = KoreanTranslationResponse(
+            translation=mock_translation_ko,
+            hanja="便",
+        )
 
         mocker.patch(
             "ankigen.llm.generate_structured_response",
@@ -100,7 +109,30 @@ class TestTranslateWord:
 
         result = translate_word("편한", lang="ko")
 
-        assert result == mock_translation_ko
+        assert isinstance(result, TranslationResult)
+        assert result.translation == mock_translation_ko
+        assert result.hanja == "便"
+
+    def test_translate_korean_word_with_no_hanja(self, mocker, mock_translation_ko):
+        """Native-Korean words yield an empty Hanja string."""
+        mock_response = KoreanTranslationResponse(translation=mock_translation_ko, hanja="")
+
+        mocker.patch(
+            "ankigen.llm.generate_structured_response",
+            return_value=mock_response,
+        )
+
+        result = translate_word("예쁘다", lang="ko")
+        assert result.hanja == ""
+
+    def test_translate_korean_uses_korean_response_model(self, mocker, mock_translation_ko):
+        """Korean translations request the Korean-specific response model."""
+        mock_generate = mocker.patch(
+            "ankigen.llm.generate_structured_response",
+            return_value=KoreanTranslationResponse(translation=mock_translation_ko, hanja=""),
+        )
+        translate_word("편한", lang="ko")
+        assert mock_generate.call_args.kwargs["response_model"] is KoreanTranslationResponse
 
 
 class TestProviderConfig:

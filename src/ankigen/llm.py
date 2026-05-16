@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import time
+from dataclasses import dataclass
 from typing import Literal
 
 import instructor
@@ -15,10 +16,25 @@ from pydantic import BaseModel
 
 from ankigen.models import (
     GrammarExample,
+    KoreanTranslationResponse,
     TranslationResponse,
     create_grammar_example_response,
     create_sentence_response,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class TranslationResult:
+    """Return shape for :func:`translate_word`.
+
+    ``hanja`` is always ``""`` for Chinese; for Korean it carries the
+    canonical Hanja form when the word is Sino-Korean, or ``""`` for native
+    Korean words.
+    """
+
+    translation: str
+    hanja: str = ""
+
 
 logger = logging.getLogger("ankigen.llm")
 
@@ -81,7 +97,15 @@ LANGUAGE_CONFIG = {
     "ko": {
         "name": "Korean",
         "sentence_prompt": "Generate exactly {num_sentences} natural example sentences in Korean using the word '{word}'. The sentences should demonstrate different usages and contexts of the word. Return only the sentences, no translations or explanations.",
-        "translation_prompt": "Translate the Korean word '{word}' to English. Include the part of speech and any common meanings or usages. Do NOT include romanization or the original Korean characters. Be concise.",
+        "translation_prompt": (
+            "Translate the Korean word '{word}' to English. Include the part of speech "
+            "and any common meanings or usages. Do NOT include romanization or the "
+            "original Korean characters in the translation. Be concise.\n\n"
+            "Also return the canonical Hanja (Chinese-character) form of the word in "
+            "the `hanja` field IF the word is Sino-Korean. Use the most common single "
+            "Hanja spelling, no spaces, no parentheses, no Hangul. Return an empty "
+            "string for native-Korean words that have no Hanja."
+        ),
         "grammar_extraction_system": (
             "You are a Korean language expert helping a learner build Anki grammar cards "
             "from a teacher's class notes. Identify each distinct grammatical construction "
@@ -92,7 +116,11 @@ LANGUAGE_CONFIG = {
             "Korean, alongside any English translations the teacher provides. Keep the "
             "explanation short (1-3 sentences) and prefer the teacher's wording when present. "
             "Return the canonical Korean pattern as the `pattern` field — never English. "
-            "Use a leading '~' for endings/particles when appropriate (e.g. '~게 되다')."
+            "Use a leading '~' for endings/particles when appropriate (e.g. '~게 되다'). "
+            "When the pattern contains Sino-Korean noun roots (e.g. 박사, 과정, 중, 이유), "
+            "set the `hanja` field to their canonical Hanja form (e.g. '博士 課程 中', "
+            "'理由'); leave `hanja` empty for purely grammatical endings/particles or "
+            "native-Korean content."
         ),
         "grammar_extraction_user": (
             "Extract every grammatical construction taught in this Korean class-notes "
@@ -281,16 +309,21 @@ def generate_sentences(word: str, lang: Language = "zh", num_sentences: int = 3)
     return sentences  # type: ignore[no-any-return]
 
 
-def translate_word(word: str, lang: Language = "zh") -> str:
+def translate_word(word: str, lang: Language = "zh") -> TranslationResult:
     """
     Translate a word to English using the LLM.
+
+    For Korean, the LLM is also asked for the canonical Hanja form so we can
+    avoid a second API round-trip; the returned ``hanja`` is ``""`` when the
+    word has no Sino-Korean origin. For Chinese, ``hanja`` is always ``""``.
 
     Args:
         word: The vocabulary word to translate
         lang: Language code ('zh' for Chinese, 'ko' for Korean)
 
     Returns:
-        English translation with part of speech
+        :class:`TranslationResult` with the English translation and optional
+        Hanja form.
     """
     model = get_model()
     config = LANGUAGE_CONFIG[lang]
@@ -298,25 +331,36 @@ def translate_word(word: str, lang: Language = "zh") -> str:
     logger.debug("Translating '%s' (%s) using %s", word, lang, model)
     start_time = time.time()
 
-    response = generate_structured_response(
-        response_model=TranslationResponse,
-        system_prompt=(
-            f"You are a {config['name']}-English translator. "
-            "Provide accurate, concise translations."
-        ),
-        user_prompt=config["translation_prompt"].format(word=word),
-    )
+    if lang == "ko":
+        ko_response = generate_structured_response(
+            response_model=KoreanTranslationResponse,
+            system_prompt=(
+                f"You are a {config['name']}-English translator. "
+                "Provide accurate, concise translations and include Hanja for Sino-Korean words."
+            ),
+            user_prompt=config["translation_prompt"].format(word=word),
+        )
+        translation = ko_response.translation  # type: ignore[attr-defined]
+        hanja = ko_response.hanja or ""  # type: ignore[attr-defined]
+    else:
+        zh_response = generate_structured_response(
+            response_model=TranslationResponse,
+            system_prompt=(
+                f"You are a {config['name']}-English translator. "
+                "Provide accurate, concise translations."
+            ),
+            user_prompt=config["translation_prompt"].format(word=word),
+        )
+        translation = zh_response.translation  # type: ignore[attr-defined]
+        hanja = ""
 
     elapsed = time.time() - start_time
-    # instructor dynamically patches the return type based on response_model,
-    # but mypy can't infer this at static analysis time
-    translation = response.translation  # type: ignore[attr-defined]
     logger.debug(
         "Translation completed in %.2fs: %s",
         elapsed,
         translation[:50] if len(translation) > 50 else translation,
     )
-    return translation  # type: ignore[no-any-return]
+    return TranslationResult(translation=translation, hanja=hanja.strip())
 
 
 def generate_grammar_examples(

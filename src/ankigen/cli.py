@@ -43,7 +43,7 @@ from ankigen.anki_db import (
     load_anki_words,
     normalize_anki_term,
 )
-from ankigen.cleaner import clean_and_write, clean_vocabulary_file
+from ankigen.cleaner import clean_and_write, clean_vocabulary_file, parse_hanja_token
 from ankigen.extractor import (
     ExtractMode,
     extract_vocabulary_from_file,
@@ -58,6 +58,7 @@ from ankigen.grammar import (
     generate_grammar_csv,
     write_grammar_jsonl,
 )
+from ankigen.hanja_lookup import resolve_hanja
 from ankigen.llm import Language, generate_sentences, translate_word
 from ankigen.logging_config import get_log_dir, get_log_level, get_log_retention, setup_logging
 from ankigen.similarity import cluster_pairs, find_similar_pairs
@@ -97,36 +98,42 @@ def read_words(input_file: Path) -> list[str]:
     return words
 
 
-def process_word(word: str, lang: Language, num_sentences: int) -> dict[str, str]:
+def process_word(
+    word: str,
+    lang: Language,
+    num_sentences: int,
+    *,
+    inline_hanja: str = "",
+) -> dict[str, str]:
     """
-    Process a single word: get translation, Jyutping (for Chinese), and optionally sentences.
+    Process a single word: get translation, Jyutping (for Chinese) or Hanja
+    (for Korean), and optionally sentences.
 
     Args:
-        word: The vocabulary word
-        lang: Language code
-        num_sentences: Number of sentences to generate (0 to skip)
+        word: The vocabulary word (bare, with any ``(漢字)`` annotation
+            already split out by the caller).
+        lang: Language code.
+        num_sentences: Number of sentences to generate (0 to skip).
+        inline_hanja: Hanja captured from a ``한글(漢字)`` annotation upstream.
+            Ignored for Chinese.
 
     Returns:
-        Dict with language-appropriate field names
+        Dict with language-appropriate field names.
     """
     logger.info("Processing: %s...", word)
 
-    # Get translation
-    translation = translate_word(word, lang)
+    result = translate_word(word, lang)
+    translation = result.translation
 
     if num_sentences > 0:
-        # Generate sentences
         sentences = generate_sentences(word, lang, num_sentences)
-        # Format as numbered string for the formatter
         numbered = " ".join(f"{i + 1}. {s}" for i, s in enumerate(sentences))
-        # Apply HTML formatting
         formatted = format_sentences(numbered, word)
     else:
         formatted = ""
 
     logger.debug("Done processing word")
 
-    # Return language-specific field names
     if lang == "zh":
         jyutping = get_jyutping(word)
         return {
@@ -135,12 +142,14 @@ def process_word(word: str, lang: Language, num_sentences: int) -> dict[str, str
             "English": translation,
             "Sentence": formatted,
         }
-    else:  # Korean
-        return {
-            "Korean": word,
-            "English": translation,
-            "Comments": formatted,
-        }
+    # Korean: prefer local resolver (inline > embedded Hanja chars) then LLM
+    hanja = resolve_hanja(word, inline_hanja=inline_hanja) or result.hanja
+    return {
+        "Korean": word,
+        "Hanja": hanja,
+        "English": translation,
+        "Comments": formatted,
+    }
 
 
 def get_output_path(input_file: Path, lang: Language, custom_output: Path | None) -> Path:
@@ -195,7 +204,12 @@ def generate_csv(
         words = read_words(input_file)
         if exclude_words:
             before = len(words)
-            words = [w for w in words if normalize_anki_term(w) not in exclude_words]
+            # Compare against Anki using the bare word, not the ``한글(漢字)`` form.
+            words = [
+                w
+                for w in words
+                if normalize_anki_term(parse_hanja_token(w)[0]) not in exclude_words
+            ]
             skipped = before - len(words)
             if skipped:
                 logger.info("Skipped %d words already present in Anki", skipped)
@@ -209,14 +223,15 @@ def generate_csv(
     if lang == "zh":
         fieldnames = ["Hanzi", "Jyutping", "English", "Sentence"]
     else:  # Korean
-        fieldnames = ["Korean", "English", "Comments"]
+        fieldnames = ["Korean", "Hanja", "English", "Comments"]
 
     with open(output_file, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
 
-        for word in words:
-            row = process_word(word, lang, num_sentences)
+        for raw in words:
+            bare, inline_hanja = parse_hanja_token(raw) if lang == "ko" else (raw, "")
+            row = process_word(bare, lang, num_sentences, inline_hanja=inline_hanja)
             writer.writerow(row)
 
     logger.info("Output written to %s", output_file)
@@ -434,7 +449,10 @@ def _extract_single_file_vocab(args: argparse.Namespace, output_file: Path | Non
     exclude_words = _resolve_anki_words(args, args.lang)
     if exclude_words:
         before = len(words)
-        words = [w for w in words if normalize_anki_term(w) not in exclude_words]
+        # Match Anki on the bare word, ignoring any ``(漢字)`` annotation.
+        words = [
+            w for w in words if normalize_anki_term(parse_hanja_token(w)[0]) not in exclude_words
+        ]
         skipped = before - len(words)
         if skipped:
             logger.info("Skipped %d words already present in Anki", skipped)
@@ -442,8 +460,10 @@ def _extract_single_file_vocab(args: argparse.Namespace, output_file: Path | Non
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
     if output_file.exists() and not args.overwrite:
-        existing_words = set(read_words(output_file))
-        new_words = [w for w in words if w not in existing_words]
+        # Dedupe by bare word (without ``(漢字)`` annotation) so that the same
+        # word with and without Hanja still collapses to one entry.
+        existing_bare = {parse_hanja_token(w)[0] for w in read_words(output_file)}
+        new_words = [w for w in words if parse_hanja_token(w)[0] not in existing_bare]
         if not new_words:
             logger.info("All extracted words already exist in %s", output_file)
             return
@@ -656,7 +676,9 @@ def cmd_similar(args: argparse.Namespace) -> None:
         if not args.input_file.exists():
             logger.error("Input file not found: %s", args.input_file)
             sys.exit(1)
-        words = read_words(args.input_file)
+        # Similarity is computed on the bare word; strip any ``(漢字)`` annotation
+        # so e.g. ``음식(飮食)`` is compared against ``음식``.
+        words = [parse_hanja_token(w)[0] for w in read_words(args.input_file)]
         if not words:
             logger.warning("No words found in %s", args.input_file)
             return

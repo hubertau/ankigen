@@ -23,6 +23,7 @@ from pathlib import Path
 
 from ankigen.anki_db import normalize_anki_term
 from ankigen.extractor import extract_source_text
+from ankigen.hanja_lookup import resolve_hanja
 from ankigen.llm import (
     LANGUAGE_CONFIG,
     Language,
@@ -33,7 +34,7 @@ from ankigen.models import GrammarExample, GrammarExtractionResponse, GrammarIte
 
 logger = logging.getLogger("ankigen.grammar")
 
-GRAMMAR_CSV_FIELDNAMES = ["Pattern", "Meaning", "Examples"]
+GRAMMAR_CSV_FIELDNAMES = ["Pattern", "Hanja", "Meaning", "Examples"]
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +246,21 @@ def format_grammar_examples(examples: list[GrammarExample], pattern: str) -> str
     return "<br><br>".join(blocks)
 
 
+def _resolve_grammar_hanja(item: GrammarItem, lang: Language) -> str:
+    """Choose the Hanja string for a grammar row.
+
+    Prefers any Hanja already set on the item (typically from the LLM
+    extraction step), then falls back to the local resolver which can pick up
+    Hanja characters already embedded in ``item.pattern``. Returns ``""`` when
+    nothing is available — we do not spend an extra LLM call here.
+    """
+    if lang != "ko":
+        return ""
+    if item.hanja.strip():
+        return item.hanja.strip()
+    return resolve_hanja(item.pattern)
+
+
 def generate_grammar_csv(
     input_path: Path,
     output_path: Path,
@@ -254,7 +270,7 @@ def generate_grammar_csv(
     exclude_patterns: set[str] | None = None,
 ) -> None:
     """
-    Generate the 3-column grammar Anki CSV from a JSONL file.
+    Generate the 4-column grammar Anki CSV from a JSONL file.
 
     Args:
         input_path: Path to the JSONL file written by ``extract --mode grammar``.
@@ -286,6 +302,7 @@ def generate_grammar_csv(
             writer.writerow(
                 {
                     "Pattern": item.pattern,
+                    "Hanja": _resolve_grammar_hanja(item, lang),
                     "Meaning": format_grammar_meaning(item.meaning, item.explanation),
                     "Examples": examples_html,
                 }

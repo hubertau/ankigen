@@ -345,6 +345,16 @@ def identify_vocabulary(text: str, lang: Language = "zh") -> list[str]:
     logger.debug("Calling %s for %s vocabulary identification", model, lang_name)
     start_time = time.time()
 
+    hanja_rule = (
+        " EXCEPTION for Korean: if the source text presents a Sino-Korean word "
+        "together with its Hanja form (e.g. '음식(飮食)', '한자(漢字)'), keep that "
+        "exact '한글(漢字)' annotation in the returned word so downstream tools "
+        "can reuse the Hanja without a separate lookup. Do not invent Hanja "
+        "annotations that are not in the source text."
+        if lang == "ko"
+        else ""
+    )
+
     response = generate_structured_response(
         response_model=VocabularyResponse,
         system_prompt=(
@@ -356,7 +366,7 @@ def identify_vocabulary(text: str, lang: Language = "zh") -> list[str]:
             "Return each word in its dictionary/base form. "
             f"IMPORTANT: Return ONLY the {lang_name} characters/script. "
             "Do NOT include any romanization (pinyin, romaja, etc.), "
-            "pronunciation guides, or parenthetical annotations."
+            "pronunciation guides, or parenthetical annotations." + hanja_rule
         ),
         user_prompt=f"Extract vocabulary words from this {lang_name} text:\n\n{text}",
     )

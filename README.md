@@ -4,7 +4,7 @@ Generate Anki vocabulary **and grammar** CSVs with LLM-powered example sentences
 
 ## Features
 
-- **Multi-language support**: Chinese (with Jyutping) and Korean
+- **Multi-language support**: Chinese (with Jyutping) and Korean (with Hanja for Sino-Korean words)
 - **LLM-powered**: Generate natural example sentences and translations
 - **Two card types**: vocabulary words *and* grammar patterns (`--mode grammar`/`all`)
 - **PDF, DOCX & Image extraction**: Extract from PDFs, Word documents, or images (OCR via GPT-4 Vision)
@@ -89,8 +89,8 @@ ankigen uses subcommands for different operations:
 
 | `--mode` | Input | Output | Anki note shape |
 |----------|-------|--------|-----------------|
-| `vocab` (default) | `.txt` (one word per line) | `outputs/{lang}/output_{stem}.csv` | Hanzi/Korean, Jyutping (zh only), English, Sentence |
-| `grammar` (auto-detected from `.jsonl`) | `_grammar.jsonl` | `outputs/{lang}/output_{stem}_grammar.csv` | **Pattern, Meaning, Examples** (3 cols; Meaning bolds the short gloss with the longer explanation on the next line) |
+| `vocab` (default) | `.txt` (one word per line) | `outputs/{lang}/output_{stem}.csv` | zh: Hanzi, Jyutping, English, Sentence — ko: **Korean, Hanja, English, Comments** |
+| `grammar` (auto-detected from `.jsonl`) | `_grammar.jsonl` | `outputs/{lang}/output_{stem}_grammar.csv` | **Pattern, Hanja, Meaning, Examples** (4 cols; Hanja is populated for Sino-Korean roots, empty otherwise; Meaning bolds the short gloss with the longer explanation on the next line) |
 | `all` | Either of the two — sibling is inferred | Both CSVs | both |
 
 ```bash
@@ -103,21 +103,35 @@ echo "促使
 ankigen generate inputs/zh/words.txt
 ```
 
-**Vocab output** (`outputs/zh/output_words.csv`):
+**Vocab output (Chinese)** (`outputs/zh/output_words.csv`):
 
 | Hanzi | Jyutping | English | Sentence |
 |-------|----------|---------|----------|
 | 促使 | cuk1sai2 | Verb: to urge, to spur | (HTML formatted sentences) |
 
+**Vocab output (Korean)** (`outputs/ko/output_words.csv`):
+
+| Korean | Hanja | English | Comments |
+|--------|-------|---------|----------|
+| 음식 | 飮食 | Noun: food, cuisine | (HTML formatted sentences) |
+| 예쁘다 |  | Adjective: pretty | (HTML formatted sentences) |
+
+The Hanja column is filled for Sino-Korean words (`음식 → 飮食`) and left empty
+for native-Korean words (`예쁘다`). The card-model side needs a matching
+`Hanja` field — add one to your Korean note type before importing.
+
 **Grammar output** (`outputs/ko/output_20260516_grammar.csv`):
 
-| Pattern | Meaning | Examples |
-|---------|---------|----------|
-| ~게 되다 | `<b>To end up doing / change of state</b><br>Used to express a change of state caused by external circumstances.` | (HTML: each verbatim teacher example highlighted, with English translation underneath) |
+| Pattern | Hanja | Meaning | Examples |
+|---------|-------|---------|----------|
+| ~게 되다 |  | `<b>To end up doing / change of state</b><br>Used to express a change of state caused by external circumstances.` | (HTML: each verbatim teacher example highlighted, with English translation underneath) |
+| 박사 과정을 밟다 | 博士 課程 | `<b>To be pursuing a doctoral program</b><br>Correct expression for someone currently doing a PhD.` | … |
 
-The Meaning column merges the LLM's short gloss (bolded) with its longer
-explanation (next line) so each Anki card has a single "what does this pattern
-mean?" cell.
+The Hanja column is populated when the pattern contains Sino-Korean noun
+roots (e.g. `박사 → 博士`); purely grammatical endings/particles leave it
+empty. The Meaning column merges the LLM's short gloss (bolded) with its
+longer explanation (next line) so each Anki card has a single "what does
+this pattern mean?" cell.
 
 The Examples column preserves the teacher's verbatim sentences from the source DOCX. If a pattern has fewer than `-n` examples, the LLM tops up the rest.
 
@@ -276,6 +290,18 @@ ankigen clean inputs/ko/dirty.txt -o inputs/ko/clean.txt --lang ko
 | Dash translations | `직원 - Employee` | `직원` |
 | Numbering | `1. 도망가다` | `도망가다` |
 | Bullet points | `- 게으르다` | `게으르다` |
+
+**Korean Hanja annotation (preserved)**: a `한글(漢字)` annotation is *not*
+stripped — it round-trips through `clean` and is consumed by `generate` to
+fill the `Hanja` CSV column without an extra LLM lookup:
+
+| Pattern | Before | After |
+|---------|--------|-------|
+| Inline Hanja annotation | `음식(飮食), food` | `음식(飮食)` |
+| Inline Hanja + romanization | `음식(飮食) (eumsig)` | `음식(飮食)` |
+
+Use the same `한글(漢字)` shape in your own input files when you want to
+pre-seed the Hanja column.
 
 **Options**:
 
