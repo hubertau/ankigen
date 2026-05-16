@@ -8,6 +8,7 @@ Generate Anki vocabulary CSVs with LLM-powered example sentences and translation
 - **LLM-powered**: Generate natural example sentences and translations
 - **PDF & Image extraction**: Extract vocabulary from PDFs or images (OCR via GPT-4 Vision)
 - **Input cleaning**: Automatically remove translations, romanization, and annotations from input files
+- **Similarity review**: Surface near-duplicate, variant, and contained terms (within a list or vs an Anki deck)
 - **Flexible providers**: OpenAI, OpenRouter, or local models (Ollama, vLLM)
 - **HTML formatting**: Keywords highlighted in red, sentences in blue
 - **Configurable**: Number of sentences, output paths, and more
@@ -209,6 +210,37 @@ ankigen clean inputs/ko/dirty.txt -o inputs/ko/clean.txt --lang ko
 | `--overwrite` | Overwrite existing output file |
 | `--anki-db`, `--anki-deck`, `--anki-field` | Skip words already in Anki (see [Anki database filtering](#anki-database-filtering-optional)) |
 
+### Similar: Find near-duplicates and variants
+
+Exact duplicates are removed automatically during `clean`/`extract`. The `similar` command instead surfaces terms that are *close but not identical* so you can review them — it never modifies your word list.
+
+```bash
+# Group similar terms in a word list
+ankigen similar inputs/ko/words.txt --lang ko
+
+# Also compare against an existing Anki deck, write a CSV
+ankigen similar inputs/zh/words.txt --lang zh --format csv --anki-db ~/collection.anki2
+```
+
+It prints grouped clusters to the screen and writes a sidecar report next to the input (`<input>.similar.txt`). Each pair is tagged with a reason:
+
+| Reason | Meaning | Example |
+|--------|---------|---------|
+| `near-identical` | One unit different — likely an OCR/transcription typo | `测试` / `测式` |
+| `containment` | One term is contained in the other | `学习` / `学习方法` |
+| `shared-stem` | Same Korean stem, or high Chinese character overlap | `가다` / `가요` / `갑니다` |
+| `fuzzy` | Generic closeness above `--threshold` | — |
+
+**Options**:
+
+| Option | Description |
+|--------|-------------|
+| `--lang {zh,ko}` | Language (default: zh) |
+| `--threshold FLOAT` | Minimum fuzzy similarity ratio, 0.0–1.0 (default: 0.80) |
+| `-o, --output FILE` | Report file (default: `<input>.similar.txt`) |
+| `--format {text,csv}` | `text` (grouped) or `csv` (pair rows). Default: text |
+| `--anki-db`, `--anki-deck`, `--anki-field` | Also flag terms similar to existing Anki cards (see [Anki database filtering](#anki-database-filtering-optional)) |
+
 ### Status: Check configuration
 
 View your current configuration, optional Anki filtering env vars, and verify paths exist:
@@ -329,9 +361,10 @@ uv run mypy src/
 ankigen/
 ├── src/ankigen/
 │   ├── __init__.py
-│   ├── cli.py            # CLI entry point (generate, extract, clean)
+│   ├── cli.py            # CLI entry point (generate, extract, clean, similar)
 │   ├── cleaner.py        # Input file cleaning
 │   ├── extractor.py      # PDF/image extraction, OCR, and watch folder
+│   ├── similarity.py     # Near-duplicate / variant detection
 │   ├── formatter.py      # HTML sentence formatting
 │   ├── llm.py            # LLM client (OpenAI-compatible)
 │   ├── logging_config.py # Logging setup with file rotation
@@ -340,6 +373,7 @@ ankigen/
 │   ├── conftest.py       # Test fixtures
 │   ├── test_cleaner.py
 │   ├── test_extractor.py
+│   ├── test_similarity.py
 │   ├── test_formatter.py
 │   └── test_llm.py
 ├── logs/                 # Daily log files (gitignored)

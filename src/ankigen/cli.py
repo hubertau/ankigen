@@ -50,6 +50,7 @@ from ankigen.extractor import (
 from ankigen.formatter import format_sentences
 from ankigen.llm import Language, generate_sentences, translate_word
 from ankigen.logging_config import get_log_dir, get_log_level, get_log_retention, setup_logging
+from ankigen.similarity import cluster_pairs, find_similar_pairs
 
 # Configure logging
 logger = logging.getLogger("ankigen.cli")
@@ -421,6 +422,89 @@ def cmd_clean(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def cmd_similar(args: argparse.Namespace) -> None:
+    """Handle the 'similar' subcommand - report similar-but-not-duplicate terms."""
+    if not args.input_file.exists():
+        logger.error("Input file not found: %s", args.input_file)
+        sys.exit(1)
+
+    words = read_words(args.input_file)
+    if not words:
+        logger.warning("No words found in %s", args.input_file)
+        return
+
+    anki_words = _resolve_anki_words(args, args.lang)
+    pairs = find_similar_pairs(
+        words,
+        args.lang,
+        threshold=args.threshold,
+        anki_words=anki_words or None,
+    )
+
+    if args.output is not None:
+        out_path = args.output
+    else:
+        ext = ".similar.csv" if args.format == "csv" else ".similar.txt"
+        out_path = args.input_file.with_name(args.input_file.stem + ext)
+
+    print("=" * 60)
+    print(f"SIMILAR VOCABULARY ({args.lang})")
+    print("=" * 60)
+    print(f"\nInput: {args.input_file}   Terms: {len(words)}   Threshold: {args.threshold}")
+    print(f"Anki cross-check: {len(anki_words)} card(s)" if anki_words else "Anki cross-check: (off)")
+
+    if not pairs:
+        print("\nNo similar pairs found. Nothing to review.")
+        return
+
+    clusters = cluster_pairs(pairs)
+    clusters.sort(key=len, reverse=True)
+    print(f"\nFound {len(pairs)} similar pair(s) across {len(clusters)} group(s).\n")
+
+    for idx, members in enumerate(clusters, start=1):
+        member_set = set(members)
+        group_pairs = [p for p in pairs if p.a in member_set and p.b in member_set]
+        in_anki = {m for m in members if normalize_anki_term(m) in anki_words}
+        # Suggested keep: a card already in Anki, else the shortest term.
+        keep = next(iter(sorted(in_anki))) if in_anki else min(members, key=lambda m: (len(m), m))
+        print(f"▸ Group {idx}  (suggest keep: {keep})")
+        for m in members:
+            tag = "  [in Anki]" if m in in_anki else ""
+            print(f"   {m}{tag}")
+        for p in sorted(group_pairs, key=lambda p: p.score, reverse=True):
+            src = " [anki]" if p.source == "anki" else ""
+            print(f"     {p.a} ~ {p.b}  {p.reason} {p.score}{src}")
+        print()
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if args.format == "csv":
+        with open(out_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["word_a", "word_b", "reason", "score", "source"])
+            for p in pairs:
+                writer.writerow([p.a, p.b, p.reason, p.score, p.source])
+    else:
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(f"Similar vocabulary report ({args.lang}) for {args.input_file}\n")
+            f.write(f"{len(pairs)} pair(s) across {len(clusters)} group(s)\n\n")
+            for idx, members in enumerate(clusters, start=1):
+                member_set = set(members)
+                group_pairs = [p for p in pairs if p.a in member_set and p.b in member_set]
+                in_anki = {m for m in members if normalize_anki_term(m) in anki_words}
+                keep = next(iter(sorted(in_anki))) if in_anki else min(members, key=lambda m: (len(m), m))
+                f.write(f"Group {idx} (suggest keep: {keep})\n")
+                for m in members:
+                    tag = "  [in Anki]" if m in in_anki else ""
+                    f.write(f"  {m}{tag}\n")
+                for p in sorted(group_pairs, key=lambda p: p.score, reverse=True):
+                    src = " [anki]" if p.source == "anki" else ""
+                    f.write(f"    {p.a} ~ {p.b}  {p.reason} {p.score}{src}\n")
+                f.write("\n")
+
+    logger.info("Similarity report written to %s", out_path)
+    print(f"Report written to {out_path}")
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     """Handle the 'status' subcommand - show configuration health check."""
     print("=" * 60)
@@ -643,6 +727,49 @@ def main() -> None:
     )
     _add_anki_args(clean_parser)
 
+    # 'similar' subcommand
+    sim_parser = subparsers.add_parser(
+        "similar",
+        help="Find similar-but-not-duplicate vocabulary",
+        description=(
+            "Detect near-duplicate, morphologically related, or contained terms "
+            "in a word list (and optionally vs an Anki deck) and report them grouped."
+        ),
+    )
+    sim_parser.add_argument(
+        "input_file",
+        type=Path,
+        help="Input text file with words (one per line)",
+    )
+    sim_parser.add_argument(
+        "--lang",
+        type=str,
+        choices=["zh", "ko"],
+        default="zh",
+        help="Language: zh (Chinese) or ko (Korean). Default: zh",
+    )
+    sim_parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.80,
+        help="Minimum fuzzy similarity ratio (0.0-1.0). Default: 0.80",
+    )
+    sim_parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=None,
+        help="Report file (default: <input>.similar.txt next to the input)",
+    )
+    sim_parser.add_argument(
+        "--format",
+        type=str,
+        choices=["text", "csv"],
+        default="text",
+        help="Report format: text (grouped) or csv (pair rows). Default: text",
+    )
+    _add_anki_args(sim_parser)
+
     # 'status' subcommand
     subparsers.add_parser(
         "status",
@@ -662,6 +789,8 @@ def main() -> None:
         cmd_extract(args)
     elif args.command == "clean":
         cmd_clean(args)
+    elif args.command == "similar":
+        cmd_similar(args)
     elif args.command == "status":
         cmd_status(args)
     else:
