@@ -18,6 +18,7 @@ from ankigen.anki_db import (
     get_anki_field,
     load_anki_notes,
     load_anki_words,
+    load_deck_names,
     normalize_anki_term,
 )
 
@@ -359,6 +360,37 @@ class TestGetDeckIds:
         deck_ids = _get_deck_ids(conn, "Chinese")
         conn.close()
         assert deck_ids == set()
+
+
+class TestLoadDeckNames:
+    """`load_deck_names` returns a {deck_id: name} map for both schemas."""
+
+    def test_old_schema_maps_ids_to_names(self, tmp_path):
+        db_path = tmp_path / "col.anki2"
+        _make_old_schema_db(
+            db_path,
+            "Chinese",
+            ["促使"],
+            extra_decks=[(1002, "Chinese::Vocabulary", ["归纳"])],
+        )
+        names = load_deck_names(db_path)
+        assert names[1001] == "Chinese"
+        assert names[1002] == "Chinese::Vocabulary"
+
+    def test_new_schema_maps_ids_to_names(self, tmp_path):
+        db_path = tmp_path / "col.anki2"
+        _make_new_schema_db(
+            db_path,
+            "Korean",
+            ["편한"],
+            extra_decks=[(2002, "Korean::Grammar", ["추천"])],
+        )
+        names = load_deck_names(db_path)
+        assert names[2001] == "Korean"
+        assert names[2002] == "Korean::Grammar"
+
+    def test_missing_file_returns_empty(self, tmp_path):
+        assert load_deck_names(tmp_path / "nope.anki2") == {}
 
 
 class TestBuildModelFieldMap:
