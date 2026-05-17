@@ -1154,7 +1154,7 @@ def main() -> None:
         choices=["vocab", "grammar", "all"],
         default="vocab",
         help=(
-            "What to generate: vocab (default), grammar (3-column Pattern/Meaning/"
+            "What to generate: vocab (default), grammar (4-column Pattern/Meaning/"
             "Examples CSV from a JSONL), or all (both — sibling file is inferred "
             "from the given path). `.jsonl` inputs auto-detect grammar."
         ),
