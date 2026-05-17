@@ -70,7 +70,7 @@ from ankigen.grammar import (
 from ankigen.hanja_lookup import resolve_hanja
 from ankigen.llm import Language, generate_sentences, translate_word
 from ankigen.logging_config import get_log_dir, get_log_level, get_log_retention, setup_logging
-from ankigen.similarity import cluster_pairs, find_similar_pairs
+from ankigen.similarity import SimilarPair, cluster_pairs, find_similar_pairs
 
 # Configure logging
 logger = logging.getLogger("ankigen.cli")
@@ -652,6 +652,44 @@ def _sanitize_deck_name(deck_name: str) -> str:
     return "_".join(filter(None, safe.split("_"))).lower() or "anki_deck"
 
 
+def _render_similar_clusters(
+    clusters: list[list[str]],
+    pairs: list[SimilarPair],
+    anki_tag_set: set[str],
+    *,
+    for_file: bool = False,
+) -> list[str]:
+    """Return text lines for all similarity groups.
+
+    Used by both the stdout display and the sidecar file writer so the
+    formatting logic lives in exactly one place.
+    """
+    lines: list[str] = []
+    for idx, members in enumerate(clusters, start=1):
+        member_set = set(members)
+        group_pairs = [p for p in pairs if p.a in member_set and p.b in member_set]
+        in_anki = {m for m in members if normalize_anki_term(m) in anki_tag_set}
+        keep = (
+            next(iter(sorted(in_anki)))
+            if in_anki
+            else min(members, key=lambda m: (len(m), m))
+        )
+        if for_file:
+            lines.append(f"Group {idx} (suggest keep: {keep})")
+            m_indent, p_indent = "  ", "    "
+        else:
+            lines.append(f"▸ Group {idx}  (suggest keep: {keep})")
+            m_indent, p_indent = "   ", "     "
+        for m in members:
+            tag = "  [in Anki]" if m in in_anki else ""
+            lines.append(f"{m_indent}{m}{tag}")
+        for p in sorted(group_pairs, key=lambda p: p.score, reverse=True):
+            src = " [anki]" if p.source == "anki" else ""
+            lines.append(f"{p_indent}{p.a} ~ {p.b}  {p.reason} {p.score}{src}")
+        lines.append("")
+    return lines
+
+
 def cmd_similar(args: argparse.Namespace) -> None:
     """Handle the 'similar' subcommand - report similar-but-not-duplicate terms.
 
@@ -733,20 +771,8 @@ def cmd_similar(args: argparse.Namespace) -> None:
     clusters.sort(key=len, reverse=True)
     print(f"\nFound {len(pairs)} similar pair(s) across {len(clusters)} group(s).\n")
 
-    for idx, members in enumerate(clusters, start=1):
-        member_set = set(members)
-        group_pairs = [p for p in pairs if p.a in member_set and p.b in member_set]
-        in_anki = {m for m in members if normalize_anki_term(m) in anki_tag_set}
-        # Suggested keep: a card already in Anki, else the shortest term.
-        keep = next(iter(sorted(in_anki))) if in_anki else min(members, key=lambda m: (len(m), m))
-        print(f"▸ Group {idx}  (suggest keep: {keep})")
-        for m in members:
-            tag = "  [in Anki]" if m in in_anki else ""
-            print(f"   {m}{tag}")
-        for p in sorted(group_pairs, key=lambda p: p.score, reverse=True):
-            src = " [anki]" if p.source == "anki" else ""
-            print(f"     {p.a} ~ {p.b}  {p.reason} {p.score}{src}")
-        print()
+    for line in _render_similar_clusters(clusters, pairs, anki_tag_set):
+        print(line)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if args.format == "csv":
@@ -759,23 +785,8 @@ def cmd_similar(args: argparse.Namespace) -> None:
         with open(out_path, "w", encoding="utf-8") as f:
             f.write(f"Similar vocabulary report ({args.lang}) for {report_source}\n")
             f.write(f"{len(pairs)} pair(s) across {len(clusters)} group(s)\n\n")
-            for idx, members in enumerate(clusters, start=1):
-                member_set = set(members)
-                group_pairs = [p for p in pairs if p.a in member_set and p.b in member_set]
-                in_anki = {m for m in members if normalize_anki_term(m) in anki_tag_set}
-                keep = (
-                    next(iter(sorted(in_anki)))
-                    if in_anki
-                    else min(members, key=lambda m: (len(m), m))
-                )
-                f.write(f"Group {idx} (suggest keep: {keep})\n")
-                for m in members:
-                    tag = "  [in Anki]" if m in in_anki else ""
-                    f.write(f"  {m}{tag}\n")
-                for p in sorted(group_pairs, key=lambda p: p.score, reverse=True):
-                    src = " [anki]" if p.source == "anki" else ""
-                    f.write(f"    {p.a} ~ {p.b}  {p.reason} {p.score}{src}\n")
-                f.write("\n")
+            for line in _render_similar_clusters(clusters, pairs, anki_tag_set, for_file=True):
+                f.write(f"{line}\n")
 
     logger.info("Similarity report written to %s", out_path)
     print(f"Report written to {out_path}")

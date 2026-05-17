@@ -1,8 +1,11 @@
 """Pydantic models for structured LLM responses."""
 
+from functools import cache
+
 from pydantic import BaseModel, Field
 
 
+@cache
 def create_sentence_response(num_sentences: int = 3) -> type[BaseModel]:
     """Factory to create a SentenceResponse model with dynamic sentence count."""
 
@@ -116,6 +119,7 @@ class GrammarExtractionResponse(BaseModel):
     )
 
 
+@cache
 def create_grammar_example_response(num_examples: int = 3) -> type[BaseModel]:
     """Factory to create a GrammarExampleResponse model with a fixed example count."""
 
