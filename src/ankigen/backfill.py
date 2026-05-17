@@ -25,7 +25,7 @@ from ankigen.audit import (
     read_audit_jsonl,
 )
 from ankigen.cleaner import parse_hanja_token
-from ankigen.formatter import format_sentences
+from ankigen.formatter import BR_SPLIT_RE, format_sentences
 from ankigen.hanja_lookup import resolve_hanja
 from ankigen.llm import generate_sentences, translate_word
 
@@ -37,7 +37,6 @@ logger = logging.getLogger("ankigen.backfill")
 # ---------------------------------------------------------------------------
 
 
-_BR_SPLIT_RE = re.compile(r"<br\s*/?>", flags=re.IGNORECASE)
 _ANY_SPAN_RE = re.compile(r"<span[^>]*>|</span>", flags=re.IGNORECASE)
 
 
@@ -62,7 +61,7 @@ def split_sentences_from_html(html: str) -> list[str]:
     if not html.strip():
         return []
     sentences: list[str] = []
-    for piece in _BR_SPLIT_RE.split(html):
+    for piece in BR_SPLIT_RE.split(html):
         body = _ANY_SPAN_RE.sub("", piece).strip()
         if body:
             sentences.append(body)

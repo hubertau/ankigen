@@ -1172,8 +1172,9 @@ def main() -> None:
         "--append",
         action="store_true",
         help=(
-            "Kept for backward compatibility — append+dedupe is now the default "
-            "when the output file already exists."
+            "No-op — append+dedupe is the default when the output file already exists. "
+            "Kept for backward compatibility with older scripts. "
+            "Use --overwrite to wipe the output file before writing."
         ),
     )
     ext_parser.add_argument(
@@ -1218,8 +1219,8 @@ def main() -> None:
         "--lang",
         type=str,
         choices=["zh", "ko"],
-        default="ko",
-        help="Language: zh (Chinese) or ko (Korean). Default: ko",
+        default="zh",
+        help="Language: zh (Chinese) or ko (Korean). Default: zh",
     )
     clean_parser.add_argument(
         "--overwrite",

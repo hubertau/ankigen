@@ -43,10 +43,12 @@ import logging
 import os
 import re
 from collections.abc import Callable
+from functools import cache
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
 from ankigen.anki_db import AnkiNote
+from ankigen.formatter import BR_SPLIT_RE
 from ankigen.hanja_lookup import extract_hanja_chars
 from ankigen.llm import Language
 
@@ -332,12 +334,6 @@ ReasonCode = Literal[
     "plain_text_sentences",
 ]
 
-# Sentence separator used by `format_sentences` (single <br>). A single
-# rendered sentence may carry multiple alternating blue/red spans
-# (interrupted blue span around the keyword), so we count sentences by
-# splitting on <br> rather than by counting blue spans.
-_BR_SPLIT_RE = re.compile(r"<br\s*/?>", flags=re.IGNORECASE)
-
 # Regex matching the inline ``한글(漢字)`` annotation a user may have typed
 # directly into the Korean field instead of (or in addition to) populating
 # the Hanja column. Reused from `cleaner.extract_inline_hanja` semantically;
@@ -411,7 +407,7 @@ def count_sentence_blocks(html: str) -> int:
     """
     if not html.strip():
         return 0
-    return sum(1 for piece in _BR_SPLIT_RE.split(html) if piece.strip())
+    return sum(1 for piece in BR_SPLIT_RE.split(html) if piece.strip())
 
 
 def has_keyword_highlight(html: str, keyword: str) -> bool:
@@ -585,6 +581,16 @@ def _rule_plain_text_sentences(note: AnkiNote, *, resolved: ResolvedFields) -> A
 # ---------------------------------------------------------------------------
 
 
+@cache
+def _get_default_jyutping_fn() -> Callable[[str], str]:
+    # Imported lazily to avoid a circular import (cli imports audit at
+    # module level; audit must not import cli at module level in return).
+    # lru_cache ensures the import only runs once.
+    from ankigen.cli import get_jyutping
+
+    return get_jyutping
+
+
 def audit_notes(
     notes: list[AnkiNote],
     *,
@@ -615,11 +621,7 @@ def audit_notes(
             ``ANKIGEN_NOTE_TYPE_OVERRIDES`` env var.
     """
     if jyutping_resolver is None:
-        # Imported lazily to avoid a circular import at module load time
-        # (cli imports audit; audit must not import cli at top level).
-        from ankigen.cli import get_jyutping as _default_jyutping
-
-        jyutping_resolver = _default_jyutping
+        jyutping_resolver = _get_default_jyutping_fn()
 
     if overrides is None:
         overrides = get_note_type_overrides()
