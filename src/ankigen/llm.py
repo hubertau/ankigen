@@ -74,7 +74,13 @@ Provider = Literal["openai", "openrouter", "anthropic", "local", "deepseek"]
 LANGUAGE_CONFIG = {
     "zh": {
         "name": "Chinese",
-        "sentence_prompt": "Generate exactly {num_sentences} natural example sentences in Chinese using the word '{word}'. The sentences should demonstrate different usages and contexts of the word. Return only the sentences, no translations or explanations.",
+        "sentence_prompt": (
+            "Generate exactly {num_sentences} natural example sentences in Chinese using "
+            "the word '{word}'. The sentences should demonstrate different usages and "
+            "contexts of the word. Wrap the word exactly as it appears in each sentence "
+            "in double asterisks, e.g. **{word}**. "
+            "Return only the sentences, no translations or explanations."
+        ),
         "translation_prompt": "Translate the Chinese word '{word}' to English. Include the part of speech and any common meanings or usages. Do NOT include pinyin or the original Chinese characters. Be concise.",
         "grammar_extraction_system": (
             "You are a Chinese language expert helping a learner build Anki grammar cards "
@@ -103,7 +109,14 @@ LANGUAGE_CONFIG = {
     },
     "ko": {
         "name": "Korean",
-        "sentence_prompt": "Generate exactly {num_sentences} natural example sentences in Korean using the word '{word}'. The sentences should demonstrate different usages and contexts of the word. Return only the sentences, no translations or explanations.",
+        "sentence_prompt": (
+            "Generate exactly {num_sentences} natural example sentences in Korean using "
+            "the word '{word}'. The sentences should demonstrate different usages and "
+            "contexts of the word. Wrap the word's form as it naturally appears in the "
+            "sentence (conjugated or with particles) in double asterisks, "
+            "e.g. **먹었어요** for 먹다 or **음식을** for 음식. "
+            "Return only the sentences, no translations or explanations."
+        ),
         "translation_prompt": (
             "Translate the Korean word '{word}' to English. Include the part of speech "
             "and any common meanings or usages. Do NOT include romanization or the "
