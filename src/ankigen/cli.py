@@ -70,6 +70,7 @@ from ankigen.grammar import (
 from ankigen.hanja_lookup import resolve_hanja
 from ankigen.llm import Language, generate_sentences, translate_word
 from ankigen.logging_config import get_log_dir, get_log_level, get_log_retention, setup_logging
+from ankigen.resume import completed_csv_keys, durable_write
 from ankigen.similarity import SimilarPair, cluster_pairs, find_similar_pairs
 
 # Configure logging
@@ -194,6 +195,7 @@ def generate_csv(
     *,
     clean_input: bool = False,
     exclude_words: set[str] | None = None,
+    overwrite: bool = False,
 ) -> None:
     """
     Generate the output CSV from a word list.
@@ -205,6 +207,9 @@ def generate_csv(
         num_sentences: Number of sentences to generate per word (0 to skip)
         clean_input: If True, clean the input before processing
         exclude_words: Optional NFC-normalized terms to skip (e.g. from Anki)
+        overwrite: If True, wipe and rewrite. Otherwise an existing output
+            file is resumed: rows already written are kept and skipped, and
+            each new row is fsync'd so an interrupted run loses nothing.
     """
     if clean_input:
         logger.info("Cleaning input file before processing...")
@@ -233,17 +238,33 @@ def generate_csv(
         fieldnames = ["Hanzi", "Jyutping", "English", "Sentence"]
     else:  # Korean
         fieldnames = ["Korean", "Hanja", "English", "Comments"]
+    key_column = fieldnames[0]
 
-    with open(output_file, "w", encoding="utf-8", newline="") as f:
+    resuming = not overwrite and output_file.exists() and output_file.stat().st_size > 0
+    done = completed_csv_keys(output_file, key_column) if resuming else set()
+    if done:
+        logger.info(
+            "Resuming: %d row(s) already in %s will be skipped",
+            len(done),
+            output_file,
+        )
+
+    written = 0
+    with open(output_file, "a" if resuming else "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
+        if not resuming:
+            writer.writeheader()
 
         for raw in words:
             bare, inline_hanja = parse_hanja_token(raw) if lang == "ko" else (raw, "")
+            if normalize_anki_term(bare) in done:
+                continue
             row = process_word(bare, lang, num_sentences, inline_hanja=inline_hanja)
             writer.writerow(row)
+            durable_write(f)
+            written += 1
 
-    logger.info("Output written to %s", output_file)
+    logger.info("Output written to %s (%d new row(s))", output_file, written)
 
 
 def _add_anki_args(parser: argparse.ArgumentParser) -> None:
@@ -371,6 +392,7 @@ def cmd_generate(args: argparse.Namespace) -> None:
                 num_sentences=args.sentences,
                 clean_input=args.clean,
                 exclude_words=exclude_words or None,
+                overwrite=args.overwrite,
             )
         else:
             logger.warning("Vocab sibling not found: %s — skipping vocab CSV", vocab_path)
@@ -385,6 +407,7 @@ def cmd_generate(args: argparse.Namespace) -> None:
                 lang=args.lang,
                 num_examples=args.sentences,
                 exclude_patterns=exclude_patterns or None,
+                overwrite=args.overwrite,
             )
         else:
             logger.warning("Grammar sibling not found: %s — skipping grammar CSV", grammar_path)
@@ -403,6 +426,7 @@ def cmd_generate(args: argparse.Namespace) -> None:
             lang=args.lang,
             num_examples=args.sentences,
             exclude_patterns=exclude_patterns or None,
+            overwrite=args.overwrite,
         )
         return
 
@@ -416,6 +440,7 @@ def cmd_generate(args: argparse.Namespace) -> None:
         num_sentences=args.sentences,
         clean_input=args.clean,
         exclude_words=exclude_words or None,
+        overwrite=args.overwrite,
     )
 
 
@@ -1116,12 +1141,20 @@ def main() -> None:
         "No-op in grammar mode.",
     )
     gen_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Wipe and regenerate the output CSV. By default an existing "
+        "output file is resumed: finished rows are kept and skipped, so an "
+        "interrupted run (e.g. lost connection) can be continued by re-running "
+        "the same command without re-spending API budget.",
+    )
+    gen_parser.add_argument(
         "--mode",
         type=str,
         choices=["vocab", "grammar", "all"],
         default="vocab",
         help=(
-            "What to generate: vocab (default), grammar (3-column Pattern/Meaning/"
+            "What to generate: vocab (default), grammar (4-column Pattern/Meaning/"
             "Examples CSV from a JSONL), or all (both — sibling file is inferred "
             "from the given path). `.jsonl` inputs auto-detect grammar."
         ),

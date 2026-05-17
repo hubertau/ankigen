@@ -9,10 +9,7 @@ import shutil
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast
-
-if TYPE_CHECKING:
-    from ankigen.grammar import GrammarItem
+from typing import Any, Literal, NamedTuple, cast
 
 from docx import Document
 from openai import OpenAI
@@ -31,6 +28,7 @@ from ankigen.llm import (
     get_model,
     get_provider,
 )
+from ankigen.models import GrammarItem
 
 _DEFAULT_CHUNK_TOKENS = 20_000
 

@@ -43,6 +43,71 @@ def test_generate_csv_skips_exclude_words(monkeypatch, tmp_path):
     assert rows[0]["Hanzi"] == "乙"
 
 
+class TestGenerateCsvResume:
+    """An interrupted generate run resumes instead of redoing finished rows."""
+
+    def _fake_pw(self, calls: list[str]):
+        def fake_process_word(
+            word: str, lang: str, num_sentences: int, *, inline_hanja: str = ""
+        ) -> dict[str, str]:
+            calls.append(word)
+            return {"Hanzi": word, "Jyutping": "", "English": "x", "Sentence": ""}
+
+        return fake_process_word
+
+    def test_existing_rows_are_skipped(self, monkeypatch, tmp_path):
+        calls: list[str] = []
+        monkeypatch.setattr("ankigen.cli.process_word", self._fake_pw(calls))
+
+        out = tmp_path / "out.csv"
+        with open(out, "w", encoding="utf-8", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=["Hanzi", "Jyutping", "English", "Sentence"])
+            w.writeheader()
+            w.writerow({"Hanzi": "甲", "Jyutping": "", "English": "done", "Sentence": ""})
+
+        inp = tmp_path / "in.txt"
+        inp.write_text("甲\n乙\n", encoding="utf-8")
+        generate_csv(inp, out, "zh", 0)
+
+        # 甲 already in the file -> process_word only called for 乙.
+        assert calls == ["乙"]
+        with open(out, encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        assert [r["Hanzi"] for r in rows] == ["甲", "乙"]
+        assert rows[0]["English"] == "done"  # original row preserved
+
+    def test_overwrite_wipes_and_redoes(self, monkeypatch, tmp_path):
+        calls: list[str] = []
+        monkeypatch.setattr("ankigen.cli.process_word", self._fake_pw(calls))
+
+        out = tmp_path / "out.csv"
+        out.write_text(
+            "Hanzi,Jyutping,English,Sentence\n甲,,old,\n", encoding="utf-8"
+        )
+
+        inp = tmp_path / "in.txt"
+        inp.write_text("甲\n乙\n", encoding="utf-8")
+        generate_csv(inp, out, "zh", 0, overwrite=True)
+
+        assert calls == ["甲", "乙"]
+        with open(out, encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        assert [r["Hanzi"] for r in rows] == ["甲", "乙"]
+        assert rows[0]["English"] == "x"  # regenerated, not "old"
+
+    def test_fresh_run_writes_header_once(self, monkeypatch, tmp_path):
+        calls: list[str] = []
+        monkeypatch.setattr("ankigen.cli.process_word", self._fake_pw(calls))
+
+        inp = tmp_path / "in.txt"
+        inp.write_text("甲\n", encoding="utf-8")
+        out = tmp_path / "out.csv"
+        generate_csv(inp, out, "zh", 0)
+
+        content = out.read_text(encoding="utf-8")
+        assert content.count("Hanzi,Jyutping,English,Sentence") == 1
+
+
 class TestProcessWordKoreanHanja:
     """`process_word` resolves Hanja via inline → embedded → LLM priority."""
 
