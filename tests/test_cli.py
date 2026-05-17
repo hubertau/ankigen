@@ -1,8 +1,15 @@
 """Tests for CLI helpers (without full subprocess runs)."""
 
 import csv
+from datetime import datetime
+from pathlib import Path
 
-from ankigen.cli import generate_csv, process_word
+from ankigen.cli import (
+    _default_audit_output,
+    _default_backfill_output_stem,
+    generate_csv,
+    process_word,
+)
 from ankigen.llm import TranslationResult
 
 
@@ -121,3 +128,51 @@ class TestGenerateCsvKoreanColumns:
         assert rows[1]["Korean"] == "예쁘다"
         # Empty inline_hanja -> fake's fallback "TEST" (just proves threading works).
         assert rows[1]["Hanja"] == "TEST"
+
+
+class TestDefaultAuditOutputPath:
+    """`_default_audit_output` puts the JSONL under inputs/{lang}/."""
+
+    def test_korean_default(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("ANKIGEN_OUTPUT_DIR", str(tmp_path))
+        path = _default_audit_output("ko")
+        today = datetime.now().strftime("%Y%m%d")
+        assert path == tmp_path / "ko" / f"audit_ko_{today}.jsonl"
+
+    def test_chinese_default(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("ANKIGEN_OUTPUT_DIR", str(tmp_path))
+        path = _default_audit_output("zh")
+        today = datetime.now().strftime("%Y%m%d")
+        assert path == tmp_path / "zh" / f"audit_zh_{today}.jsonl"
+
+
+class TestDefaultBackfillOutputStem:
+    """`_default_backfill_output_stem` mirrors inputs/<lang>/ into outputs/<lang>/."""
+
+    def test_inputs_layout_mirrored_to_outputs(self, tmp_path):
+        jsonl = tmp_path / "inputs" / "ko" / "audit_ko_20260516.jsonl"
+        jsonl.parent.mkdir(parents=True)
+        jsonl.write_text("", encoding="utf-8")
+        stem = _default_backfill_output_stem(jsonl, "ko")
+        assert stem == tmp_path / "outputs" / "ko" / "update_audit_ko_20260516"
+
+    def test_path_lang_dir_wins_over_inferred(self, tmp_path):
+        # JSONL lives under inputs/ko/... but we pass lang=zh — the path
+        # already tells us where it belongs, so prefer the path's lang dir.
+        jsonl = tmp_path / "inputs" / "ko" / "audit_ko_20260516.jsonl"
+        jsonl.parent.mkdir(parents=True)
+        jsonl.write_text("", encoding="utf-8")
+        stem = _default_backfill_output_stem(jsonl, "zh")
+        assert stem == tmp_path / "outputs" / "ko" / "update_audit_ko_20260516"
+
+    def test_inferred_lang_used_when_outside_inputs_layout(self, tmp_path):
+        jsonl = tmp_path / "audit_ko_20260516.jsonl"
+        jsonl.write_text("", encoding="utf-8")
+        stem = _default_backfill_output_stem(jsonl, "ko")
+        assert stem == Path("outputs") / "ko" / "update_audit_ko_20260516"
+
+    def test_no_lang_falls_back_to_sibling_path(self, tmp_path):
+        jsonl = tmp_path / "audit.jsonl"
+        jsonl.write_text("", encoding="utf-8")
+        stem = _default_backfill_output_stem(jsonl, None)
+        assert stem == tmp_path / "update_audit"

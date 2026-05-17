@@ -174,6 +174,70 @@ class TestTokenBucket:
         sleep.assert_not_called()
 
 
+class TestRequestBucketRpm:
+    """Proactive rolling-60s request-bucket throttle (RPM)."""
+
+    def setup_method(self) -> None:
+        from ankigen.llm import _reset_token_bucket
+
+        _reset_token_bucket()
+
+    def test_no_sleep_under_rpm_limit(self, mocker, monkeypatch) -> None:
+        from ankigen import llm
+
+        monkeypatch.setenv("ANKIGEN_LLM_RATE_LIMIT_RPM", "50")
+        monkeypatch.setenv("ANKIGEN_LLM_RATE_LIMIT_TPM", "10000000")
+        sleep = mocker.patch("ankigen.llm.time.sleep")
+        # 49 requests recorded; the 50th call still has headroom.
+        for _ in range(49):
+            llm._request_bucket.record()
+        llm._throttle_for_tokens(estimate=10)
+        sleep.assert_not_called()
+
+    def test_sleeps_when_rpm_at_ceiling(self, mocker, monkeypatch) -> None:
+        from ankigen import llm
+
+        monkeypatch.setenv("ANKIGEN_LLM_RATE_LIMIT_RPM", "50")
+        monkeypatch.setenv("ANKIGEN_LLM_RATE_LIMIT_TPM", "10000000")
+        sleep = mocker.patch("ankigen.llm.time.sleep")
+        # 50 requests recorded — one more would exceed the cap.
+        for _ in range(50):
+            llm._request_bucket.record()
+        llm._throttle_for_tokens(estimate=10)
+        sleep.assert_called_once()
+        slept = sleep.call_args.args[0]
+        assert 0 < slept <= 61
+
+    def test_zero_rpm_disables_request_throttle(self, mocker, monkeypatch) -> None:
+        from ankigen import llm
+
+        monkeypatch.setenv("ANKIGEN_LLM_RATE_LIMIT_RPM", "0")
+        monkeypatch.setenv("ANKIGEN_LLM_RATE_LIMIT_TPM", "10000000")
+        sleep = mocker.patch("ankigen.llm.time.sleep")
+        for _ in range(10_000):
+            llm._request_bucket.record()
+        llm._throttle_for_tokens(estimate=10)
+        sleep.assert_not_called()
+
+    def test_sleeps_for_max_of_tpm_and_rpm_waits(self, mocker, monkeypatch) -> None:
+        """When both buckets demand a pause, we sleep for the longer one."""
+        from ankigen import llm
+
+        monkeypatch.setenv("ANKIGEN_LLM_RATE_LIMIT_RPM", "50")
+        monkeypatch.setenv("ANKIGEN_LLM_RATE_LIMIT_TPM", "1000")
+        sleep = mocker.patch("ankigen.llm.time.sleep")
+        # Saturate both buckets — TPM with one big event, RPM with 50 requests.
+        llm._token_bucket.record(950)
+        for _ in range(50):
+            llm._request_bucket.record()
+        llm._throttle_for_tokens(estimate=200)
+        sleep.assert_called_once()
+        # The exact value depends on real time, but it should be positive
+        # and bounded by the window + margin.
+        slept = sleep.call_args.args[0]
+        assert 0 < slept <= 61
+
+
 class TestRateLimitRetry:
     """Reactive 429-retry safety net."""
 

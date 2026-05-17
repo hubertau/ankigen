@@ -235,19 +235,24 @@ def _extract_json_payload(text: str) -> str:
 # ---------------------------------------------------------------------------
 # Rate-limit plumbing
 #
-# Two layers, both invoked from ``generate_structured_response``:
+# Three layers, all invoked from ``generate_structured_response``:
 #
 # 1. ``_TokenBucket`` — rolling 60-second window of ``(timestamp, tokens)``
 #    events. Before each call we ask whether sending ``estimate`` extra
 #    tokens would push the recent sum above ``ANKIGEN_LLM_RATE_LIMIT_TPM``;
 #    if so we sleep until the oldest entry falls out of the window.
-# 2. ``_with_429_retry`` — backstop in case the proactive estimate is off
-#    or the provider counts tokens differently. Retries
+# 2. ``_RequestBucket`` — sibling rolling 60-second window of request
+#    timestamps, gated by ``ANKIGEN_LLM_RATE_LIMIT_RPM`` (default 50).
+#    Protects against bursty per-card backfill loops that send small
+#    prompts (low tokens, high request count).
+# 3. ``_with_429_retry`` — backstop in case the proactive estimates are off
+#    or the provider counts tokens/requests differently. Retries
 #    ``ANKIGEN_LLM_MAX_RETRIES`` times with exponential backoff.
 # ---------------------------------------------------------------------------
 
 
 _DEFAULT_TPM = 30_000
+_DEFAULT_RPM = 50
 _DEFAULT_MAX_RETRIES = 4
 _WINDOW_SECONDS = 60.0
 
@@ -299,13 +304,60 @@ class _TokenBucket:
         self._events.clear()
 
 
-# Module-level singleton bucket. Reset between tests via :func:`_reset_token_bucket`.
+class _RequestBucket:
+    """Tracks the running request count over the past ``window`` seconds.
+
+    Each ``record()`` call appends a timestamp; ``sleep_needed`` reports
+    how long the caller has to wait before adding a new request would
+    keep the count at or below ``rpm_limit``. The window is shared with
+    :class:`_TokenBucket`'s window length so both buckets agree on what
+    "the last minute" means.
+    """
+
+    def __init__(self, window: float = _WINDOW_SECONDS) -> None:
+        self._window = window
+        self._events: deque[float] = deque()
+
+    def _purge(self, now: float) -> None:
+        cutoff = now - self._window
+        while self._events and self._events[0] <= cutoff:
+            self._events.popleft()
+
+    def recent_requests(self, now: float | None = None) -> int:
+        now = time.monotonic() if now is None else now
+        self._purge(now)
+        return len(self._events)
+
+    def sleep_needed(self, rpm_limit: int, now: float | None = None) -> float:
+        """How long to sleep before issuing one more request stays under ``rpm_limit``."""
+        if rpm_limit <= 0:
+            return 0.0
+        now = time.monotonic() if now is None else now
+        self._purge(now)
+        if len(self._events) < rpm_limit:
+            return 0.0
+        # We're at or above the ceiling — sleep until the oldest event falls
+        # out of the window so the count drops below `rpm_limit`.
+        oldest_ts = self._events[0]
+        return max(0.0, self._window - (now - oldest_ts) + 0.5)
+
+    def record(self, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        self._events.append(now)
+
+    def reset(self) -> None:
+        self._events.clear()
+
+
+# Module-level singletons. Reset between tests via :func:`_reset_token_bucket`.
 _token_bucket = _TokenBucket()
+_request_bucket = _RequestBucket()
 
 
 def _reset_token_bucket() -> None:
-    """Test-only helper to clear the rolling-window state."""
+    """Test-only helper to clear the rolling-window state (both buckets)."""
     _token_bucket.reset()
+    _request_bucket.reset()
 
 
 def _get_tpm_limit() -> int:
@@ -317,6 +369,18 @@ def _get_tpm_limit() -> int:
     except ValueError:
         logger.warning("Invalid ANKIGEN_LLM_RATE_LIMIT_TPM=%r; using default %d", raw, _DEFAULT_TPM)
         return _DEFAULT_TPM
+    return max(0, value)
+
+
+def _get_rpm_limit() -> int:
+    raw = os.getenv("ANKIGEN_LLM_RATE_LIMIT_RPM")
+    if not raw:
+        return _DEFAULT_RPM
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid ANKIGEN_LLM_RATE_LIMIT_RPM=%r; using default %d", raw, _DEFAULT_RPM)
+        return _DEFAULT_RPM
     return max(0, value)
 
 
@@ -335,12 +399,31 @@ def _get_max_retries() -> int:
 
 
 def _throttle_for_tokens(estimate: int) -> None:
-    """Sleep proactively if sending ``estimate`` tokens would breach the TPM ceiling."""
+    """Sleep proactively if either the TPM **or** RPM ceiling would be breached.
+
+    We compute both wait times and sleep for whichever is longer — that's
+    enough to keep us under both ceilings. ``estimate`` is the projected
+    token cost of the upcoming call; the request bucket only needs to
+    know that one more call is coming, not how big it is.
+    """
     tpm = _get_tpm_limit()
-    if tpm <= 0:
+    rpm = _get_rpm_limit()
+    tpm_wait = _token_bucket.sleep_needed(estimate, tpm) if tpm > 0 else 0.0
+    rpm_wait = _request_bucket.sleep_needed(rpm) if rpm > 0 else 0.0
+    sleep_for = max(tpm_wait, rpm_wait)
+    if sleep_for <= 0:
         return
-    sleep_for = _token_bucket.sleep_needed(estimate, tpm)
-    if sleep_for > 0:
+
+    # Log the dimension that actually drove the pause so the user can
+    # tell whether they're being throttled on tokens or on request count.
+    if rpm_wait >= tpm_wait:
+        logger.info(
+            "Rate limit pacing: sleeping %.1fs (request count %d/%d in last 60s)",
+            sleep_for,
+            _request_bucket.recent_requests(),
+            rpm,
+        )
+    else:
         logger.info(
             "Rate limit pacing: sleeping %.1fs (estimated %d tokens for next call, "
             "%d/%d in last 60s)",
@@ -349,7 +432,7 @@ def _throttle_for_tokens(estimate: int) -> None:
             _token_bucket.recent_tokens(),
             tpm,
         )
-        time.sleep(sleep_for)
+    time.sleep(sleep_for)
 
 
 def _is_rate_limit_error(exc: BaseException) -> bool:
@@ -396,9 +479,10 @@ def generate_structured_response[ResponseModelT: BaseModel](
     """
     Generate a structured response for either OpenAI-compatible or Anthropic providers.
 
-    Calls are paced against ``ANKIGEN_LLM_RATE_LIMIT_TPM`` (rolling-60s token
-    bucket) and retried on rate-limit errors up to ``ANKIGEN_LLM_MAX_RETRIES``
-    times with exponential backoff.
+    Calls are paced against both ``ANKIGEN_LLM_RATE_LIMIT_TPM`` (rolling-60s
+    token bucket, default 30k) and ``ANKIGEN_LLM_RATE_LIMIT_RPM`` (rolling-60s
+    request bucket, default 50) and retried on rate-limit errors up to
+    ``ANKIGEN_LLM_MAX_RETRIES`` times with exponential backoff.
     """
     provider = get_provider()
     model = get_model()
@@ -443,8 +527,9 @@ def generate_structured_response[ResponseModelT: BaseModel](
         return _with_429_retry(_call)
     finally:
         # Record the estimate either way — a failed-but-retried call still
-        # consumed tokens against the provider's bucket.
+        # consumed tokens (and one request) against the provider's bucket.
         _token_bucket.record(estimate)
+        _request_bucket.record()
 
 
 def generate_sentences(word: str, lang: Language = "zh", num_sentences: int = 3) -> list[str]:
