@@ -192,6 +192,9 @@ def get_client() -> instructor.Instructor:
         api_key=api_key,
         default_headers=default_headers if default_headers else None,
     )
+    # deepseek-reasoner rejects tool_choice; JSON mode works for all DeepSeek models.
+    if provider == "deepseek":
+        return instructor.from_openai(client, mode=instructor.Mode.JSON)
     return instructor.from_openai(client)
 
 
