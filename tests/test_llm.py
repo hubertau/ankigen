@@ -2,7 +2,14 @@
 
 import pytest
 
-from ankigen.llm import TranslationResult, generate_sentences, get_model, translate_word
+from ankigen.llm import (
+    TranslationResult,
+    generate_sentences,
+    get_client,
+    get_model,
+    get_provider,
+    translate_word,
+)
 from ankigen.models import (
     KoreanTranslationResponse,
     TranslationResponse,
@@ -327,6 +334,27 @@ class TestProviderConfig:
         # Should return a model string
         assert isinstance(model, str)
         assert len(model) > 0
+
+    def test_deepseek_provider_registered(self):
+        """DeepSeek is an OpenAI-compatible provider with a sane default."""
+        from ankigen.llm import PROVIDER_CONFIG
+
+        cfg = PROVIDER_CONFIG["deepseek"]
+        assert cfg["base_url"] == "https://api.deepseek.com/v1"
+        assert cfg["default_model"]
+
+    def test_deepseek_uses_openai_client_path(self, mocker):
+        """DeepSeek goes through the OpenAI-compatible client, not Anthropic."""
+        mocker.patch(
+            "os.getenv",
+            side_effect=lambda k, d=None: {
+                "LLM_PROVIDER": "deepseek",
+                "LLM_API_KEY": "sk-test",
+            }.get(k, d),
+        )
+        assert get_provider() == "deepseek"
+        # Must not raise the anthropic-only ValueError.
+        get_client()
 
 
 class TestSentenceResponseModel:
