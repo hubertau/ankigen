@@ -574,11 +574,12 @@ ankigen extract ~/Downloads/notes_march.docx --lang ko --mode grammar
 
 # 2. (Optional) Hand-edit the JSONL to fix patterns or remove noise
 
-# 3. Generate the 3-column Anki grammar CSV
+# 3. Generate the 4-column Anki grammar CSV
 ankigen generate inputs/ko/{YYYYMMDD}_grammar.jsonl --lang ko -n 5
 # → outputs/ko/output_{YYYYMMDD}_grammar.csv
-#   Columns: Pattern | Meaning | Examples
-#   (Meaning bolds the short gloss with the longer explanation on the next line)
+#   Columns: Pattern | Hanja | Meaning | Examples
+#   (Hanja populated for Sino-Korean patterns, empty otherwise;
+#    Meaning bolds the short gloss with the longer explanation on the next line)
 ```
 
 In `generate --mode grammar`, `-n` is the *target* number of examples per card:
@@ -627,7 +628,7 @@ ankigen/
 │   ├── cli.py            # CLI entry point (generate, extract, clean, similar)
 │   ├── cleaner.py        # Input file cleaning
 │   ├── extractor.py      # PDF/DOCX/image extraction, OCR, watch & ad-hoc folder
-│   ├── grammar.py        # Grammar extraction, JSONL round-trip, 3-column CSV
+│   ├── grammar.py        # Grammar extraction, JSONL round-trip, 4-column CSV
 │   ├── similarity.py     # Near-duplicate / variant detection
 │   ├── formatter.py      # HTML sentence formatting
 │   ├── llm.py            # LLM client (OpenAI-compatible)

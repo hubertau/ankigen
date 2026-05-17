@@ -285,6 +285,8 @@ class _TokenBucket:
             return 0.0
         now = time.monotonic() if now is None else now
         self._purge(now)
+        if not self._events:
+            return 0.0
         running = sum(tokens for _, tokens in self._events)
         if running + estimate <= tpm_limit:
             return 0.0

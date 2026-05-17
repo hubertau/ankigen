@@ -801,7 +801,16 @@ def read_audit_jsonl(path: Path) -> list[AuditedNote]:
                     AuditReason(code=str(r["code"]), detail=str(r.get("detail", "")))
                     for r in row.get("reasons", [])
                 ]
-                lang: Language = row.get("lang", "ko")
+                lang_raw = row.get("lang", "ko")
+                if lang_raw not in ("zh", "ko"):
+                    logger.warning(
+                        "Unknown language %r in JSONL line %d in %s; skipping",
+                        lang_raw,
+                        line_num,
+                        path,
+                    )
+                    continue
+                lang: Language = lang_raw  # type: ignore[assignment]
                 resolved = _resolved_from_row(row, lang)
                 audited.append(
                     AuditedNote(note=note, lang=lang, resolved=resolved, reasons=reasons)

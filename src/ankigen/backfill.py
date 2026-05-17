@@ -157,8 +157,13 @@ def backfill_note(
                 # the audit flagging — fall back to the LLM as a courtesy so
                 # the user isn't left with a still-blank cell.
                 if translation_result is None:
-                    translation_result = translate_word(headword, lang)
-                if translation_result.hanja:
+                    try:
+                        translation_result = translate_word(headword, lang)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "LLM hanja fallback failed for '%s': %s", headword, exc
+                        )
+                if translation_result is not None and translation_result.hanja:
                     _set(resolved.secondary, translation_result.hanja)
         elif needs_llm_hanja and translation_result is not None:
             # `translation_result.hanja` is "" for native-Korean words; that's
