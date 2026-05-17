@@ -2,6 +2,10 @@
 
 import re
 
+# Matches the <br> separator used between sentences. Shared by audit and backfill
+# for counting and splitting sentence HTML produced by format_sentences().
+BR_SPLIT_RE = re.compile(r"<br\s*/?>", flags=re.IGNORECASE)
+
 
 def format_sentences(text: str, keyword: str) -> str:
     """

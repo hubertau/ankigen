@@ -9,7 +9,10 @@ import shutil
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal, NamedTuple, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast
+
+if TYPE_CHECKING:
+    from ankigen.grammar import GrammarItem
 
 from docx import Document
 from openai import OpenAI
@@ -674,7 +677,7 @@ def process_folder(
     today = datetime.now().strftime("%Y%m%d")
 
     all_words: list[str] = []
-    all_grammar_items: list[Any] = []  # list[GrammarItem]; Any avoids import cycle
+    all_grammar_items: list[GrammarItem] = []
     processed_files: list[Path] = []
 
     for file_path in files:
