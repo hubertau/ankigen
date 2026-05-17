@@ -343,8 +343,10 @@ class TestProviderConfig:
         assert cfg["base_url"] == "https://api.deepseek.com/v1"
         assert cfg["default_model"]
 
-    def test_deepseek_uses_openai_client_path(self, mocker):
-        """DeepSeek goes through the OpenAI-compatible client, not Anthropic."""
+    def test_deepseek_uses_json_mode(self, mocker):
+        """DeepSeek uses instructor JSON mode, not tool_choice (unsupported by deepseek-reasoner)."""
+        import instructor
+
         mocker.patch(
             "os.getenv",
             side_effect=lambda k, d=None: {
@@ -352,9 +354,8 @@ class TestProviderConfig:
                 "LLM_API_KEY": "sk-test",
             }.get(k, d),
         )
-        assert get_provider() == "deepseek"
-        # Must not raise the anthropic-only ValueError.
-        get_client()
+        client = get_client()
+        assert client.mode == instructor.Mode.JSON
 
 
 class TestSentenceResponseModel:
