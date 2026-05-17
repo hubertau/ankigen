@@ -105,3 +105,61 @@ class TestFormatSentences:
 
         # Should not have empty spans
         assert '<span style="color: blue;"></span>' not in result
+
+
+class TestFormatSentencesMarkers:
+    """Marker-based highlighting: **word** in sentence → red span."""
+
+    def test_marker_highlights_conjugated_korean_verb(self):
+        # Irregular verb: 돕다 → 도와요 (ㅂ-irregular); marker carries the surface form.
+        text = "1. 그가 나를 **도와요**."
+        result = format_sentences(text, "돕다")
+        assert '<span style="color: red;">도와요</span>' in result
+        assert "돕다" not in result  # dictionary form must NOT appear
+
+    def test_marker_highlights_korean_noun_with_particle(self):
+        text = "1. 저는 **음식을** 좋아해요."
+        result = format_sentences(text, "음식")
+        assert '<span style="color: red;">음식을</span>' in result
+
+    def test_marker_takes_precedence_over_exact_match(self):
+        # The keyword appears both bare and in a marker — marker wins.
+        text = "1. **먹었어요**, 맛있는 음식."
+        result = format_sentences(text, "음식")
+        # Marker span present
+        assert '<span style="color: red;">먹었어요</span>' in result
+        # No extra red span for the bare "음식" (marker path used, not fallback)
+        assert result.count('<span style="color: red;">') == 1
+
+    def test_multiple_markers_in_one_sentence(self):
+        text = "1. **가서** 밥을 **먹었어요**."
+        result = format_sentences(text, "가다")
+        assert '<span style="color: red;">가서</span>' in result
+        assert '<span style="color: red;">먹었어요</span>' in result
+
+    def test_marker_chinese_sentence(self):
+        text = "1. **促使**他努力工作。"
+        result = format_sentences(text, "促使")
+        assert '<span style="color: red;">促使</span>' in result
+
+    def test_no_empty_spans_with_leading_marker(self):
+        # Marker at position 0 should not leave an empty blue span at the front.
+        text = "1. **가요** 지금."
+        result = format_sentences(text, "가다")
+        assert '<span style="color: blue;"></span>' not in result
+
+    def test_round_trip_strips_markers(self):
+        # After format_sentences converts **...** to HTML, split_sentences_from_html
+        # should return the plain surface form (without asterisks).
+        from ankigen.backfill import split_sentences_from_html
+
+        text = "1. 저는 **음식을** 먹었어요. 2. **도와요** 항상."
+        html = format_sentences(text, "음식")
+        plain = split_sentences_from_html(html)
+        assert plain == ["저는 음식을 먹었어요.", "도와요 항상."]
+
+    def test_fallback_still_works_for_unmarked_sentences(self):
+        # No markers → exact match fallback (backward compat for existing cards).
+        text = "1. 促使他努力工作。"
+        result = format_sentences(text, "促使")
+        assert '<span style="color: red;">促使</span>' in result
