@@ -33,6 +33,7 @@ from ankigen.llm import (
     generate_structured_response,
 )
 from ankigen.models import GrammarExample, GrammarExtractionResponse, GrammarItem
+from ankigen.resume import completed_csv_keys, durable_write
 
 logger = logging.getLogger("ankigen.grammar")
 
@@ -357,6 +358,7 @@ def generate_grammar_csv(
     num_examples: int,
     *,
     exclude_patterns: set[str] | None = None,
+    overwrite: bool = False,
 ) -> None:
     """
     Generate the 4-column grammar Anki CSV from a JSONL file.
@@ -368,6 +370,9 @@ def generate_grammar_csv(
         num_examples: Desired examples per card. Verbatim examples are kept and
             the LLM is only called for the missing ones.
         exclude_patterns: Optional NFC-normalised patterns to skip (Anki dedupe).
+        overwrite: If True, wipe and rewrite. Otherwise an existing output
+            file is resumed: rows already written are kept and skipped, and
+            each new row is fsync'd so an interrupted run loses nothing.
     """
     items = read_grammar_jsonl(input_path)
     logger.info("Loaded %d grammar item(s) from %s", len(items), input_path)
@@ -381,10 +386,24 @@ def generate_grammar_csv(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(output_path, "w", encoding="utf-8", newline="") as f:
+    key_column = GRAMMAR_CSV_FIELDNAMES[0]  # "Pattern"
+    resuming = not overwrite and output_path.exists() and output_path.stat().st_size > 0
+    done = completed_csv_keys(output_path, key_column) if resuming else set()
+    if done:
+        logger.info(
+            "Resuming: %d grammar row(s) already in %s will be skipped",
+            len(done),
+            output_path,
+        )
+
+    written = 0
+    with open(output_path, "a" if resuming else "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=GRAMMAR_CSV_FIELDNAMES)
-        writer.writeheader()
+        if not resuming:
+            writer.writeheader()
         for item in items:
+            if normalize_anki_term(item.pattern) in done:
+                continue
             logger.info("Processing grammar pattern: %s", item.pattern)
             merged = _merge_examples(item, lang, num_examples)
             examples_html = format_grammar_examples(merged, item.pattern)
@@ -396,8 +415,10 @@ def generate_grammar_csv(
                     "Examples": examples_html,
                 }
             )
+            durable_write(f)
+            written += 1
 
-    logger.info("Grammar CSV written to %s", output_path)
+    logger.info("Grammar CSV written to %s (%d new row(s))", output_path, written)
 
 
 # ---------------------------------------------------------------------------
