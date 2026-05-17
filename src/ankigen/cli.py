@@ -963,6 +963,7 @@ def cmd_backfill(args: argparse.Namespace) -> None:
         args.input_file,
         output_stem,
         target_sentences=args.sentences,
+        overwrite=args.overwrite,
     )
 
     if not paths:
@@ -1399,6 +1400,12 @@ def main() -> None:
             "Default: outputs/{lang}/update_<input_stem>, where {lang} is "
             "inferred from the audit JSONL's first row."
         ),
+    )
+    backfill_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        default=False,
+        help="Delete existing TSV(s) and regenerate all notes from scratch (default: resume).",
     )
 
     # 'status' subcommand

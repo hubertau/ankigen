@@ -7,7 +7,6 @@ from ankigen.llm import (
     generate_sentences,
     get_client,
     get_model,
-    get_provider,
     translate_word,
 )
 from ankigen.models import (

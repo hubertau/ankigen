@@ -600,7 +600,7 @@ class TestBackfillProgressLogging:
         assert "[1/2] guid=g-a model='Korean Vocab'" in text
         assert "[2/2] guid=g-b model='Korean Vocab'" in text
         assert "touched=['English']" in text
-        assert "Backfill complete: 2 of 2 note(s) regenerated" in text
+        assert "Backfill complete: 2 new, 0 skipped" in text
 
     def test_failure_log_carries_index_and_reasons(self, mocker, tmp_path: Path, caplog) -> None:
         from ankigen.audit import write_audit_jsonl
@@ -641,3 +641,105 @@ class TestReadAuditJsonlBackwardCompat:
         loaded = read_audit_jsonl(path)
         assert len(loaded) == 1
         assert loaded[0].resolved == _KO_DEFAULT_RESOLVED
+
+
+# ---------------------------------------------------------------------------
+# Resume / overwrite for backfill_jsonl
+# ---------------------------------------------------------------------------
+
+
+class TestBackfillResume:
+    """An interrupted backfill run resumes by skipping already-written GUIDs."""
+
+    def _write_jsonl(self, tmp_path: Path, entries: list) -> Path:
+        from ankigen.audit import write_audit_jsonl
+
+        jsonl = tmp_path / "audit.jsonl"
+        write_audit_jsonl(entries, jsonl)
+        return jsonl
+
+    def _patch_translate(self, mocker, translation: str = "x"):
+        mocker.patch(
+            "ankigen.backfill.translate_word",
+            return_value=TranslationResult(translation=translation, hanja=""),
+        )
+
+    def test_existing_guid_is_skipped(self, tmp_path: Path, mocker):
+        """Second run skips a note whose GUID is already in the TSV."""
+        self._patch_translate(mocker)
+        note_a = _ko_note(korean="음식", english="", guid="guid-a", nid=1)
+        note_b = _ko_note(korean="학교", english="", guid="guid-b", nid=2)
+        jsonl = self._write_jsonl(
+            tmp_path,
+            [
+                _entry(note_a, reasons=[("empty_english", "")]),
+                _entry(note_b, reasons=[("empty_english", "")]),
+            ],
+        )
+
+        # First run: processes both notes.
+        paths = backfill_jsonl(jsonl, tmp_path / "update")
+        _, rows = _read_tsv(paths[0])
+        assert len(rows) == 2
+
+        # Track how many translate_word calls happen on the second run.
+        call_log: list[str] = []
+        mocker.patch(
+            "ankigen.backfill.translate_word",
+            side_effect=lambda w, *a, **kw: call_log.append(w)
+            or TranslationResult(translation="y", hanja=""),
+        )
+
+        # Second run: both GUIDs already written — no LLM calls.
+        paths2 = backfill_jsonl(jsonl, tmp_path / "update")
+        assert call_log == []
+        # TSV still has exactly 2 rows (no duplicates written).
+        _, rows2 = _read_tsv(paths2[0])
+        assert len(rows2) == 2
+
+    def test_overwrite_deletes_and_regenerates(self, tmp_path: Path, mocker):
+        """--overwrite deletes existing TSVs and regenerates all notes."""
+        self._patch_translate(mocker, translation="first")
+        note = _ko_note(korean="음식", english="", guid="guid-a", nid=1)
+        jsonl = self._write_jsonl(tmp_path, [_entry(note, reasons=[("empty_english", "")])])
+
+        paths = backfill_jsonl(jsonl, tmp_path / "update")
+        _, rows = _read_tsv(paths[0])
+        # Columns: notetype, deck, guid, Korean, Hanja, English, Comments
+        assert rows[0][5] == "first"  # English field
+
+        self._patch_translate(mocker, translation="second")
+        paths2 = backfill_jsonl(jsonl, tmp_path / "update", overwrite=True)
+        _, rows2 = _read_tsv(paths2[0])
+        assert len(rows2) == 1
+        assert rows2[0][5] == "second"  # regenerated
+
+    def test_tsv_directives_written_once_on_resume(self, tmp_path: Path, mocker):
+        """Resuming appends data rows without repeating the # directives."""
+        self._patch_translate(mocker)
+        note_a = _ko_note(korean="음식", english="", guid="guid-a", nid=1)
+        note_b = _ko_note(korean="학교", english="", guid="guid-b", nid=2)
+
+        # First run: only note_a.
+        jsonl_a = tmp_path / "a.jsonl"
+        from ankigen.audit import write_audit_jsonl
+
+        write_audit_jsonl([_entry(note_a, reasons=[("empty_english", "")])], jsonl_a)
+        backfill_jsonl(jsonl_a, tmp_path / "update")
+
+        # Second run: both notes, guid-a is already done.
+        jsonl_ab = tmp_path / "ab.jsonl"
+        write_audit_jsonl(
+            [
+                _entry(note_a, reasons=[("empty_english", "")]),
+                _entry(note_b, reasons=[("empty_english", "")]),
+            ],
+            jsonl_ab,
+        )
+        paths = backfill_jsonl(jsonl_ab, tmp_path / "update")
+
+        headers, rows = _read_tsv(paths[0])
+        # Directives appear exactly once each.
+        assert sum(1 for h in headers if h.startswith("#separator")) == 1
+        # Both data rows present.
+        assert len(rows) == 2
