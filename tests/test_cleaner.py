@@ -3,7 +3,13 @@
 import unicodedata
 
 from ankigen.anki_db import normalize_anki_term
-from ankigen.cleaner import clean_line, clean_vocabulary_file
+from ankigen.cleaner import (
+    clean_line,
+    clean_line_with_hanja,
+    clean_vocabulary_file,
+    extract_inline_hanja,
+    parse_hanja_token,
+)
 
 
 class TestCleanLine:
@@ -187,3 +193,91 @@ class TestCleanVocabularyFile:
             exclude_words={normalize_anki_term("\uac00")},
         )
         assert result == ["감사합니다"]
+
+
+class TestExtractInlineHanja:
+    """Splitting `한글(漢字)` into its parts."""
+
+    def test_basic_korean_hanja_annotation(self):
+        text, hanja = extract_inline_hanja("음식(飮食)")
+        assert text == "음식"
+        assert hanja == "飮食"
+
+    def test_hanja_with_inner_whitespace(self):
+        text, hanja = extract_inline_hanja("박사 과정(博士 課程)")
+        assert text == "박사 과정"
+        assert hanja == "博士課程"
+
+    def test_no_hanja_paren_returns_text_unchanged(self):
+        text, hanja = extract_inline_hanja("음식")
+        assert text == "음식"
+        assert hanja == ""
+
+    def test_non_hanja_paren_is_left_alone(self):
+        # (chouchang) is romanization, not Hanja — leave the paren in place
+        # so the regular paren stripper can deal with it.
+        text, hanja = extract_inline_hanja("惆怅 (chouchang)")
+        assert text == "惆怅 (chouchang)"
+        assert hanja == ""
+
+    def test_parse_hanja_token_alias(self):
+        assert parse_hanja_token("음식(飮食)") == ("음식", "飮食")
+        assert parse_hanja_token("음식") == ("음식", "")
+
+
+class TestCleanLineWithHanja:
+    """Korean lines preserve their Hanja annotation through cleaning."""
+
+    def test_korean_hanja_paren_captured_and_reattached(self):
+        assert clean_line("음식(飮食)", "ko") == "음식(飮食)"
+        word, hanja = clean_line_with_hanja("음식(飮食)", "ko")
+        assert word == "음식"
+        assert hanja == "飮食"
+
+    def test_korean_hanja_combined_with_other_annotations(self):
+        # Comma-separated English translation + Hanja annotation.
+        assert clean_line("음식(飮食), food", "ko") == "음식(飮食)"
+
+    def test_korean_hanja_combined_with_romanization_paren(self):
+        # Both annotation styles in one line: Hanja stays, romanization goes.
+        result = clean_line("음식(飮食) (eumsig)", "ko")
+        assert result == "음식(飮食)"
+
+    def test_chinese_unaffected_by_hanja_rule(self):
+        # Chinese path must not treat parenthesised Han characters as Hanja.
+        # The line 投資(投资) collapses to 投資 via normal paren stripping.
+        result = clean_line("投資(投资)", "zh")
+        assert result == "投資"
+
+    def test_pure_hanja_line_in_paren_returns_none(self):
+        # A line that's just the (Hanja) annotation has no real Korean word.
+        assert clean_line("(飮食)", "ko") is None
+
+
+class TestCleanVocabularyFileHanja:
+    """File-level cleaning preserves Hanja annotations end-to-end."""
+
+    def test_file_with_hanja_annotations_round_trips(self, tmp_path):
+        input_file = tmp_path / "words.txt"
+        input_file.write_text(
+            "음식(飮食)\n예쁘다\n박사 과정(博士 課程)\n",
+            encoding="utf-8",
+        )
+        result = clean_vocabulary_file(input_file, "ko")
+        assert result == ["음식(飮食)", "예쁘다", "박사 과정(博士課程)"]
+
+    def test_exclude_words_matches_bare_form(self, tmp_path):
+        # Anki holds bare "음식"; the input has the annotated form. The bare
+        # form must still be matched and filtered out.
+        input_file = tmp_path / "words.txt"
+        input_file.write_text("음식(飮食)\n감사합니다\n", encoding="utf-8")
+
+        result = clean_vocabulary_file(input_file, "ko", exclude_words={"음식"})
+        assert result == ["감사합니다"]
+
+    def test_dedupe_uses_bare_word(self, tmp_path):
+        input_file = tmp_path / "words.txt"
+        input_file.write_text("음식(飮食)\n음식\n", encoding="utf-8")
+        result = clean_vocabulary_file(input_file, "ko")
+        # Only the first occurrence wins (and keeps its Hanja annotation).
+        assert result == ["음식(飮食)"]

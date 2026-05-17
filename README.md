@@ -4,7 +4,7 @@ Generate Anki vocabulary **and grammar** CSVs with LLM-powered example sentences
 
 ## Features
 
-- **Multi-language support**: Chinese (with Jyutping) and Korean
+- **Multi-language support**: Chinese (with Jyutping) and Korean (with Hanja for Sino-Korean words)
 - **LLM-powered**: Generate natural example sentences and translations
 - **Two card types**: vocabulary words *and* grammar patterns (`--mode grammar`/`all`)
 - **PDF, DOCX & Image extraction**: Extract from PDFs, Word documents, or images (OCR via GPT-4 Vision)
@@ -12,6 +12,7 @@ Generate Anki vocabulary **and grammar** CSVs with LLM-powered example sentences
 - **Verbatim teacher examples**: Grammar mode preserves the example sentences from teacher notes and only asks the LLM to top up when there aren't enough
 - **Input cleaning**: Automatically remove translations, romanization, and annotations from input files
 - **Similarity review**: Scan an Anki deck (or word list) for near-duplicate, variant, and contained terms
+- **Audit & backfill**: Sweep an existing Anki deck for cards missing the current format (e.g. blank Hanja column, too few example sentences) and regenerate only the weak fields into a GUID-keyed Anki-update TSV
 - **Flexible providers**: OpenAI, Anthropic, OpenRouter, or local models (Ollama, vLLM)
 - **HTML formatting**: Keywords highlighted in red, sentences in blue
 - **Configurable**: Number of sentences, output paths, and more
@@ -69,6 +70,19 @@ ANKIGEN_LOG_RETENTION=-1            # Days to keep logs (-1 = forever, default)
 # ANKIGEN_ANKI_FIELD_KO=Korean
 ```
 
+### Rate limiting
+
+Every LLM-bound subcommand (`extract`, `generate`, `audit`/`backfill`) routes through the same proactive throttle that paces calls against both a rolling-60s **token** budget and a rolling-60s **request** budget. Long source documents are also auto-split into chunks during `extract` so a single call never blows past the per-call input-token ceiling.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ANKIGEN_LLM_RATE_LIMIT_TPM` | `30000` | Proactive rolling-60s input-token ceiling. ankigen estimates each call's token cost and sleeps before sending if the recent sum would exceed this. Set to `0` to disable proactive pacing. |
+| `ANKIGEN_LLM_RATE_LIMIT_RPM` | `50` | Proactive rolling-60s requests-per-minute ceiling. Useful for `backfill` loops that issue many small per-card prompts (low tokens, high request count). Set to `0` to disable. |
+| `ANKIGEN_LLM_CHUNK_TOKENS` | `20000` | Target tokens per chunked LLM call during `extract`. Long inputs are split on `[H1]`/`[H2]`/`[H3]` heading and paragraph boundaries to fit under this size, then results are merged with dedupe. Keep below `ANKIGEN_LLM_RATE_LIMIT_TPM` so a single chunk can't trip the limit. |
+| `ANKIGEN_LLM_MAX_RETRIES` | `4` | How many times to retry an LLM call that returns a 429 / rate-limit error before giving up. Each retry uses exponential backoff (5s, 15s, 45s, 90s, capped). |
+
+When either bucket fires, ankigen logs an `INFO` line naming the dimension that drove the pause (tokens vs requests) so progress stays visible during long backfills.
+
 ### Anki database filtering (optional)
 
 When `ANKIGEN_ANKI_DB` and `ANKIGEN_ANKI_DECK_{LANG}` are set, **extract**, **clean**, and **generate** skip vocabulary that already appears in the chosen deck (including sub-decks). Words are compared using **Unicode NFC** normalization so equivalent composed/decomposed strings still match.
@@ -78,6 +92,16 @@ When `ANKIGEN_ANKI_DB` and `ANKIGEN_ANKI_DECK_{LANG}` are set, **extract**, **cl
 CLI overrides (same flags on `generate`, `extract`, and `clean`): `--anki-db PATH`, `--anki-deck NAME`, `--anki-field INDEX_OR_NAME`.
 
 Run `ankigen status` to see resolved Anki-related paths and whether the database file exists.
+
+#### Custom note-type field names (audit / backfill only)
+
+`audit` and `backfill` default to the canonical schemas produced by `ankigen generate` (Korean: `Korean | Hanja | English | Comments`; Chinese: `Hanzi | Jyutping | English | Sentence`). To audit a custom note type with different field names, set `ANKIGEN_NOTE_TYPE_OVERRIDES` to a JSON object keyed by Anki **model name**:
+
+```bash
+export ANKIGEN_NOTE_TYPE_OVERRIDES='{"Korean (advanced)": {"sentence_field": "Comment"}}'
+```
+
+Only the roles that differ from the language defaults need to be listed. Valid keys are `headword_field`, `hanja_field` (Korean) / `jyutping_field` (Chinese), `english_field`, and `sentence_field`. See the [Audit & Backfill](#audit--backfill) section for the full schema, warning behaviour, and progress-log format.
 
 ## Usage
 
@@ -89,8 +113,8 @@ ankigen uses subcommands for different operations:
 
 | `--mode` | Input | Output | Anki note shape |
 |----------|-------|--------|-----------------|
-| `vocab` (default) | `.txt` (one word per line) | `outputs/{lang}/output_{stem}.csv` | Hanzi/Korean, Jyutping (zh only), English, Sentence |
-| `grammar` (auto-detected from `.jsonl`) | `_grammar.jsonl` | `outputs/{lang}/output_{stem}_grammar.csv` | **Pattern, Meaning, Examples** (3 cols; Meaning bolds the short gloss with the longer explanation on the next line) |
+| `vocab` (default) | `.txt` (one word per line) | `outputs/{lang}/output_{stem}.csv` | zh: Hanzi, Jyutping, English, Sentence — ko: **Korean, Hanja, English, Comments** |
+| `grammar` (auto-detected from `.jsonl`) | `_grammar.jsonl` | `outputs/{lang}/output_{stem}_grammar.csv` | **Pattern, Hanja, Meaning, Examples** (4 cols; Hanja is populated for Sino-Korean roots, empty otherwise; Meaning bolds the short gloss with the longer explanation on the next line) |
 | `all` | Either of the two — sibling is inferred | Both CSVs | both |
 
 ```bash
@@ -103,21 +127,35 @@ echo "促使
 ankigen generate inputs/zh/words.txt
 ```
 
-**Vocab output** (`outputs/zh/output_words.csv`):
+**Vocab output (Chinese)** (`outputs/zh/output_words.csv`):
 
 | Hanzi | Jyutping | English | Sentence |
 |-------|----------|---------|----------|
 | 促使 | cuk1sai2 | Verb: to urge, to spur | (HTML formatted sentences) |
 
+**Vocab output (Korean)** (`outputs/ko/output_words.csv`):
+
+| Korean | Hanja | English | Comments |
+|--------|-------|---------|----------|
+| 음식 | 飮食 | Noun: food, cuisine | (HTML formatted sentences) |
+| 예쁘다 |  | Adjective: pretty | (HTML formatted sentences) |
+
+The Hanja column is filled for Sino-Korean words (`음식 → 飮食`) and left empty
+for native-Korean words (`예쁘다`). The card-model side needs a matching
+`Hanja` field — add one to your Korean note type before importing.
+
 **Grammar output** (`outputs/ko/output_20260516_grammar.csv`):
 
-| Pattern | Meaning | Examples |
-|---------|---------|----------|
-| ~게 되다 | `<b>To end up doing / change of state</b><br>Used to express a change of state caused by external circumstances.` | (HTML: each verbatim teacher example highlighted, with English translation underneath) |
+| Pattern | Hanja | Meaning | Examples |
+|---------|-------|---------|----------|
+| ~게 되다 |  | `<b>To end up doing / change of state</b><br>Used to express a change of state caused by external circumstances.` | (HTML: each verbatim teacher example highlighted, with English translation underneath) |
+| 박사 과정을 밟다 | 博士 課程 | `<b>To be pursuing a doctoral program</b><br>Correct expression for someone currently doing a PhD.` | … |
 
-The Meaning column merges the LLM's short gloss (bolded) with its longer
-explanation (next line) so each Anki card has a single "what does this pattern
-mean?" cell.
+The Hanja column is populated when the pattern contains Sino-Korean noun
+roots (e.g. `박사 → 博士`); purely grammatical endings/particles leave it
+empty. The Meaning column merges the LLM's short gloss (bolded) with its
+longer explanation (next line) so each Anki card has a single "what does
+this pattern mean?" cell.
 
 The Examples column preserves the teacher's verbatim sentences from the source DOCX. If a pattern has fewer than `-n` examples, the LLM tops up the rest.
 
@@ -277,6 +315,18 @@ ankigen clean inputs/ko/dirty.txt -o inputs/ko/clean.txt --lang ko
 | Numbering | `1. 도망가다` | `도망가다` |
 | Bullet points | `- 게으르다` | `게으르다` |
 
+**Korean Hanja annotation (preserved)**: a `한글(漢字)` annotation is *not*
+stripped — it round-trips through `clean` and is consumed by `generate` to
+fill the `Hanja` CSV column without an extra LLM lookup:
+
+| Pattern | Before | After |
+|---------|--------|-------|
+| Inline Hanja annotation | `음식(飮食), food` | `음식(飮食)` |
+| Inline Hanja + romanization | `음식(飮食) (eumsig)` | `음식(飮食)` |
+
+Use the same `한글(漢字)` shape in your own input files when you want to
+pre-seed the Hanja column.
+
 **Options**:
 
 | Option | Description |
@@ -323,6 +373,110 @@ It prints grouped clusters to the screen and writes a report file: `<deck>.simil
 | `-o, --output FILE` | Report file (default: `<deck>.similar.txt` or `<input>.similar.txt`) |
 | `--format {text,csv}` | `text` (grouped) or `csv` (pair rows). Default: text |
 | `--anki-db`, `--anki-deck`, `--anki-field` | Anki deck to scan (or cross-check against, in input-file mode); see [Anki database filtering](#anki-database-filtering-optional) |
+
+### Audit & Backfill: Fix old/incomplete vocab cards in an existing deck
+
+The `audit` + `backfill` pair lets you sweep an Anki vocab deck for cards that don't match the current 4-column format and regenerate the weak fields in place. Use it after you've added a new column (e.g. the Korean `Hanja` column), or any time you want to top up cards that were originally generated with fewer sentences than your current target.
+
+The workflow is split into two commands so the slow LLM step is decoupled from the deck read (mirrors `extract` → `generate`):
+
+1. **`ankigen audit`** — read-only on the Anki DB. Scores every note against per-language format rules and writes a JSONL audit file with one entry per flagged note (GUID, current fields, and the reasons it failed).
+2. **`ankigen backfill`** — reads the audit JSONL, regenerates **only the flagged fields**, and writes one Anki-importable TSV per note type. TSVs carry a `#guid column:3` header so Anki updates the original notes by GUID even when headwords collide (e.g. homographs, or grammar duplicates like `~게 되다`).
+
+Grammar cards are not yet supported.
+
+```bash
+# 1. Quit Anki first (SQLite locks the live collection).
+#    Then audit the configured Korean deck.
+ankigen audit --lang ko -n 3
+# → inputs/ko/audit_ko_20260516.jsonl  with N flagged notes + a summary
+
+# 2. (Optional) Hand-edit the JSONL to drop false positives or
+#    delete an entry's `reasons` items to skip regenerating that field.
+
+# 3. Regenerate the weak fields via LLM into Anki-update TSV(s):
+ankigen backfill inputs/ko/audit_ko_20260516.jsonl -n 3
+# → outputs/ko/update_audit_ko_20260516__korean_vocab.tsv
+
+# 4. In Anki:  File > Import > pick the TSV.
+#    Tick "Update existing notes" — Anki matches on GUID via the
+#    #guid column:3 directive in the file header.
+```
+
+Default paths mirror the rest of ankigen: the JSONL audit report lands in `inputs/{lang}/` (because it's an *input* to the backfill step, like extract outputs are inputs to `generate`), and the final TSV(s) land in `outputs/{lang}/` (ready to import). Pass `-o` to either command to override.
+
+**Audit rules**
+
+| Reason code | Korean trigger | Chinese trigger |
+|---|---|---|
+| `missing_hanja_for_sino` | `Hanja` blank AND `Korean` contains embedded Hanja OR a `한글(漢字)` annotation | — |
+| `empty_hanja_optional` | `Hanja` blank on a Hangul-only word (opt in via `--include-empty-hanja`) | — |
+| `missing_jyutping` | — | `Jyutping` blank AND pycantonese can resolve `Hanzi` |
+| `empty_english` | `English` blank | `English` blank |
+| `too_few_sentences` | `Comments` has fewer than `-n` sentence blocks | `Sentence` has fewer than `-n` blocks |
+| `keyword_not_highlighted` | `Comments` non-empty but no red `<span>` matches `Korean` | `Sentence` non-empty but no red `<span>` matches `Hanzi` |
+| `plain_text_sentences` | `Comments` non-empty but contains no `<span` tags (legacy) | `Sentence` non-empty but contains no `<span` tags |
+
+**Backfill actions**
+
+| Reason code | Action |
+|---|---|
+| `missing_hanja_for_sino` | Local Hanja resolver (no LLM); falls back to LLM if local returns blank |
+| `empty_hanja_optional` | LLM `translate_word` (coalesced with `empty_english` when both fire — one call) |
+| `missing_jyutping` | `pycantonese` (no LLM) |
+| `empty_english` | LLM `translate_word` |
+| `too_few_sentences` | Existing sentences are preserved; LLM `generate_sentences` is asked for the shortfall only, then `format_sentences` re-renders the whole field |
+| `keyword_not_highlighted` / `plain_text_sentences` | `format_sentences` re-run over the existing text (no LLM) |
+
+The headword (`Korean` / `Hanzi`) is **immutable** — backfill never overwrites it.
+
+**Note-type field overrides.** The audit assumes the canonical schema produced by `ankigen generate` (Korean: `Korean | Hanja | English | Comments`; Chinese: `Hanzi | Jyutping | English | Sentence`). If you have a custom note type that uses different field names — e.g. `Korean (advanced)` with a singular `Comment` field instead of plural `Comments` — set `ANKIGEN_NOTE_TYPE_OVERRIDES` to a JSON object keyed by Anki model name:
+
+```bash
+export ANKIGEN_NOTE_TYPE_OVERRIDES='{
+  "Korean (advanced)": {
+    "headword_field": "Korean",
+    "hanja_field": "Hanja",
+    "english_field": "English",
+    "sentence_field": "Comment"
+  }
+}'
+```
+
+You only need to list the roles that differ from the defaults — unspecified roles fall back to the language default. Valid role keys are `headword_field`, `hanja_field` (Korean) / `jyutping_field` (Chinese), `english_field`, and `sentence_field`. Run `ankigen status` to confirm your overrides parsed correctly.
+
+When a note type has neither a recognised default schema nor a matching override, the entire note type is **skipped with a `WARNING`** at audit time (so it never silently slips through to backfill). The warning lists the missing field, any plausible candidate it spotted on the note (e.g. it would flag `Comment` as a likely match for `sentence_field`), and prints a ready-to-paste `ANKIGEN_NOTE_TYPE_OVERRIDES=...` snippet.
+
+**Backfill progress logs.** During backfill, each note is logged at `INFO` as `[N/total] guid=… model=… reasons=[…] → touched=[…]` so you can follow long runs without `-v`. The `INFO` line `Note-type override active for 'Model name': sentence_field='Comment'` confirms an override was applied.
+
+**Important: quit Anki first.** The live `collection.anki2` is locked by Anki for SQLite reads; the audit will report "deck not found" or fail to open the file. Quit Anki (or export an `.apkg` and point `--anki-db` at that) before running.
+
+**LLM call volume.** `--include-empty-hanja` issues ~1 LLM call per Hangul-only Korean note, and `too_few_sentences` can also be call-heavy on large decks. Both `audit` and `backfill` pace themselves against:
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `ANKIGEN_LLM_RATE_LIMIT_TPM` | `30000` | Rolling-60s tokens-per-minute cap |
+| `ANKIGEN_LLM_RATE_LIMIT_RPM` | `50` | Rolling-60s requests-per-minute cap |
+
+Both buckets sleep proactively when a call would breach the ceiling; `ANKIGEN_LLM_MAX_RETRIES` still kicks in as a reactive backstop for misestimates.
+
+**Audit options**:
+
+| Option | Description |
+|--------|-------------|
+| `--lang {zh,ko}` | Language (default: `ko`) |
+| `-n, --sentences INT` | Target sentence count per card (default: 3; use `0` to disable the sentence rule) |
+| `--include-empty-hanja` | Korean only: flag every Hangul-only word with a blank Hanja column |
+| `-o, --output FILE` | Audit JSONL output (default: `inputs/{lang}/audit_{lang}_{YYYYMMDD}.jsonl`) |
+| `--anki-db`, `--anki-deck` | Anki deck to audit; see [Anki database filtering](#anki-database-filtering-optional). `--anki-field` is unused (we read whole notes). |
+
+**Backfill options**:
+
+| Option | Description |
+|--------|-------------|
+| `input_file` | Audit JSONL file produced by `ankigen audit` |
+| `-n, --sentences INT` | Target sentence count (default: 3) — used when topping up `too_few_sentences` |
+| `-o, --output STEM` | Output stem (suffixed with `__<model>.tsv` per note type). Default: `outputs/{lang}/update_<input_stem>`, where `{lang}` is inferred from the JSONL's first row |
 
 ### Status: Check configuration
 

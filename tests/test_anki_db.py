@@ -9,12 +9,14 @@ import zipfile
 from pathlib import Path
 
 from ankigen.anki_db import (
+    AnkiNote,
     _build_model_field_map,
     _get_deck_ids,
     _get_words_from_deck,
     get_anki_db_path,
     get_anki_deck_name,
     get_anki_field,
+    load_anki_notes,
     load_anki_words,
     normalize_anki_term,
 )
@@ -678,3 +680,195 @@ class TestLoadAnkiWordsFieldClampAndNfc:
         _make_new_schema_db(db_path, "Korean", [nfd_ga], field_names=["Korean", "English"])
         result = load_anki_words(db_path, "Korean", field="Korean")
         assert result == {"\uac00"}
+
+
+# ---------------------------------------------------------------------------
+# Helpers to build full-note databases (one row per note, arbitrary field values)
+# ---------------------------------------------------------------------------
+
+
+def _make_full_note_db_old_schema(
+    path: Path,
+    *,
+    deck_id: int,
+    deck_name: str,
+    model_name: str,
+    field_names: list[str],
+    notes: list[tuple[int, str, list[str]]],
+) -> None:
+    """Build an old-schema DB with full control over each note's field values.
+
+    Args:
+        notes: list of ``(nid, guid, [field_value, ...])`` — one tuple per
+            note. Field values must match the ``field_names`` length.
+    """
+    models_json = json.dumps(
+        {
+            str(_MODEL_ID): {
+                "id": _MODEL_ID,
+                "name": model_name,
+                "flds": [{"name": n, "ord": i} for i, n in enumerate(field_names)],
+            }
+        }
+    )
+
+    conn = sqlite3.connect(str(path))
+    conn.executescript("""
+        CREATE TABLE col (
+            id INTEGER NOT NULL, crt INTEGER NOT NULL, mod INTEGER NOT NULL,
+            scm INTEGER NOT NULL, ver INTEGER NOT NULL, dty INTEGER NOT NULL,
+            usn INTEGER NOT NULL, ls INTEGER NOT NULL, conf TEXT NOT NULL,
+            models TEXT NOT NULL, decks TEXT NOT NULL, dconf TEXT NOT NULL,
+            tags TEXT NOT NULL
+        );
+        CREATE TABLE notes (
+            id INTEGER NOT NULL PRIMARY KEY, guid TEXT NOT NULL,
+            mid INTEGER NOT NULL, mod INTEGER NOT NULL, usn INTEGER NOT NULL,
+            tags TEXT NOT NULL, flds TEXT NOT NULL, sfld INTEGER NOT NULL,
+            csum INTEGER NOT NULL, flags INTEGER NOT NULL, data TEXT NOT NULL
+        );
+        CREATE TABLE cards (
+            id INTEGER NOT NULL PRIMARY KEY, nid INTEGER NOT NULL,
+            did INTEGER NOT NULL, ord INTEGER NOT NULL, mod INTEGER NOT NULL,
+            usn INTEGER NOT NULL, type INTEGER NOT NULL, queue INTEGER NOT NULL,
+            due INTEGER NOT NULL, ivl INTEGER NOT NULL, factor INTEGER NOT NULL,
+            reps INTEGER NOT NULL, lapses INTEGER NOT NULL, left INTEGER NOT NULL,
+            odue INTEGER NOT NULL, odid INTEGER NOT NULL, flags INTEGER NOT NULL,
+            data TEXT NOT NULL
+        );
+    """)
+
+    decks_json = json.dumps({str(deck_id): {"id": deck_id, "name": deck_name}})
+    conn.execute(
+        "INSERT INTO col VALUES (1,0,0,0,11,0,0,0,'{}',?,?,'{}',' ')",
+        (models_json, decks_json),
+    )
+
+    for nid, guid, values in notes:
+        flds = FIELD_SEP.join(values)
+        conn.execute(
+            "INSERT INTO notes VALUES (?,?,?,0,0,'',?,0,0,0,'')",
+            (nid, guid, _MODEL_ID, flds),
+        )
+        conn.execute(
+            "INSERT INTO cards VALUES (?,?,?,0,0,0,0,0,0,0,0,0,0,0,0,0,0,'')",
+            (nid * 10, nid, deck_id),
+        )
+
+    conn.commit()
+    conn.close()
+
+
+class TestLoadAnkiNotes:
+    """End-to-end tests for the richer :func:`load_anki_notes` API."""
+
+    def test_returns_anki_note_records(self, tmp_path):
+        db_path = tmp_path / "collection.anki2"
+        _make_full_note_db_old_schema(
+            db_path,
+            deck_id=1001,
+            deck_name="Korean::Vocab",
+            model_name="Korean Vocab",
+            field_names=["Korean", "Hanja", "English", "Comments"],
+            notes=[
+                (1, "guid-aaa", ["음식", "", "food", ""]),
+                (2, "guid-bbb", ["飮食", "飮食", "food (sino)", "<span>...</span>"]),
+            ],
+        )
+        notes = load_anki_notes(db_path, "Korean::Vocab")
+        assert len(notes) == 2
+        by_guid = {n.guid: n for n in notes}
+        assert isinstance(by_guid["guid-aaa"], AnkiNote)
+        assert by_guid["guid-aaa"].fields["Korean"] == "음식"
+        assert by_guid["guid-aaa"].fields["Hanja"] == ""
+        assert by_guid["guid-aaa"].fields["English"] == "food"
+        assert by_guid["guid-aaa"].model_name == "Korean Vocab"
+        assert by_guid["guid-aaa"].deck_id == 1001
+        assert by_guid["guid-bbb"].fields["Hanja"] == "飮食"
+
+    def test_returns_field_order_matching_note_type(self, tmp_path):
+        db_path = tmp_path / "collection.anki2"
+        _make_full_note_db_old_schema(
+            db_path,
+            deck_id=1001,
+            deck_name="Chinese",
+            model_name="Chinese Vocab",
+            field_names=["Hanzi", "Jyutping", "English", "Sentence"],
+            notes=[(1, "g1", ["促使", "", "to urge", ""])],
+        )
+        notes = load_anki_notes(db_path, "Chinese")
+        assert notes[0].field_order == ["Hanzi", "Jyutping", "English", "Sentence"]
+
+    def test_missing_file_returns_empty_list(self, tmp_path):
+        assert load_anki_notes(tmp_path / "nope.anki2", "Deck") == []
+
+    def test_deck_not_found_returns_empty_list(self, tmp_path):
+        db_path = tmp_path / "collection.anki2"
+        _make_full_note_db_old_schema(
+            db_path,
+            deck_id=1001,
+            deck_name="Chinese",
+            model_name="Basic",
+            field_names=["F"],
+            notes=[(1, "g", ["x"])],
+        )
+        assert load_anki_notes(db_path, "Nonexistent") == []
+
+    def test_apkg_format(self, tmp_path):
+        apkg_path = tmp_path / "deck.apkg"
+        with tempfile.TemporaryDirectory() as tmp:
+            inner = Path(tmp) / "collection.anki2"
+            _make_full_note_db_old_schema(
+                inner,
+                deck_id=1001,
+                deck_name="Korean",
+                model_name="Korean Vocab",
+                field_names=["Korean", "English"],
+                notes=[(1, "g1", ["편한", "comfortable"])],
+            )
+            with zipfile.ZipFile(apkg_path, "w") as zf:
+                zf.write(inner, "collection.anki2")
+        notes = load_anki_notes(apkg_path, "Korean")
+        assert len(notes) == 1
+        assert notes[0].fields["Korean"] == "편한"
+
+    def test_nfd_korean_field_is_nfc_normalized(self, tmp_path):
+        nfd_ga = unicodedata.normalize("NFD", "\uac00")
+        db_path = tmp_path / "collection.anki2"
+        _make_full_note_db_old_schema(
+            db_path,
+            deck_id=1001,
+            deck_name="Korean",
+            model_name="Korean Vocab",
+            field_names=["Korean", "English"],
+            notes=[(1, "g1", [nfd_ga, "x"])],
+        )
+        notes = load_anki_notes(db_path, "Korean")
+        assert notes[0].fields["Korean"] == "\uac00"
+
+    def test_unsupported_extension_returns_empty_list(self, tmp_path):
+        bad = tmp_path / "x.db"
+        bad.write_text("not a db", encoding="utf-8")
+        assert load_anki_notes(bad, "Deck") == []
+
+    def test_multiple_cards_per_note_deduped(self, tmp_path):
+        """A note with multiple cards in the deck should only return once."""
+        db_path = tmp_path / "collection.anki2"
+        _make_full_note_db_old_schema(
+            db_path,
+            deck_id=1001,
+            deck_name="Korean",
+            model_name="Korean Vocab",
+            field_names=["Korean", "English"],
+            notes=[(1, "g1", ["편한", "x"])],
+        )
+        # Add a second card row for the same nid (Anki cards table is per-card)
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "INSERT INTO cards VALUES (?,?,?,0,0,0,0,0,0,0,0,0,0,0,0,0,0,'')",
+            (11, 1, 1001),
+        )
+        conn.commit()
+        conn.close()
+        notes = load_anki_notes(db_path, "Korean")
+        assert len(notes) == 1

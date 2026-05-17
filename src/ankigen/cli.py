@@ -40,10 +40,19 @@ from ankigen.anki_db import (
     get_anki_db_path,
     get_anki_deck_name,
     get_anki_field,
+    load_anki_notes,
     load_anki_words,
     normalize_anki_term,
 )
-from ankigen.cleaner import clean_and_write, clean_vocabulary_file
+from ankigen.audit import (
+    audit_notes,
+    get_note_type_overrides,
+    peek_audit_lang,
+    summarize_audit,
+    write_audit_jsonl,
+)
+from ankigen.backfill import backfill_jsonl
+from ankigen.cleaner import clean_and_write, clean_vocabulary_file, parse_hanja_token
 from ankigen.extractor import (
     ExtractMode,
     extract_vocabulary_from_file,
@@ -58,6 +67,7 @@ from ankigen.grammar import (
     generate_grammar_csv,
     write_grammar_jsonl,
 )
+from ankigen.hanja_lookup import resolve_hanja
 from ankigen.llm import Language, generate_sentences, translate_word
 from ankigen.logging_config import get_log_dir, get_log_level, get_log_retention, setup_logging
 from ankigen.similarity import cluster_pairs, find_similar_pairs
@@ -97,36 +107,42 @@ def read_words(input_file: Path) -> list[str]:
     return words
 
 
-def process_word(word: str, lang: Language, num_sentences: int) -> dict[str, str]:
+def process_word(
+    word: str,
+    lang: Language,
+    num_sentences: int,
+    *,
+    inline_hanja: str = "",
+) -> dict[str, str]:
     """
-    Process a single word: get translation, Jyutping (for Chinese), and optionally sentences.
+    Process a single word: get translation, Jyutping (for Chinese) or Hanja
+    (for Korean), and optionally sentences.
 
     Args:
-        word: The vocabulary word
-        lang: Language code
-        num_sentences: Number of sentences to generate (0 to skip)
+        word: The vocabulary word (bare, with any ``(漢字)`` annotation
+            already split out by the caller).
+        lang: Language code.
+        num_sentences: Number of sentences to generate (0 to skip).
+        inline_hanja: Hanja captured from a ``한글(漢字)`` annotation upstream.
+            Ignored for Chinese.
 
     Returns:
-        Dict with language-appropriate field names
+        Dict with language-appropriate field names.
     """
     logger.info("Processing: %s...", word)
 
-    # Get translation
-    translation = translate_word(word, lang)
+    result = translate_word(word, lang)
+    translation = result.translation
 
     if num_sentences > 0:
-        # Generate sentences
         sentences = generate_sentences(word, lang, num_sentences)
-        # Format as numbered string for the formatter
         numbered = " ".join(f"{i + 1}. {s}" for i, s in enumerate(sentences))
-        # Apply HTML formatting
         formatted = format_sentences(numbered, word)
     else:
         formatted = ""
 
     logger.debug("Done processing word")
 
-    # Return language-specific field names
     if lang == "zh":
         jyutping = get_jyutping(word)
         return {
@@ -135,12 +151,14 @@ def process_word(word: str, lang: Language, num_sentences: int) -> dict[str, str
             "English": translation,
             "Sentence": formatted,
         }
-    else:  # Korean
-        return {
-            "Korean": word,
-            "English": translation,
-            "Comments": formatted,
-        }
+    # Korean: prefer local resolver (inline > embedded Hanja chars) then LLM
+    hanja = resolve_hanja(word, inline_hanja=inline_hanja) or result.hanja
+    return {
+        "Korean": word,
+        "Hanja": hanja,
+        "English": translation,
+        "Comments": formatted,
+    }
 
 
 def get_output_path(input_file: Path, lang: Language, custom_output: Path | None) -> Path:
@@ -195,7 +213,12 @@ def generate_csv(
         words = read_words(input_file)
         if exclude_words:
             before = len(words)
-            words = [w for w in words if normalize_anki_term(w) not in exclude_words]
+            # Compare against Anki using the bare word, not the ``한글(漢字)`` form.
+            words = [
+                w
+                for w in words
+                if normalize_anki_term(parse_hanja_token(w)[0]) not in exclude_words
+            ]
             skipped = before - len(words)
             if skipped:
                 logger.info("Skipped %d words already present in Anki", skipped)
@@ -209,14 +232,15 @@ def generate_csv(
     if lang == "zh":
         fieldnames = ["Hanzi", "Jyutping", "English", "Sentence"]
     else:  # Korean
-        fieldnames = ["Korean", "English", "Comments"]
+        fieldnames = ["Korean", "Hanja", "English", "Comments"]
 
     with open(output_file, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
 
-        for word in words:
-            row = process_word(word, lang, num_sentences)
+        for raw in words:
+            bare, inline_hanja = parse_hanja_token(raw) if lang == "ko" else (raw, "")
+            row = process_word(bare, lang, num_sentences, inline_hanja=inline_hanja)
             writer.writerow(row)
 
     logger.info("Output written to %s", output_file)
@@ -434,7 +458,10 @@ def _extract_single_file_vocab(args: argparse.Namespace, output_file: Path | Non
     exclude_words = _resolve_anki_words(args, args.lang)
     if exclude_words:
         before = len(words)
-        words = [w for w in words if normalize_anki_term(w) not in exclude_words]
+        # Match Anki on the bare word, ignoring any ``(漢字)`` annotation.
+        words = [
+            w for w in words if normalize_anki_term(parse_hanja_token(w)[0]) not in exclude_words
+        ]
         skipped = before - len(words)
         if skipped:
             logger.info("Skipped %d words already present in Anki", skipped)
@@ -442,8 +469,10 @@ def _extract_single_file_vocab(args: argparse.Namespace, output_file: Path | Non
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
     if output_file.exists() and not args.overwrite:
-        existing_words = set(read_words(output_file))
-        new_words = [w for w in words if w not in existing_words]
+        # Dedupe by bare word (without ``(漢字)`` annotation) so that the same
+        # word with and without Hanja still collapses to one entry.
+        existing_bare = {parse_hanja_token(w)[0] for w in read_words(output_file)}
+        new_words = [w for w in words if parse_hanja_token(w)[0] not in existing_bare]
         if not new_words:
             logger.info("All extracted words already exist in %s", output_file)
             return
@@ -656,7 +685,9 @@ def cmd_similar(args: argparse.Namespace) -> None:
         if not args.input_file.exists():
             logger.error("Input file not found: %s", args.input_file)
             sys.exit(1)
-        words = read_words(args.input_file)
+        # Similarity is computed on the bare word; strip any ``(漢字)`` annotation
+        # so e.g. ``음식(飮食)`` is compared against ``음식``.
+        words = [parse_hanja_token(w)[0] for w in read_words(args.input_file)]
         if not words:
             logger.warning("No words found in %s", args.input_file)
             return
@@ -750,6 +781,168 @@ def cmd_similar(args: argparse.Namespace) -> None:
     print(f"Report written to {out_path}")
 
 
+def _resolve_anki_db_and_deck(args: argparse.Namespace, lang: Language) -> tuple[Path, str] | None:
+    """Resolve ``(db_path, deck_name)`` for whole-note loading.
+
+    Like :func:`_resolve_anki_words` but for commands that read entire
+    notes (audit) rather than a single field. Returns ``None`` and logs
+    an error when either piece of configuration is missing, so the caller
+    can ``sys.exit(1)`` cleanly.
+    """
+    db_path: Path | None = args.anki_db or get_anki_db_path()
+    if db_path is None:
+        logger.error(
+            "No Anki database configured. Pass --anki-db or set ANKIGEN_ANKI_DB in your .env file."
+        )
+        return None
+    deck_name: str | None = args.anki_deck or get_anki_deck_name(lang)
+    if not deck_name:
+        logger.error(
+            "No Anki deck configured for %s. Pass --anki-deck or set "
+            "ANKIGEN_ANKI_DECK_%s in your .env file.",
+            lang,
+            lang.upper(),
+        )
+        return None
+    return db_path, deck_name
+
+
+def _default_audit_output(lang: Language) -> Path:
+    """Default JSONL output path for ``ankigen audit``.
+
+    Audit JSONLs are *inputs* to the backfill step, so they live alongside
+    the other generate-inputs in ``inputs/{lang}/``. The ``inputs/`` base
+    is shared with ``extract`` (see :func:`extractor.get_output_dir`); the
+    dated filename keeps multiple sweeps from clobbering each other.
+    """
+    today = datetime.now().strftime("%Y%m%d")
+    return get_output_dir() / lang / f"audit_{lang}_{today}.jsonl"
+
+
+def _default_backfill_output_stem(input_jsonl: Path, lang: Language | None) -> Path:
+    """Default TSV stem for ``ankigen backfill``.
+
+    Backfill TSVs are final Anki-import artefacts, so they belong in
+    ``outputs/{lang}/`` (mirrors ``generate``'s convention — see
+    :func:`_resolve_output_file`). When the input JSONL lives under
+    ``inputs/<lang>/...``, we swap ``inputs`` → ``outputs`` and reuse the
+    same lang directory. Otherwise we fall back to a project-relative
+    ``outputs/<lang>/`` (when the lang is known) or to a sibling path
+    next to the input file.
+    """
+    stem = f"update_{input_jsonl.stem}"
+    parts = input_jsonl.resolve().parts
+    if "inputs" in parts:
+        idx = parts.index("inputs")
+        project_root = Path(*parts[:idx]) if idx > 0 else Path("/")
+        # Prefer the lang dir already in the path; fall back to inferred lang.
+        path_lang = parts[idx + 1] if len(parts) > idx + 1 else None
+        lang_dir = path_lang or (lang or "")
+        if lang_dir:
+            return project_root / "outputs" / lang_dir / stem
+        return project_root / "outputs" / stem
+    if lang:
+        return Path("outputs") / lang / stem
+    return input_jsonl.with_name(stem)
+
+
+def cmd_audit(args: argparse.Namespace) -> None:
+    """Handle the 'audit' subcommand — read deck, score notes, write JSONL.
+
+    Output path defaults to ``inputs/{lang}/audit_{lang}_{YYYYMMDD}.jsonl``
+    (the JSONL is treated as an *input* to backfill — same convention as
+    other extract-style outputs). Pass ``-o`` to override.
+    """
+    resolved = _resolve_anki_db_and_deck(args, args.lang)
+    if resolved is None:
+        sys.exit(1)
+    db_path, deck_name = resolved
+
+    logger.info(
+        "Auditing Anki deck '%s' from %s (lang=%s, target_sentences=%d, include_empty_hanja=%s)",
+        deck_name,
+        db_path,
+        args.lang,
+        args.sentences,
+        args.include_empty_hanja,
+    )
+    notes = load_anki_notes(db_path, deck_name)
+    if not notes:
+        logger.error(
+            "No notes found in deck '%s'. (Anki may be running and holding a SQLite "
+            "lock — quit Anki or export an .apkg.)",
+            deck_name,
+        )
+        sys.exit(1)
+
+    audited = audit_notes(
+        notes,
+        target_sentences=args.sentences,
+        include_empty_hanja=args.include_empty_hanja,
+    )
+
+    if args.output is not None:
+        output_path = args.output
+    else:
+        output_path = _default_audit_output(args.lang)
+
+    write_audit_jsonl(audited, output_path)
+
+    summary = summarize_audit(audited)
+    print("=" * 60)
+    print(f"AUDIT RESULTS ({args.lang}) — {deck_name}")
+    print("=" * 60)
+    print(f"\nNotes scanned: {len(notes)}")
+    print(f"Notes flagged: {len(audited)}")
+    if summary:
+        print("\nReasons:")
+        for code in sorted(summary):
+            print(f"  {code:<30} {summary[code]}")
+    print(f"\nAudit JSONL written to: {output_path}")
+    if audited:
+        print("\nNext step:")
+        print(f"  ankigen backfill {output_path} -n {args.sentences}")
+
+
+def cmd_backfill(args: argparse.Namespace) -> None:
+    """Handle the 'backfill' subcommand — regenerate flagged fields → TSV(s).
+
+    Output stem defaults to ``outputs/{lang}/update_{input_stem}`` (the
+    lang is inferred from the first row of the JSONL — audits are always
+    single-lang). One TSV per note type is written, suffixed with a
+    slugified model name (e.g.
+    ``outputs/ko/update_audit_ko_20260516__korean_vocab.tsv``).
+    """
+    if not args.input_file.exists():
+        logger.error("Input file not found: %s", args.input_file)
+        sys.exit(1)
+
+    if args.output is not None:
+        output_stem = args.output
+    else:
+        inferred_lang = peek_audit_lang(args.input_file)
+        output_stem = _default_backfill_output_stem(args.input_file, inferred_lang)
+
+    paths = backfill_jsonl(
+        args.input_file,
+        output_stem,
+        target_sentences=args.sentences,
+    )
+
+    if not paths:
+        print("No notes were backfilled.")
+        return
+
+    print("=" * 60)
+    print("BACKFILL RESULTS")
+    print("=" * 60)
+    for path in paths:
+        print(f"  {path}")
+    print("\nNext step:")
+    print("  In Anki: File > Import — pick the TSV(s) above.")
+    print("  Anki matches by GUID (#guid column:3 header) so existing notes update in place.")
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     """Handle the 'status' subcommand - show configuration health check."""
     print("=" * 60)
@@ -807,6 +1000,28 @@ def cmd_status(args: argparse.Namespace) -> None:
         "\n   Note: Reading the live collection.anki2 while Anki is open may fail "
         "(SQLite lock). Quit Anki or export an .apkg for reliable reads."
     )
+
+    # Audit / backfill note-type field overrides
+    print("\n🧩 NOTE TYPE OVERRIDES (audit / backfill):")
+    raw_overrides = os.environ.get("ANKIGEN_NOTE_TYPE_OVERRIDES", "").strip()
+    if not raw_overrides:
+        print(
+            "   ANKIGEN_NOTE_TYPE_OVERRIDES: (not set — using KO/ZH defaults)\n"
+            "   Defaults: KO = Korean | Hanja | English | Comments\n"
+            "             ZH = Hanzi  | Jyutping | English | Sentence"
+        )
+    else:
+        overrides = get_note_type_overrides()
+        if not overrides:
+            print(
+                "   ANKIGEN_NOTE_TYPE_OVERRIDES: (set but failed to parse — "
+                "see WARNING logs above for the reason)"
+            )
+        else:
+            print(f"   ANKIGEN_NOTE_TYPE_OVERRIDES: {len(overrides)} note type(s)")
+            for model_name, roles in sorted(overrides.items()):
+                role_str = ", ".join(f"{k}={v!r}" for k, v in sorted(roles.items()))
+                print(f"     {model_name!r}: {role_str}")
 
     # Show example flow
     print("\n" + "=" * 60)
@@ -1062,6 +1277,87 @@ def main() -> None:
     )
     _add_anki_args(sim_parser)
 
+    # 'audit' subcommand
+    audit_parser = subparsers.add_parser(
+        "audit",
+        help="Audit an Anki vocab deck for missing/weak fields",
+        description=(
+            "Scan an existing Anki vocab deck (Korean: Korean|Hanja|English|Comments; "
+            "Chinese: Hanzi|Jyutping|English|Sentence), flag notes that don't match "
+            "the current format, and write a JSONL audit file with one entry per "
+            "flagged note. Pair with `ankigen backfill` to regenerate the weak "
+            "fields and produce a GUID-keyed update CSV for Anki."
+        ),
+    )
+    audit_parser.add_argument(
+        "--lang",
+        type=str,
+        choices=["zh", "ko"],
+        default="ko",
+        help="Language: zh (Chinese) or ko (Korean). Default: ko",
+    )
+    audit_parser.add_argument(
+        "-n",
+        "--sentences",
+        type=int,
+        default=3,
+        help="Target sentences per card (default: 3, use 0 to disable the sentence rule)",
+    )
+    audit_parser.add_argument(
+        "--include-empty-hanja",
+        action="store_true",
+        help=(
+            "Also flag every Hangul-only Korean word with a blank Hanja column "
+            "(wide sweep). Costs ~1 LLM call per Hangul-only note in backfill — "
+            "paced by ANKIGEN_LLM_RATE_LIMIT_RPM (default 50). Korean only."
+        ),
+    )
+    audit_parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=None,
+        help="Audit JSONL output (default: inputs/{lang}/audit_{lang}_{YYYYMMDD}.jsonl)",
+    )
+    _add_anki_args(audit_parser)
+
+    # 'backfill' subcommand
+    backfill_parser = subparsers.add_parser(
+        "backfill",
+        help="Regenerate weak fields on flagged notes and write an Anki-update TSV",
+        description=(
+            "Read the audit JSONL produced by `ankigen audit`, regenerate ONLY "
+            "the fields whose reasons were flagged (Hanja via local resolver / "
+            "LLM, Jyutping via pycantonese, English via LLM, sentences via LLM "
+            "top-up), and write one Anki-importable TSV per note type. "
+            "TSVs carry a `#guid column:3` header so Anki updates the original "
+            "notes by GUID even when headwords collide."
+        ),
+    )
+    backfill_parser.add_argument(
+        "input_file",
+        type=Path,
+        help="Audit JSONL file produced by `ankigen audit`",
+    )
+    backfill_parser.add_argument(
+        "-n",
+        "--sentences",
+        type=int,
+        default=3,
+        help="Target sentences per card (default: 3); used when topping up too-few-sentences",
+    )
+    backfill_parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=None,
+        help=(
+            "Output stem (suffixed with __<model>.tsv per note type). "
+            "Default: outputs/{lang}/update_<input_stem>, where {lang} is "
+            "inferred from the audit JSONL's first row."
+        ),
+    )
+
     # 'status' subcommand
     subparsers.add_parser(
         "status",
@@ -1083,6 +1379,10 @@ def main() -> None:
         cmd_clean(args)
     elif args.command == "similar":
         cmd_similar(args)
+    elif args.command == "audit":
+        cmd_audit(args)
+    elif args.command == "backfill":
+        cmd_backfill(args)
     elif args.command == "status":
         cmd_status(args)
     else:

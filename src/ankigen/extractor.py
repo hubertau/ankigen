@@ -17,6 +17,8 @@ from pydantic import BaseModel, Field
 from pypdf import PdfReader
 
 from ankigen.anki_db import normalize_anki_term
+from ankigen.chunking import estimate_tokens, split_text_for_extraction
+from ankigen.cleaner import parse_hanja_token
 from ankigen.llm import (
     LANGUAGE_CONFIG,
     PROVIDER_CONFIG,
@@ -26,6 +28,8 @@ from ankigen.llm import (
     get_model,
     get_provider,
 )
+
+_DEFAULT_CHUNK_TOKENS = 20_000
 
 ExtractMode = Literal["vocab", "grammar", "all"]
 
@@ -326,9 +330,63 @@ def extract_text_from_image(path: Path, lang: Language = "zh") -> str:
     return extracted_text
 
 
+def _get_chunk_tokens() -> int:
+    """Read ``ANKIGEN_LLM_CHUNK_TOKENS`` (default 20k) for extract chunking."""
+    raw = os.getenv("ANKIGEN_LLM_CHUNK_TOKENS")
+    if not raw:
+        return _DEFAULT_CHUNK_TOKENS
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid ANKIGEN_LLM_CHUNK_TOKENS=%r; using default %d",
+            raw,
+            _DEFAULT_CHUNK_TOKENS,
+        )
+        return _DEFAULT_CHUNK_TOKENS
+    return max(1, value)
+
+
+def _merge_vocab_words(chunks_words: list[list[str]], lang: Language) -> list[str]:
+    """Dedupe vocab across chunks, preserving order and Hanja annotations.
+
+    For Korean, the dedupe key is the bare word (without any ``(漢字)``
+    annotation); if any chunk produced a ``한글(漢字)`` form for the same bare
+    word, that annotated form replaces a previously-seen bare entry.
+    """
+    if lang != "ko":
+        seen: dict[str, str] = {}
+        order: list[str] = []
+        for chunk in chunks_words:
+            for w in chunk:
+                if w not in seen:
+                    seen[w] = w
+                    order.append(w)
+        return order
+
+    merged: dict[str, str] = {}
+    ko_order: list[str] = []
+    for chunk in chunks_words:
+        for w in chunk:
+            bare, hanja = parse_hanja_token(w)
+            if bare not in merged:
+                merged[bare] = w
+                ko_order.append(bare)
+            elif hanja and not parse_hanja_token(merged[bare])[1]:
+                # Upgrade a previously bare entry with an annotated one.
+                merged[bare] = w
+    return [merged[k] for k in ko_order]
+
+
 def identify_vocabulary(text: str, lang: Language = "zh") -> list[str]:
     """
     Identify vocabulary words from text using LLM.
+
+    Long inputs are automatically split into chunks (each under
+    ``ANKIGEN_LLM_CHUNK_TOKENS`` tokens) so a single call never exceeds the
+    provider's per-minute input-token budget. Results are merged with order
+    preserved and duplicates removed; Korean Hanja annotations win over bare
+    forms when both appear across chunks.
 
     Args:
         text: The text to extract vocabulary from
@@ -342,30 +400,56 @@ def identify_vocabulary(text: str, lang: Language = "zh") -> list[str]:
     model = get_model()
     lang_name = LANGUAGE_CONFIG[lang]["name"]
 
+    hanja_rule = (
+        " EXCEPTION for Korean: if the source text presents a Sino-Korean word "
+        "together with its Hanja form (e.g. '음식(飮食)', '한자(漢字)'), keep that "
+        "exact '한글(漢字)' annotation in the returned word so downstream tools "
+        "can reuse the Hanja without a separate lookup. Do not invent Hanja "
+        "annotations that are not in the source text."
+        if lang == "ko"
+        else ""
+    )
+
+    system_prompt = (
+        f"You are a {lang_name} language expert. "
+        "Extract important vocabulary words from the given text. "
+        "Focus on words that would be useful for language learners: "
+        "nouns, verbs, adjectives, adverbs, and common expressions. "
+        "Exclude very common words (like 'the', 'is', 'a' equivalents). "
+        "Return each word in its dictionary/base form. "
+        f"IMPORTANT: Return ONLY the {lang_name} characters/script. "
+        "Do NOT include any romanization (pinyin, romaja, etc.), "
+        "pronunciation guides, or parenthetical annotations." + hanja_rule
+    )
+
+    chunks = split_text_for_extraction(text, _get_chunk_tokens())
+    if len(chunks) > 1:
+        logger.info(
+            "Splitting extract into %d chunks (~%d tokens total) to respect rate limit",
+            len(chunks),
+            estimate_tokens(text),
+        )
+
     logger.debug("Calling %s for %s vocabulary identification", model, lang_name)
     start_time = time.time()
 
-    response = generate_structured_response(
-        response_model=VocabularyResponse,
-        system_prompt=(
-            f"You are a {lang_name} language expert. "
-            "Extract important vocabulary words from the given text. "
-            "Focus on words that would be useful for language learners: "
-            "nouns, verbs, adjectives, adverbs, and common expressions. "
-            "Exclude very common words (like 'the', 'is', 'a' equivalents). "
-            "Return each word in its dictionary/base form. "
-            f"IMPORTANT: Return ONLY the {lang_name} characters/script. "
-            "Do NOT include any romanization (pinyin, romaja, etc.), "
-            "pronunciation guides, or parenthetical annotations."
-        ),
-        user_prompt=f"Extract vocabulary words from this {lang_name} text:\n\n{text}",
-    )
+    chunks_words: list[list[str]] = []
+    for idx, chunk in enumerate(chunks, start=1):
+        if len(chunks) > 1:
+            logger.info("Identifying vocabulary from chunk %d/%d", idx, len(chunks))
+        response = generate_structured_response(
+            response_model=VocabularyResponse,
+            system_prompt=system_prompt,
+            user_prompt=f"Extract vocabulary words from this {lang_name} text:\n\n{chunk}",
+        )
+        chunk_words = response.words  # type: ignore[attr-defined]
+        chunks_words.append(list(chunk_words))
 
+    merged = _merge_vocab_words(chunks_words, lang)
     elapsed = time.time() - start_time
-    words = response.words  # type: ignore[attr-defined]
     logger.debug("Vocabulary identification completed in %.2fs", elapsed)
-    logger.info("Identified %d vocabulary words", len(words))
-    return words  # type: ignore[no-any-return]
+    logger.info("Identified %d vocabulary words", len(merged))
+    return merged
 
 
 def get_file_type(path: Path) -> str:

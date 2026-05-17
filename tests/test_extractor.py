@@ -139,6 +139,63 @@ class TestIdentifyVocabulary:
         assert "Chinese" in call_kwargs["user_prompt"]
 
 
+class TestIdentifyVocabularyChunking:
+    """Long inputs are split into chunks and merged with dedupe."""
+
+    def test_long_input_splits_into_multiple_calls(self, mocker) -> None:
+        # Pin chunk count by mocking the splitter directly.
+        mocker.patch(
+            "ankigen.extractor.split_text_for_extraction",
+            return_value=["chunk one", "chunk two", "chunk three"],
+        )
+
+        responses = [
+            VocabularyResponse(words=["단어1", "단어2"]),
+            VocabularyResponse(words=["단어2", "단어3"]),
+            VocabularyResponse(words=["단어3", "단어4"]),
+        ]
+        mock_generate = mocker.patch(
+            "ankigen.extractor.generate_structured_response",
+            side_effect=responses,
+        )
+
+        result = identify_vocabulary("long input text", lang="ko")
+
+        assert mock_generate.call_count == 3
+        # Deduped, order-preserving union of chunk outputs.
+        assert result == ["단어1", "단어2", "단어3", "단어4"]
+
+    def test_short_input_remains_one_call(self, mocker) -> None:
+        mocker.patch(
+            "ankigen.extractor.split_text_for_extraction",
+            return_value=["one chunk"],
+        )
+        mock_generate = mocker.patch(
+            "ankigen.extractor.generate_structured_response",
+            return_value=VocabularyResponse(words=["甲", "乙"]),
+        )
+        identify_vocabulary("短文本", lang="zh")
+        assert mock_generate.call_count == 1
+
+    def test_korean_hanja_annotation_wins_over_bare(self, mocker) -> None:
+        """Across chunks, a `한글(漢字)` form upgrades a previously bare form."""
+        mocker.patch(
+            "ankigen.extractor.split_text_for_extraction",
+            return_value=["A", "B"],
+        )
+
+        mocker.patch(
+            "ankigen.extractor.generate_structured_response",
+            side_effect=[
+                VocabularyResponse(words=["음식"]),  # bare first
+                VocabularyResponse(words=["음식(飮食)"]),  # annotated later
+            ],
+        )
+
+        result = identify_vocabulary("doc", lang="ko")
+        assert result == ["음식(飮食)"]
+
+
 class TestExtractVocabularyFromFile:
     """Tests for the main extraction entry point."""
 

@@ -1,0 +1,407 @@
+"""Backfill weak fields on Anki vocab notes flagged by :mod:`ankigen.audit`.
+
+Reads an audit JSONL file, regenerates **only the flagged fields** for each
+note via the existing helpers (:func:`translate_word`, :func:`generate_sentences`,
+:func:`resolve_hanja`, :func:`get_jyutping`), and writes one Anki-importable
+TSV per note type. The TSVs carry a ``#guid column`` header directive so
+Anki updates the original notes by GUID — duplicate headwords and
+homographs are handled correctly.
+
+The headword field (``Korean`` / ``Hanzi``) is treated as immutable and
+never overwritten. Only the columns whose audit reasons appear in the
+JSONL are recomputed; every other column is passed through verbatim.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from collections.abc import Callable
+from pathlib import Path
+from typing import NamedTuple
+
+from ankigen.audit import (
+    AuditedNote,
+    read_audit_jsonl,
+)
+from ankigen.cleaner import parse_hanja_token
+from ankigen.formatter import format_sentences
+from ankigen.hanja_lookup import resolve_hanja
+from ankigen.llm import generate_sentences, translate_word
+
+logger = logging.getLogger("ankigen.backfill")
+
+
+# ---------------------------------------------------------------------------
+# Inverse of `format_sentences` — strip the blue/red spans back to plain text
+# ---------------------------------------------------------------------------
+
+
+_BR_SPLIT_RE = re.compile(r"<br\s*/?>", flags=re.IGNORECASE)
+_ANY_SPAN_RE = re.compile(r"<span[^>]*>|</span>", flags=re.IGNORECASE)
+
+
+def split_sentences_from_html(html: str) -> list[str]:
+    """Return the raw sentence strings from a ``format_sentences`` output.
+
+    Sentences are separated by ``<br>`` (a single sentence may carry
+    multiple alternating blue/red spans because the keyword interrupts
+    the outer blue span — see :func:`ankigen.formatter.format_sentences`).
+    For each ``<br>``-delimited piece we strip every ``<span ...>`` /
+    ``</span>`` tag so the inner red-span keyword is rejoined with the
+    blue-span context, then trim and drop empties.
+
+    Round-trip property (tested in `tests/test_backfill.py`):
+
+        ``split_sentences_from_html(format_sentences(numbered, kw)) == sentences``
+
+    for any ``sentences`` and ``kw``, where ``numbered`` is
+    ``"1. s1 2. s2 ..."`` and each sentence has had its leading number
+    stripped (``format_sentences`` removes ``\\d+\\. `` prefixes).
+    """
+    if not html.strip():
+        return []
+    sentences: list[str] = []
+    for piece in _BR_SPLIT_RE.split(html):
+        body = _ANY_SPAN_RE.sub("", piece).strip()
+        if body:
+            sentences.append(body)
+    return sentences
+
+
+# ---------------------------------------------------------------------------
+# Per-note backfill
+# ---------------------------------------------------------------------------
+
+
+class _Backfilled(NamedTuple):
+    """A note ready to write as one TSV row.
+
+    Carries everything the writer needs (notetype, deck, guid, ordered
+    fields) plus the original model id for grouping by note type.
+    """
+
+    mid: int
+    model_name: str
+    deck_name: str  # caller-supplied; the JSONL only carries `deck_id`
+    guid: str
+    field_order: list[str]
+    fields: dict[str, str]
+
+
+def _resolve_hanja_local(korean: str) -> str:
+    """Strip an inline ``한글(漢字)`` annotation, then apply local Hanja resolution.
+
+    Mirrors the ``inline_hanja → embedded → LLM`` cascade in
+    :func:`ankigen.cli.process_word`, but stops at the local tier (the LLM
+    branch is reached via the separate ``empty_hanja_optional`` rule which
+    calls :func:`translate_word` instead).
+    """
+    bare, inline = parse_hanja_token(korean)
+    local = resolve_hanja(bare, inline_hanja=inline)
+    return local
+
+
+def backfill_note(
+    entry: AuditedNote,
+    *,
+    target_sentences: int,
+    jyutping_resolver: Callable[[str], str] | None = None,
+) -> tuple[dict[str, str], list[str]]:
+    """Regenerate flagged fields and report which were touched.
+
+    Returns ``(new_fields, touched_field_names)`` so the caller can log
+    per-note progress without having to diff before/after itself. The
+    headword field is always passed through. Every other field is passed
+    through unless one of its reasons fires; when multiple reasons
+    target the same field, the actions are coalesced (e.g. for a Korean
+    card flagged with ``empty_english`` AND ``empty_hanja_optional`` we
+    issue exactly one :func:`translate_word` call and use both halves of
+    its result).
+
+    Field names come from ``entry.resolved`` (set at audit time, with
+    sensible defaults applied for old JSONLs that pre-date the resolver
+    — see :func:`ankigen.audit.read_audit_jsonl`).
+    """
+    lang = entry.lang
+    note = entry.note
+    resolved = entry.resolved
+    fields = dict(note.fields)
+    reason_codes = {r.code for r in entry.reasons}
+    touched: list[str] = []
+
+    def _set(field_name: str, value: str) -> None:
+        """Update ``fields[field_name]`` and remember it as touched."""
+        fields[field_name] = value
+        if field_name not in touched:
+            touched.append(field_name)
+
+    headword = fields.get(resolved.headword, "")
+
+    # ----- Hanja / Jyutping ------------------------------------------------
+    # Coalesce empty_hanja_optional + empty_english into a single LLM call.
+    needs_llm_translation = "empty_english" in reason_codes
+    needs_llm_hanja = "empty_hanja_optional" in reason_codes and lang == "ko"
+
+    translation_result = None
+    if needs_llm_translation or needs_llm_hanja:
+        translation_result = translate_word(headword, lang)
+
+    if lang == "ko":
+        if "missing_hanja_for_sino" in reason_codes:
+            new_hanja = _resolve_hanja_local(headword)
+            if new_hanja:
+                _set(resolved.secondary, new_hanja)
+            else:
+                # The deterministic resolver couldn't find anything despite
+                # the audit flagging — fall back to the LLM as a courtesy so
+                # the user isn't left with a still-blank cell.
+                if translation_result is None:
+                    translation_result = translate_word(headword, lang)
+                if translation_result.hanja:
+                    _set(resolved.secondary, translation_result.hanja)
+        elif needs_llm_hanja and translation_result is not None:
+            # `translation_result.hanja` is "" for native-Korean words; that's
+            # the right value to import (Anki will overwrite with empty,
+            # leaving the field blank — same as not flagging the note).
+            _set(resolved.secondary, translation_result.hanja)
+
+    elif lang == "zh" and "missing_jyutping" in reason_codes:
+        resolver = jyutping_resolver
+        if resolver is None:
+            from ankigen.cli import get_jyutping as _default_jyutping
+
+            resolver = _default_jyutping
+        _set(resolved.secondary, resolver(headword))
+
+    # ----- English ---------------------------------------------------------
+    if needs_llm_translation and translation_result is not None:
+        _set(resolved.english, translation_result.translation)
+
+    # ----- Sentences -------------------------------------------------------
+    sentence_field = resolved.sentence
+    existing_html = fields.get(sentence_field, "")
+
+    if "plain_text_sentences" in reason_codes:
+        # Pure re-format pass — no LLM call. Wrap the existing sentences in
+        # the standard spans (and add keyword highlighting).
+        existing_sentences = split_sentences_from_html(existing_html)
+        if existing_sentences:
+            numbered = " ".join(f"{i + 1}. {s}" for i, s in enumerate(existing_sentences))
+            _set(sentence_field, format_sentences(numbered, headword))
+
+    if "too_few_sentences" in reason_codes and target_sentences > 0:
+        existing_sentences = split_sentences_from_html(fields.get(sentence_field, ""))
+        needed = max(target_sentences - len(existing_sentences), 0)
+        if needed > 0:
+            try:
+                new_sentences = generate_sentences(headword, lang, needed)
+            except Exception as exc:  # noqa: BLE001 — provider SDKs raise heterogeneous types
+                logger.warning(
+                    "Sentence top-up failed for '%s' (%s); keeping %d existing sentence(s)",
+                    headword,
+                    exc,
+                    len(existing_sentences),
+                )
+                new_sentences = []
+            combined = existing_sentences + list(new_sentences)
+        else:
+            combined = existing_sentences
+
+        if combined:
+            numbered = " ".join(f"{i + 1}. {s}" for i, s in enumerate(combined))
+            _set(sentence_field, format_sentences(numbered, headword))
+
+    if (
+        "keyword_not_highlighted" in reason_codes
+        and "plain_text_sentences" not in reason_codes
+        and "too_few_sentences" not in reason_codes
+    ):
+        # The card already has the right number of sentences and is wrapped
+        # in spans, but the headword isn't highlighted (likely the user
+        # renamed the headword without re-running format_sentences). Strip
+        # and re-apply over the existing sentences.
+        existing_sentences = split_sentences_from_html(fields.get(sentence_field, ""))
+        if existing_sentences:
+            numbered = " ".join(f"{i + 1}. {s}" for i, s in enumerate(existing_sentences))
+            _set(sentence_field, format_sentences(numbered, headword))
+
+    # Headword sanity check — backfill must never overwrite it.
+    fields[resolved.headword] = headword
+    return fields, touched
+
+
+# ---------------------------------------------------------------------------
+# TSV writer
+# ---------------------------------------------------------------------------
+
+
+def _sanitize_for_tsv(value: str) -> str:
+    """Strip raw tabs/newlines that would break the Anki TSV importer.
+
+    The Anki importer treats literal tabs as column separators and literal
+    newlines as record separators even with ``#html:true``; downstream the
+    parser is happier if we replace them with their HTML escapes.
+    """
+    if not value:
+        return ""
+    return value.replace("\t", "&#9;").replace("\r\n", "<br>").replace("\n", "<br>")
+
+
+def write_update_tsvs(
+    backfilled: list[_Backfilled],
+    output_stem: Path,
+) -> list[Path]:
+    """Write one TSV per note type. Returns the list of paths written.
+
+    Output filenames follow ``{output_stem}__{slug(model_name)}.tsv`` so
+    multiple note types from the same audit JSONL don't collide.
+    """
+    if not backfilled:
+        logger.info("No notes to write — empty backfill batch")
+        return []
+
+    # Group by note type id; preserve insertion order for stable output.
+    groups: dict[int, list[_Backfilled]] = {}
+    for row in backfilled:
+        groups.setdefault(row.mid, []).append(row)
+
+    written: list[Path] = []
+    for mid, rows in groups.items():
+        model_name = rows[0].model_name or f"model_{mid}"
+        slug = _slugify(model_name)
+        out_path = output_stem.with_name(f"{output_stem.name}__{slug}.tsv")
+        # All rows in this group share the same note type, so they share a
+        # field_order. Use the first row's field_order as authoritative.
+        field_order = list(rows[0].field_order)
+        _write_one_tsv(out_path, model_name, rows, field_order)
+        written.append(out_path)
+    return written
+
+
+def _write_one_tsv(
+    path: Path,
+    model_name: str,
+    rows: list[_Backfilled],
+    field_order: list[str],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    header_columns = ["notetype", "deck", "guid", *field_order]
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        # Anki text-file import directives — `notetype column:1` etc. tell
+        # Anki to ignore the first N columns as metadata and update by GUID.
+        f.write("#separator:tab\n")
+        f.write("#html:true\n")
+        f.write("#notetype column:1\n")
+        f.write("#deck column:2\n")
+        f.write("#guid column:3\n")
+        f.write("#columns:" + "\t".join(header_columns) + "\n")
+        for row in rows:
+            values = [
+                _sanitize_for_tsv(model_name),
+                _sanitize_for_tsv(row.deck_name),
+                _sanitize_for_tsv(row.guid),
+            ]
+            for col in field_order:
+                values.append(_sanitize_for_tsv(row.fields.get(col, "")))
+            f.write("\t".join(values) + "\n")
+    logger.info("Wrote %d row(s) to %s", len(rows), path)
+
+
+def _slugify(model_name: str) -> str:
+    """Filesystem-friendly slug of an Anki note-type name."""
+    safe = "".join(c if c.isalnum() else "_" for c in model_name)
+    parts = [p for p in safe.split("_") if p]
+    return ("_".join(parts) or "model").lower()
+
+
+# ---------------------------------------------------------------------------
+# Top-level orchestration
+# ---------------------------------------------------------------------------
+
+
+def backfill_jsonl(
+    input_path: Path,
+    output_stem: Path,
+    *,
+    target_sentences: int = 3,
+    deck_name_for: Callable[[int], str] | None = None,
+    jyutping_resolver: Callable[[str], str] | None = None,
+) -> list[Path]:
+    """Read ``input_path``, regenerate flagged fields, write TSV(s) per model.
+
+    Args:
+        input_path: Path to the audit JSONL written by ``ankigen audit``.
+        output_stem: Path stem for output TSVs — e.g. ``outputs/ko/update``
+            yields ``outputs/ko/update__korean_vocab.tsv``.
+        target_sentences: Desired sentence count (mirrors the same flag on
+            the audit step; used when topping up ``too_few_sentences``).
+        deck_name_for: Optional callable mapping ``deck_id`` to deck name.
+            Anki uses the name in the ``#deck column`` directive to decide
+            where to place new notes; for *update* imports the deck of the
+            existing note wins, so when no resolver is supplied we fall
+            back to the literal string ``"deck"`` (a placeholder Anki will
+            simply log and ignore for matched updates).
+        jyutping_resolver: Override for the Jyutping helper (testability).
+    """
+    entries = read_audit_jsonl(input_path)
+    if not entries:
+        logger.info("No audit entries in %s — nothing to backfill", input_path)
+        return []
+
+    total = len(entries)
+    logger.info("Starting backfill of %d note(s) from %s", total, input_path)
+
+    backfilled: list[_Backfilled] = []
+    for idx, entry in enumerate(entries, start=1):
+        reason_codes = [r.code for r in entry.reasons]
+        try:
+            new_fields, touched = backfill_note(
+                entry,
+                target_sentences=target_sentences,
+                jyutping_resolver=jyutping_resolver,
+            )
+        except Exception as exc:  # noqa: BLE001 — log + skip per-note failures
+            logger.warning(
+                "[%d/%d] Backfill failed for guid=%s model=%r reasons=%s (%s) — skipping",
+                idx,
+                total,
+                entry.note.guid,
+                entry.note.model_name,
+                reason_codes,
+                exc,
+            )
+            continue
+
+        logger.info(
+            "[%d/%d] guid=%s model=%r reasons=%s → touched=%s",
+            idx,
+            total,
+            entry.note.guid,
+            entry.note.model_name,
+            reason_codes,
+            touched or ["(none)"],
+        )
+
+        deck_name = deck_name_for(entry.note.deck_id) if deck_name_for is not None else "deck"
+        backfilled.append(
+            _Backfilled(
+                mid=entry.note.mid,
+                model_name=entry.note.model_name,
+                deck_name=deck_name,
+                guid=entry.note.guid,
+                field_order=entry.note.field_order,
+                fields=new_fields,
+            )
+        )
+
+    logger.info("Backfill complete: %d of %d note(s) regenerated", len(backfilled), total)
+    return write_update_tsvs(backfilled, output_stem)
+
+
+__all__ = [
+    "backfill_jsonl",
+    "backfill_note",
+    "split_sentences_from_html",
+    "write_update_tsvs",
+]

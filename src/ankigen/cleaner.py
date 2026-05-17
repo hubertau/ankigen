@@ -25,6 +25,11 @@ PATTERNS = {
     "numbering": re.compile(r"^\s*\d+[\.\)]\s*"),
     # Bullet points: - word, • word, * word
     "bullets": re.compile(r"^\s*[-•\*]\s+"),
+    # Inline Hanja annotation: 한글(漢字) — parentheses contain ONLY CJK
+    # ideographs (Unified + Extension A + Compatibility) and whitespace.
+    "inline_hanja": re.compile(
+        r"\s*\(\s*([\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff][\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff\s]*)\s*\)\s*"
+    ),
 }
 
 # Language-specific character ranges for validation
@@ -32,6 +37,37 @@ LANGUAGE_CHARS = {
     "zh": re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]"),  # CJK Unified Ideographs
     "ko": re.compile(r"[\uac00-\ud7af\u1100-\u11ff]"),  # Hangul syllables and jamo
 }
+
+
+def extract_inline_hanja(text: str) -> tuple[str, str]:
+    """Split a string into ``(text_without_hanja_paren, hanja_or_empty)``.
+
+    Detects a ``한글(漢字)``-style annotation where the parenthesised content
+    is purely CJK ideographs (plus whitespace). When found, the parenthetical
+    is removed from ``text`` and its contents (whitespace-stripped) are
+    returned as the Hanja value.
+
+    Only the first such annotation is captured; any further matches are left
+    in place so the regular parenthetical-stripping step can deal with them.
+    """
+    match = PATTERNS["inline_hanja"].search(text)
+    if not match:
+        return text, ""
+
+    hanja = "".join(match.group(1).split())
+    cleaned = (text[: match.start()] + " " + text[match.end() :]).strip()
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    return cleaned, hanja
+
+
+def parse_hanja_token(token: str) -> tuple[str, str]:
+    """Parse a possibly-Hanja-annotated token (e.g. ``음식(飮食)``).
+
+    Returns ``(word, hanja)`` where ``word`` is the token with the Hanja
+    annotation removed and ``hanja`` is the captured Hanja string (or ``""``
+    if no inline Hanja was present).
+    """
+    return extract_inline_hanja(token)
 
 
 def clean_line(line: str, lang: Language) -> str | None:
@@ -43,42 +79,60 @@ def clean_line(line: str, lang: Language) -> str | None:
         lang: Target language code
 
     Returns:
-        Cleaned word/phrase, or None if line should be skipped
+        Cleaned word/phrase, or None if line should be skipped. For Korean
+        lines that include an inline ``한글(漢字)`` annotation the cleaned
+        result keeps that annotation in its canonical form so it round-trips
+        through downstream consumers.
     """
-    # Strip whitespace
-    cleaned = line.strip()
-
-    if not cleaned:
+    word, hanja = clean_line_with_hanja(line, lang)
+    if word is None:
         return None
+    if hanja:
+        return f"{word}({hanja})"
+    return word
 
-    # Remove numbering and bullets
+
+def clean_line_with_hanja(line: str, lang: Language) -> tuple[str | None, str]:
+    """Clean a single line and additionally return any captured inline Hanja.
+
+    For Korean (``lang == "ko"``), a trailing ``(漢字)`` annotation in the
+    input is split off before the general parenthetical-stripping step. For
+    Chinese (or any other language) ``hanja`` is always ``""``.
+
+    Returns:
+        ``(cleaned_word_or_None, hanja_or_empty)``.
+    """
+    cleaned = line.strip()
+    if not cleaned:
+        return None, ""
+
+    hanja = ""
+    if lang == "ko":
+        cleaned, hanja = extract_inline_hanja(cleaned)
+        if not cleaned and hanja:
+            return None, ""
+
     cleaned = PATTERNS["numbering"].sub("", cleaned)
     cleaned = PATTERNS["bullets"].sub("", cleaned)
 
-    # Remove comma-separated translations (most common format)
     cleaned = PATTERNS["comma_translation"].sub("", cleaned)
-
-    # Remove other translation separators
     cleaned = PATTERNS["semicolon_translation"].sub("", cleaned)
     cleaned = PATTERNS["colon_translation"].sub("", cleaned)
     cleaned = PATTERNS["dash_translation"].sub("", cleaned)
 
-    # Remove parenthetical annotations (pinyin, romaja, etc.)
     cleaned = PATTERNS["parenthetical"].sub("", cleaned)
 
-    # Final strip
     cleaned = cleaned.strip()
 
     if not cleaned:
-        return None
+        return None, ""
 
-    # Validate that the result contains target language characters
     lang_pattern = LANGUAGE_CHARS.get(lang)
     if lang_pattern and not lang_pattern.search(cleaned):
         logger.debug("Skipping line without %s characters: %s", lang, line.strip())
-        return None
+        return None, ""
 
-    return cleaned
+    return cleaned, hanja
 
 
 def clean_vocabulary_file(
@@ -112,17 +166,18 @@ def clean_vocabulary_file(
     skipped_invalid = 0
 
     for line in lines:
-        cleaned = clean_line(line, lang)
-        if cleaned is None:
+        word, hanja = clean_line_with_hanja(line, lang)
+        if word is None:
             if not line.strip():
                 skipped_empty += 1
             else:
                 skipped_invalid += 1
-        elif cleaned in seen:
+            continue
+        if word in seen:
             skipped_duplicate += 1
-        else:
-            cleaned_words.append(cleaned)
-            seen.add(cleaned)
+            continue
+        seen.add(word)
+        cleaned_words.append(f"{word}({hanja})" if hanja else word)
 
     logger.debug(
         "Cleaning stats: %d valid, %d empty, %d invalid, %d duplicates",
@@ -142,7 +197,13 @@ def clean_vocabulary_file(
 
     if exclude_words:
         before = len(cleaned_words)
-        cleaned_words = [w for w in cleaned_words if normalize_anki_term(w) not in exclude_words]
+        # Filter against Anki using the bare word (without the (漢字) annotation),
+        # but keep the annotated form in the returned list.
+        cleaned_words = [
+            w
+            for w in cleaned_words
+            if normalize_anki_term(parse_hanja_token(w)[0]) not in exclude_words
+        ]
         skipped_anki = before - len(cleaned_words)
         if skipped_anki:
             logger.info("Skipped %d words already present in Anki", skipped_anki)

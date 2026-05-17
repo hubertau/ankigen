@@ -1,5 +1,7 @@
 """Read vocabulary words from an Anki database for deduplication filtering."""
 
+from __future__ import annotations
+
 import json
 import logging
 import os
@@ -7,8 +9,10 @@ import sqlite3
 import tempfile
 import unicodedata
 import zipfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from ankigen.llm import Language
 
@@ -16,6 +20,24 @@ logger = logging.getLogger("ankigen.anki_db")
 
 # ASCII unit separator used by Anki to separate fields within a note
 _FIELD_SEP = chr(31)
+
+
+class AnkiNote(NamedTuple):
+    """A full Anki note read from a deck — used by the audit/backfill pipeline.
+
+    Unlike :func:`load_anki_words`, which returns only one field of each note
+    as a flat ``set[str]`` for dedup filtering, :class:`AnkiNote` keeps the
+    fields that matter for round-tripping a note back into Anki via a
+    GUID-keyed update CSV (see ``ankigen audit`` / ``ankigen backfill``).
+    """
+
+    nid: int  # notes.id
+    guid: str  # notes.guid (stable across syncs)
+    mid: int  # notes.mid (note type id)
+    model_name: str  # e.g. "Korean Vocab"
+    deck_id: int  # cards.did (deck of the first card)
+    fields: dict[str, str]  # field name -> value (NFC-normalised values)
+    field_order: list[str]  # field names in note-type order
 
 
 def normalize_anki_term(s: str) -> str:
@@ -89,28 +111,45 @@ def load_anki_words(
         Returns an empty set (with a warning) if the file is missing, the extension
         is unsupported, or the named deck is not found.
     """
-    db_path = Path(db_path).expanduser()
-
     if isinstance(field, int) and field < 0:
         logger.warning("Field index is negative (%d); using 0.", field)
         field = 0
 
-    if not db_path.exists():
-        logger.warning("Anki database not found: %s — skipping Anki filtering", db_path)
+    try:
+        with _open_collection(db_path) as conn:
+            return _extract_words(conn, deck_name, field)
+    except _CollectionOpenError:
         return set()
 
-    suffix = db_path.suffix.lower()
-    if suffix == ".apkg":
-        return _load_from_apkg(db_path, deck_name, field)
-    elif suffix in (".anki2", ".anki21"):
-        return _load_from_anki2(db_path, deck_name, field)
-    else:
-        logger.warning(
-            "Unrecognised Anki file extension '%s' for %s — expected .anki2 or .apkg",
-            suffix,
-            db_path,
-        )
-        return set()
+
+def load_anki_notes(db_path: Path, deck_name: str) -> list[AnkiNote]:
+    """Load full :class:`AnkiNote` records for every note in the deck.
+
+    Sub-decks (``deck_name + "::..."``) are included, mirroring
+    :func:`load_anki_words`. Supports ``.anki2``/``.anki21`` SQLite files and
+    ``.apkg`` zips (the embedded collection is extracted to a tempdir).
+
+    Returns an empty list (with a warning) if the file is missing, the
+    extension is unsupported, or the named deck is not found. The audit
+    pipeline treats "no notes" and "deck missing" alike: nothing to score.
+    """
+    try:
+        with _open_collection(db_path) as conn:
+            deck_ids = _get_deck_ids(conn, deck_name)
+            if not deck_ids:
+                logger.warning("Deck '%s' not found in Anki database", deck_name)
+                return []
+            notes = _get_notes_from_deck(conn, deck_ids)
+            sub_info = f" (+{len(deck_ids) - 1} sub-deck(s))" if len(deck_ids) > 1 else ""
+            logger.info(
+                "Loaded %d note(s) from Anki deck '%s'%s",
+                len(notes),
+                deck_name,
+                sub_info,
+            )
+            return notes
+    except _CollectionOpenError:
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -118,44 +157,80 @@ def load_anki_words(
 # ---------------------------------------------------------------------------
 
 
-def _load_from_anki2(db_path: Path, deck_name: str, field: int | str) -> set[str]:
-    """Open a .anki2/.anki21 SQLite file and extract words."""
+class _CollectionOpenError(Exception):
+    """Raised when ``_open_collection`` cannot return a usable connection.
+
+    Callers translate this into an empty result + a warning log line — the
+    warning has already been emitted by ``_open_collection`` itself, so the
+    caller only has to decide on the shape of "nothing" to return.
+    """
+
+
+@contextmanager
+def _open_collection(db_path: Path) -> Iterator[sqlite3.Connection]:
+    """Yield a read-only SQLite connection for a ``.anki2`` or ``.apkg`` file.
+
+    Handles the three common failure modes (missing file, unsupported
+    extension, unreadable zip / locked SQLite) by logging a warning and
+    raising :class:`_CollectionOpenError`. Callers convert that into an
+    empty result for the user-facing API.
+    """
+    db_path = Path(db_path).expanduser()
+
+    if not db_path.exists():
+        logger.warning("Anki database not found: %s — skipping Anki filtering", db_path)
+        raise _CollectionOpenError(str(db_path))
+
+    suffix = db_path.suffix.lower()
+    if suffix == ".apkg":
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            try:
+                with zipfile.ZipFile(db_path, "r") as zf:
+                    names = zf.namelist()
+                    if "collection.anki21" in names:
+                        inner_name = "collection.anki21"
+                    elif "collection.anki2" in names:
+                        inner_name = "collection.anki2"
+                    else:
+                        logger.warning(
+                            "No collection.anki2 or collection.anki21 found inside %s",
+                            db_path,
+                        )
+                        raise _CollectionOpenError(str(db_path))
+                    tmp_path = Path(tmp_dir) / inner_name
+                    with zf.open(inner_name) as src, open(tmp_path, "wb") as dst:
+                        dst.write(src.read())
+            except (zipfile.BadZipFile, KeyError, OSError) as exc:
+                logger.warning("Could not read .apkg file %s: %s", db_path, exc)
+                raise _CollectionOpenError(str(db_path)) from exc
+            try:
+                conn = sqlite3.connect(f"file:{tmp_path}?mode=ro", uri=True)
+            except sqlite3.OperationalError as exc:
+                logger.warning("Could not open Anki database inside %s: %s", db_path, exc)
+                raise _CollectionOpenError(str(db_path)) from exc
+            try:
+                yield conn
+            finally:
+                conn.close()
+        return
+
+    if suffix not in (".anki2", ".anki21"):
+        logger.warning(
+            "Unrecognised Anki file extension '%s' for %s — expected .anki2 or .apkg",
+            suffix,
+            db_path,
+        )
+        raise _CollectionOpenError(str(db_path))
+
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     except sqlite3.OperationalError as exc:
         logger.warning("Could not open Anki database %s: %s", db_path, exc)
-        return set()
-
+        raise _CollectionOpenError(str(db_path)) from exc
     try:
-        return _extract_words(conn, deck_name, field)
+        yield conn
     finally:
         conn.close()
-
-
-def _load_from_apkg(apkg_path: Path, deck_name: str, field: int | str) -> set[str]:
-    """Extract the embedded SQLite from a .apkg zip and read words from it."""
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        try:
-            with zipfile.ZipFile(apkg_path, "r") as zf:
-                names = zf.namelist()
-                if "collection.anki21" in names:
-                    inner_name = "collection.anki21"
-                elif "collection.anki2" in names:
-                    inner_name = "collection.anki2"
-                else:
-                    logger.warning(
-                        "No collection.anki2 or collection.anki21 found inside %s",
-                        apkg_path,
-                    )
-                    return set()
-                tmp_path = Path(tmp_dir) / inner_name
-                with zf.open(inner_name) as src, open(tmp_path, "wb") as dst:
-                    dst.write(src.read())
-        except (zipfile.BadZipFile, KeyError, OSError) as exc:
-            logger.warning("Could not read .apkg file %s: %s", apkg_path, exc)
-            return set()
-
-        return _load_from_anki2(tmp_path, deck_name, field)
 
 
 def _extract_words(conn: sqlite3.Connection, deck_name: str, field: int | str) -> set[str]:
@@ -354,3 +429,134 @@ def _get_words_from_deck(
             field,
         )
     return words
+
+
+def _get_model_schemas(conn: sqlite3.Connection) -> dict[int, tuple[str, list[str]]]:
+    """Return ``{mid: (model_name, [field_name, ...])}`` for every note type.
+
+    Mirrors :func:`_build_model_field_map`'s two-schema handling but returns
+    the ordered field list (needed when reconstructing a full note row).
+
+    Both schemas may coexist in some exports; if a model id appears in both
+    we keep the entry from whichever schema we read first (old schema wins
+    here to match the lookup order used by :func:`_build_model_field_map`).
+    """
+    result: dict[int, tuple[str, list[str]]] = {}
+
+    # Old schema: col.models JSON
+    try:
+        cursor = conn.execute("SELECT models FROM col LIMIT 1")
+        row = cursor.fetchone()
+        if row:
+            models_json: dict[str, Any] = json.loads(row[0])
+            for mid_str, model in models_json.items():
+                if not isinstance(model, dict):
+                    continue
+                name = str(model.get("name", ""))
+                flds = model.get("flds", [])
+                # Order by the explicit `ord` field; fall back to source order.
+                ordered = sorted(
+                    (f for f in flds if isinstance(f, dict) and "name" in f),
+                    key=lambda f: (int(f.get("ord", 0)),),
+                )
+                field_names = [str(f["name"]) for f in ordered]
+                try:
+                    result[int(mid_str)] = (name, field_names)
+                except (TypeError, ValueError):
+                    continue
+    except (sqlite3.OperationalError, json.JSONDecodeError, KeyError, TypeError):
+        pass
+
+    # New schema: standalone `notetypes` + `fields` tables. Even if the old
+    # JSON path populated some models, we re-scan here so models that ONLY
+    # exist in the new schema also get a name + field list.
+    notetype_names: dict[int, str] = {}
+    try:
+        cursor = conn.execute("SELECT id, name FROM notetypes")
+        for ntid, nname in cursor:
+            notetype_names[int(ntid)] = str(nname)
+    except sqlite3.OperationalError:
+        pass
+
+    fields_by_mid: dict[int, list[tuple[int, str]]] = {}
+    try:
+        cursor = conn.execute("SELECT ntid, ord, name FROM fields")
+        for ntid, ord_, fname in cursor:
+            fields_by_mid.setdefault(int(ntid), []).append((int(ord_), str(fname)))
+    except sqlite3.OperationalError:
+        pass
+
+    for ntid, pairs in fields_by_mid.items():
+        if ntid in result:
+            continue
+        pairs.sort(key=lambda p: p[0])
+        result[ntid] = (notetype_names.get(ntid, ""), [name for _, name in pairs])
+
+    return result
+
+
+def _get_notes_from_deck(conn: sqlite3.Connection, deck_ids: set[int]) -> list[AnkiNote]:
+    """Return all notes whose first card belongs to one of ``deck_ids``.
+
+    Each note appears at most once even if it has multiple cards in the
+    deck (we ``GROUP BY n.id`` and take the ``MIN(c.did)`` to pick a stable
+    representative deck). Notes whose ``mid`` is not in the model schema
+    cache are still returned with ``model_name=""`` and a positional
+    field list (``"field0"``, ``"field1"``, ...) so callers can at least
+    look at the raw values.
+    """
+    if not deck_ids:
+        return []
+
+    schemas = _get_model_schemas(conn)
+    placeholders = ",".join("?" * len(deck_ids))
+    params = tuple(deck_ids)
+
+    try:
+        cursor = conn.execute(
+            f"""
+            SELECT n.id, n.guid, n.mid, n.flds, MIN(c.did) AS did
+            FROM notes n
+            JOIN cards c ON c.nid = n.id
+            WHERE c.did IN ({placeholders})
+            GROUP BY n.id, n.guid, n.mid, n.flds
+            """,
+            params,
+        )
+    except sqlite3.OperationalError as exc:
+        logger.warning("Error querying Anki notes: %s", exc)
+        return []
+
+    notes: list[AnkiNote] = []
+    for nid, guid, mid, flds, did in cursor:
+        raw_values = flds.split(_FIELD_SEP) if flds else []
+        normalized = [unicodedata.normalize("NFC", v) for v in raw_values]
+        schema = schemas.get(int(mid))
+        if schema is None:
+            field_order = [f"field{i}" for i in range(len(normalized))]
+            model_name = ""
+        else:
+            model_name, schema_fields = schema
+            # If the note has more fields than the schema declares (shouldn't
+            # happen with healthy collections), keep the extras with positional
+            # placeholder names so we don't lose data.
+            if len(schema_fields) >= len(normalized):
+                field_order = list(schema_fields[: len(normalized)])
+            else:
+                field_order = list(schema_fields) + [
+                    f"field{i}" for i in range(len(schema_fields), len(normalized))
+                ]
+
+        fields = dict(zip(field_order, normalized, strict=False))
+        notes.append(
+            AnkiNote(
+                nid=int(nid),
+                guid=str(guid),
+                mid=int(mid),
+                model_name=model_name,
+                deck_id=int(did),
+                fields=fields,
+                field_order=field_order,
+            )
+        )
+    return notes

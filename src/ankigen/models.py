@@ -28,6 +28,23 @@ class TranslationResponse(BaseModel):
     )
 
 
+class KoreanTranslationResponse(BaseModel):
+    """Response model for Korean word translation that also returns Hanja."""
+
+    translation: str = Field(
+        ...,
+        description="English translation of the Korean word, including part of speech and multiple meanings if applicable",
+    )
+    hanja: str = Field(
+        default="",
+        description=(
+            "The canonical Hanja (Chinese-character) form of the word if it is "
+            "Sino-Korean. Use the most common single Hanja spelling without spaces. "
+            "Return an empty string for native-Korean words that have no Hanja."
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Grammar models
 # ---------------------------------------------------------------------------
@@ -69,6 +86,15 @@ class GrammarItem(BaseModel):
         description=(
             "1-3 sentence usage notes. Prefer copying the teacher's notes "
             "verbatim if the source document explains the pattern."
+        ),
+    )
+    hanja: str = Field(
+        default="",
+        description=(
+            "Optional Hanja annotation for any Sino-Korean roots inside the "
+            "pattern (e.g. '博士 課程 中' for '박사 과정 중'). Leave empty when "
+            "the pattern contains no Sino-Korean noun roots or has no canonical "
+            "Hanja form. Only populated for Korean."
         ),
     )
     examples: list[GrammarExample] = Field(

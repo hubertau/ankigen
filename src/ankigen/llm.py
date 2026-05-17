@@ -5,6 +5,9 @@ import logging
 import os
 import re
 import time
+from collections import deque
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Literal
 
 import instructor
@@ -13,12 +16,28 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from pydantic import BaseModel
 
+from ankigen.chunking import estimate_tokens
 from ankigen.models import (
     GrammarExample,
+    KoreanTranslationResponse,
     TranslationResponse,
     create_grammar_example_response,
     create_sentence_response,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class TranslationResult:
+    """Return shape for :func:`translate_word`.
+
+    ``hanja`` is always ``""`` for Chinese; for Korean it carries the
+    canonical Hanja form when the word is Sino-Korean, or ``""`` for native
+    Korean words.
+    """
+
+    translation: str
+    hanja: str = ""
+
 
 logger = logging.getLogger("ankigen.llm")
 
@@ -81,7 +100,15 @@ LANGUAGE_CONFIG = {
     "ko": {
         "name": "Korean",
         "sentence_prompt": "Generate exactly {num_sentences} natural example sentences in Korean using the word '{word}'. The sentences should demonstrate different usages and contexts of the word. Return only the sentences, no translations or explanations.",
-        "translation_prompt": "Translate the Korean word '{word}' to English. Include the part of speech and any common meanings or usages. Do NOT include romanization or the original Korean characters. Be concise.",
+        "translation_prompt": (
+            "Translate the Korean word '{word}' to English. Include the part of speech "
+            "and any common meanings or usages. Do NOT include romanization or the "
+            "original Korean characters in the translation. Be concise.\n\n"
+            "Also return the canonical Hanja (Chinese-character) form of the word in "
+            "the `hanja` field IF the word is Sino-Korean. Use the most common single "
+            "Hanja spelling, no spaces, no parentheses, no Hangul. Return an empty "
+            "string for native-Korean words that have no Hanja."
+        ),
         "grammar_extraction_system": (
             "You are a Korean language expert helping a learner build Anki grammar cards "
             "from a teacher's class notes. Identify each distinct grammatical construction "
@@ -92,7 +119,11 @@ LANGUAGE_CONFIG = {
             "Korean, alongside any English translations the teacher provides. Keep the "
             "explanation short (1-3 sentences) and prefer the teacher's wording when present. "
             "Return the canonical Korean pattern as the `pattern` field — never English. "
-            "Use a leading '~' for endings/particles when appropriate (e.g. '~게 되다')."
+            "Use a leading '~' for endings/particles when appropriate (e.g. '~게 되다'). "
+            "When the pattern contains Sino-Korean noun roots (e.g. 박사, 과정, 중, 이유), "
+            "set the `hanja` field to their canonical Hanja form (e.g. '博士 課程 中', "
+            "'理由'); leave `hanja` empty for purely grammatical endings/particles or "
+            "native-Korean content."
         ),
         "grammar_extraction_user": (
             "Extract every grammatical construction taught in this Korean class-notes "
@@ -201,6 +232,243 @@ def _extract_json_payload(text: str) -> str:
     return stripped
 
 
+# ---------------------------------------------------------------------------
+# Rate-limit plumbing
+#
+# Three layers, all invoked from ``generate_structured_response``:
+#
+# 1. ``_TokenBucket`` — rolling 60-second window of ``(timestamp, tokens)``
+#    events. Before each call we ask whether sending ``estimate`` extra
+#    tokens would push the recent sum above ``ANKIGEN_LLM_RATE_LIMIT_TPM``;
+#    if so we sleep until the oldest entry falls out of the window.
+# 2. ``_RequestBucket`` — sibling rolling 60-second window of request
+#    timestamps, gated by ``ANKIGEN_LLM_RATE_LIMIT_RPM`` (default 50).
+#    Protects against bursty per-card backfill loops that send small
+#    prompts (low tokens, high request count).
+# 3. ``_with_429_retry`` — backstop in case the proactive estimates are off
+#    or the provider counts tokens/requests differently. Retries
+#    ``ANKIGEN_LLM_MAX_RETRIES`` times with exponential backoff.
+# ---------------------------------------------------------------------------
+
+
+_DEFAULT_TPM = 30_000
+_DEFAULT_RPM = 50
+_DEFAULT_MAX_RETRIES = 4
+_WINDOW_SECONDS = 60.0
+
+
+class _TokenBucket:
+    """Tracks the running token cost over the past ``window`` seconds."""
+
+    def __init__(self, window: float = _WINDOW_SECONDS) -> None:
+        self._window = window
+        self._events: deque[tuple[float, int]] = deque()
+
+    def _purge(self, now: float) -> None:
+        cutoff = now - self._window
+        while self._events and self._events[0][0] <= cutoff:
+            self._events.popleft()
+
+    def recent_tokens(self, now: float | None = None) -> int:
+        now = time.monotonic() if now is None else now
+        self._purge(now)
+        return sum(tokens for _, tokens in self._events)
+
+    def sleep_needed(self, estimate: int, tpm_limit: int, now: float | None = None) -> float:
+        """How long to sleep before adding ``estimate`` tokens stays under ``tpm_limit``.
+
+        Returns ``0`` when there's room. Returns ``self._window`` (or less) when
+        the bucket is currently saturated; the caller is expected to sleep that
+        long, then proceed.
+        """
+        if tpm_limit <= 0:
+            return 0.0
+        now = time.monotonic() if now is None else now
+        self._purge(now)
+        running = sum(tokens for _, tokens in self._events)
+        if running + estimate <= tpm_limit:
+            return 0.0
+        # Oldest event is the first one to fall out of the window.
+        oldest_ts, _ = self._events[0]
+        # Sleep until that event falls out of the rolling window, plus a tiny
+        # safety margin so we don't immediately re-trip the same boundary.
+        return max(0.0, self._window - (now - oldest_ts) + 0.5)
+
+    def record(self, tokens: int, now: float | None = None) -> None:
+        if tokens <= 0:
+            return
+        now = time.monotonic() if now is None else now
+        self._events.append((now, tokens))
+
+    def reset(self) -> None:
+        self._events.clear()
+
+
+class _RequestBucket:
+    """Tracks the running request count over the past ``window`` seconds.
+
+    Each ``record()`` call appends a timestamp; ``sleep_needed`` reports
+    how long the caller has to wait before adding a new request would
+    keep the count at or below ``rpm_limit``. The window is shared with
+    :class:`_TokenBucket`'s window length so both buckets agree on what
+    "the last minute" means.
+    """
+
+    def __init__(self, window: float = _WINDOW_SECONDS) -> None:
+        self._window = window
+        self._events: deque[float] = deque()
+
+    def _purge(self, now: float) -> None:
+        cutoff = now - self._window
+        while self._events and self._events[0] <= cutoff:
+            self._events.popleft()
+
+    def recent_requests(self, now: float | None = None) -> int:
+        now = time.monotonic() if now is None else now
+        self._purge(now)
+        return len(self._events)
+
+    def sleep_needed(self, rpm_limit: int, now: float | None = None) -> float:
+        """How long to sleep before issuing one more request stays under ``rpm_limit``."""
+        if rpm_limit <= 0:
+            return 0.0
+        now = time.monotonic() if now is None else now
+        self._purge(now)
+        if len(self._events) < rpm_limit:
+            return 0.0
+        # We're at or above the ceiling — sleep until the oldest event falls
+        # out of the window so the count drops below `rpm_limit`.
+        oldest_ts = self._events[0]
+        return max(0.0, self._window - (now - oldest_ts) + 0.5)
+
+    def record(self, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        self._events.append(now)
+
+    def reset(self) -> None:
+        self._events.clear()
+
+
+# Module-level singletons. Reset between tests via :func:`_reset_token_bucket`.
+_token_bucket = _TokenBucket()
+_request_bucket = _RequestBucket()
+
+
+def _reset_token_bucket() -> None:
+    """Test-only helper to clear the rolling-window state (both buckets)."""
+    _token_bucket.reset()
+    _request_bucket.reset()
+
+
+def _get_tpm_limit() -> int:
+    raw = os.getenv("ANKIGEN_LLM_RATE_LIMIT_TPM")
+    if not raw:
+        return _DEFAULT_TPM
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid ANKIGEN_LLM_RATE_LIMIT_TPM=%r; using default %d", raw, _DEFAULT_TPM)
+        return _DEFAULT_TPM
+    return max(0, value)
+
+
+def _get_rpm_limit() -> int:
+    raw = os.getenv("ANKIGEN_LLM_RATE_LIMIT_RPM")
+    if not raw:
+        return _DEFAULT_RPM
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid ANKIGEN_LLM_RATE_LIMIT_RPM=%r; using default %d", raw, _DEFAULT_RPM)
+        return _DEFAULT_RPM
+    return max(0, value)
+
+
+def _get_max_retries() -> int:
+    raw = os.getenv("ANKIGEN_LLM_MAX_RETRIES")
+    if not raw:
+        return _DEFAULT_MAX_RETRIES
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid ANKIGEN_LLM_MAX_RETRIES=%r; using default %d", raw, _DEFAULT_MAX_RETRIES
+        )
+        return _DEFAULT_MAX_RETRIES
+    return max(0, value)
+
+
+def _throttle_for_tokens(estimate: int) -> None:
+    """Sleep proactively if either the TPM **or** RPM ceiling would be breached.
+
+    We compute both wait times and sleep for whichever is longer — that's
+    enough to keep us under both ceilings. ``estimate`` is the projected
+    token cost of the upcoming call; the request bucket only needs to
+    know that one more call is coming, not how big it is.
+    """
+    tpm = _get_tpm_limit()
+    rpm = _get_rpm_limit()
+    tpm_wait = _token_bucket.sleep_needed(estimate, tpm) if tpm > 0 else 0.0
+    rpm_wait = _request_bucket.sleep_needed(rpm) if rpm > 0 else 0.0
+    sleep_for = max(tpm_wait, rpm_wait)
+    if sleep_for <= 0:
+        return
+
+    # Log the dimension that actually drove the pause so the user can
+    # tell whether they're being throttled on tokens or on request count.
+    if rpm_wait >= tpm_wait:
+        logger.info(
+            "Rate limit pacing: sleeping %.1fs (request count %d/%d in last 60s)",
+            sleep_for,
+            _request_bucket.recent_requests(),
+            rpm,
+        )
+    else:
+        logger.info(
+            "Rate limit pacing: sleeping %.1fs (estimated %d tokens for next call, "
+            "%d/%d in last 60s)",
+            sleep_for,
+            estimate,
+            _token_bucket.recent_tokens(),
+            tpm,
+        )
+    time.sleep(sleep_for)
+
+
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    """Best-effort detection of a 429 / rate-limit error across SDKs."""
+    name = exc.__class__.__name__.lower()
+    if "ratelimit" in name:
+        return True
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    if status == 429:
+        return True
+    message = str(exc).lower()
+    return "rate limit" in message or "429" in message or "tokens per minute" in message
+
+
+def _with_429_retry[T](fn: Callable[[], T]) -> T:
+    """Run ``fn``; on rate-limit errors, sleep and retry with exponential backoff."""
+    max_retries = _get_max_retries()
+    attempt = 0
+    while True:
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001 — provider SDKs raise heterogeneous types
+            if not _is_rate_limit_error(exc) or attempt >= max_retries:
+                raise
+            backoff = min(5.0 * (3.0**attempt), 90.0)
+            logger.warning(
+                "Rate-limit error from provider (attempt %d/%d): %s — retrying in %.1fs",
+                attempt + 1,
+                max_retries,
+                exc,
+                backoff,
+            )
+            time.sleep(backoff)
+            attempt += 1
+
+
 def generate_structured_response[ResponseModelT: BaseModel](
     *,
     response_model: type[ResponseModelT],
@@ -210,39 +478,58 @@ def generate_structured_response[ResponseModelT: BaseModel](
 ) -> ResponseModelT:
     """
     Generate a structured response for either OpenAI-compatible or Anthropic providers.
+
+    Calls are paced against both ``ANKIGEN_LLM_RATE_LIMIT_TPM`` (rolling-60s
+    token bucket, default 30k) and ``ANKIGEN_LLM_RATE_LIMIT_RPM`` (rolling-60s
+    request bucket, default 50) and retried on rate-limit errors up to
+    ``ANKIGEN_LLM_MAX_RETRIES`` times with exponential backoff.
     """
     provider = get_provider()
     model = get_model()
 
-    if provider == "anthropic":
-        schema = json.dumps(response_model.model_json_schema(), ensure_ascii=False)
-        anthropic_client = get_anthropic_client()
-        response = anthropic_client.messages.create(
+    # Estimate tokens for the proactive bucket: prompts + the worst-case reply
+    # budget. The estimator is intentionally conservative (upper bound).
+    estimate = estimate_tokens(system_prompt) + estimate_tokens(user_prompt) + max_tokens
+    _throttle_for_tokens(estimate)
+
+    def _call() -> ResponseModelT:
+        if provider == "anthropic":
+            schema = json.dumps(response_model.model_json_schema(), ensure_ascii=False)
+            anthropic_client = get_anthropic_client()
+            response = anthropic_client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=(
+                    f"{system_prompt}\n\n"
+                    "Return ONLY a valid JSON object with no markdown fences.\n"
+                    f"JSON schema:\n{schema}"
+                ),
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+
+            text_blocks = [block.text for block in response.content if block.type == "text"]
+            raw_text = "\n".join(text_blocks).strip()
+            return response_model.model_validate_json(_extract_json_payload(raw_text))
+
+        openai_client = get_client()
+        # instructor dynamically patches return types from response_model;
+        # generic type inference is limited for static analysis.
+        return openai_client.chat.completions.create(  # type: ignore[no-any-return]
             model=model,
-            max_tokens=max_tokens,
-            system=(
-                f"{system_prompt}\n\n"
-                "Return ONLY a valid JSON object with no markdown fences.\n"
-                f"JSON schema:\n{schema}"
-            ),
-            messages=[{"role": "user", "content": user_prompt}],
+            response_model=response_model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
         )
 
-        text_blocks = [block.text for block in response.content if block.type == "text"]
-        raw_text = "\n".join(text_blocks).strip()
-        return response_model.model_validate_json(_extract_json_payload(raw_text))
-
-    openai_client = get_client()
-    # instructor dynamically patches return types from response_model;
-    # generic type inference is limited for static analysis.
-    return openai_client.chat.completions.create(  # type: ignore[no-any-return]
-        model=model,
-        response_model=response_model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    )
+    try:
+        return _with_429_retry(_call)
+    finally:
+        # Record the estimate either way — a failed-but-retried call still
+        # consumed tokens (and one request) against the provider's bucket.
+        _token_bucket.record(estimate)
+        _request_bucket.record()
 
 
 def generate_sentences(word: str, lang: Language = "zh", num_sentences: int = 3) -> list[str]:
@@ -281,16 +568,21 @@ def generate_sentences(word: str, lang: Language = "zh", num_sentences: int = 3)
     return sentences  # type: ignore[no-any-return]
 
 
-def translate_word(word: str, lang: Language = "zh") -> str:
+def translate_word(word: str, lang: Language = "zh") -> TranslationResult:
     """
     Translate a word to English using the LLM.
+
+    For Korean, the LLM is also asked for the canonical Hanja form so we can
+    avoid a second API round-trip; the returned ``hanja`` is ``""`` when the
+    word has no Sino-Korean origin. For Chinese, ``hanja`` is always ``""``.
 
     Args:
         word: The vocabulary word to translate
         lang: Language code ('zh' for Chinese, 'ko' for Korean)
 
     Returns:
-        English translation with part of speech
+        :class:`TranslationResult` with the English translation and optional
+        Hanja form.
     """
     model = get_model()
     config = LANGUAGE_CONFIG[lang]
@@ -298,25 +590,36 @@ def translate_word(word: str, lang: Language = "zh") -> str:
     logger.debug("Translating '%s' (%s) using %s", word, lang, model)
     start_time = time.time()
 
-    response = generate_structured_response(
-        response_model=TranslationResponse,
-        system_prompt=(
-            f"You are a {config['name']}-English translator. "
-            "Provide accurate, concise translations."
-        ),
-        user_prompt=config["translation_prompt"].format(word=word),
-    )
+    if lang == "ko":
+        ko_response = generate_structured_response(
+            response_model=KoreanTranslationResponse,
+            system_prompt=(
+                f"You are a {config['name']}-English translator. "
+                "Provide accurate, concise translations and include Hanja for Sino-Korean words."
+            ),
+            user_prompt=config["translation_prompt"].format(word=word),
+        )
+        translation = ko_response.translation  # type: ignore[attr-defined]
+        hanja = ko_response.hanja or ""  # type: ignore[attr-defined]
+    else:
+        zh_response = generate_structured_response(
+            response_model=TranslationResponse,
+            system_prompt=(
+                f"You are a {config['name']}-English translator. "
+                "Provide accurate, concise translations."
+            ),
+            user_prompt=config["translation_prompt"].format(word=word),
+        )
+        translation = zh_response.translation  # type: ignore[attr-defined]
+        hanja = ""
 
     elapsed = time.time() - start_time
-    # instructor dynamically patches the return type based on response_model,
-    # but mypy can't infer this at static analysis time
-    translation = response.translation  # type: ignore[attr-defined]
     logger.debug(
         "Translation completed in %.2fs: %s",
         elapsed,
         translation[:50] if len(translation) > 50 else translation,
     )
-    return translation  # type: ignore[no-any-return]
+    return TranslationResult(translation=translation, hanja=hanja.strip())
 
 
 def generate_grammar_examples(
