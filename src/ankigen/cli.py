@@ -983,13 +983,11 @@ def cmd_status(args: argparse.Namespace) -> None:
     print(f"   Retention: {'forever' if retention < 0 else f'{retention} days'}")
 
     print("\nANKI FILTERING (extract / clean / generate):")
-    if not os.environ.get("ANKIGEN_ANKI_DB", "").strip():
+    db_path = get_anki_db_path()
+    if db_path is None:
         print("   ANKIGEN_ANKI_DB: (not set)")
     else:
-        db_path = get_anki_db_path()
-        suffix = ""
-        if db_path is not None:
-            suffix = " — file exists" if db_path.exists() else " — file not found"
+        suffix = " — file exists" if db_path.exists() else " — file not found"
         print(f"   ANKIGEN_ANKI_DB: {db_path}{suffix}")
     for lang in _STATUS_LANG_CODES:
         deck = get_anki_deck_name(lang)
