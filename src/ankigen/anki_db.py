@@ -152,6 +152,21 @@ def load_anki_notes(db_path: Path, deck_name: str) -> list[AnkiNote]:
         return []
 
 
+def load_deck_names(db_path: Path) -> dict[int, str]:
+    """Return a ``{deck_id: deck_name}`` map from the Anki collection.
+
+    Used by ``ankigen backfill`` to put the real deck name in the TSV
+    ``#deck column`` instead of the literal ``"deck"`` placeholder, so Anki
+    files any newly-created notes — and logs matched updates — under the
+    correct deck. Returns an empty dict if the file is missing/unsupported.
+    """
+    try:
+        with _open_collection(db_path) as conn:
+            return _get_all_deck_names(conn)
+    except _CollectionOpenError:
+        return {}
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -295,6 +310,35 @@ def _get_deck_ids(conn: sqlite3.Connection, deck_name: str) -> set[int]:
         pass
 
     return ids
+
+
+def _get_all_deck_names(conn: sqlite3.Connection) -> dict[int, str]:
+    """Return every ``{deck_id: name}`` pair, handling both schema variants."""
+    names: dict[int, str] = {}
+
+    # New schema first (Anki 2.1.50+): standalone decks table.
+    try:
+        cursor = conn.execute("SELECT id, name FROM decks")
+        for did, name in cursor:
+            names[int(did)] = name
+        if names:
+            return names
+    except sqlite3.OperationalError:
+        pass  # Old schema — no decks table
+
+    # Old schema: col.decks is a JSON dict of {id_str: {name: str, ...}}.
+    try:
+        cursor = conn.execute("SELECT decks FROM col LIMIT 1")
+        row = cursor.fetchone()
+        if row:
+            decks_json: dict[str, Any] = json.loads(row[0])
+            for did_str, info in decks_json.items():
+                if isinstance(info, dict):
+                    names[int(did_str)] = info.get("name", "")
+    except (sqlite3.OperationalError, json.JSONDecodeError, KeyError):
+        pass
+
+    return names
 
 
 def _build_model_field_map(conn: sqlite3.Connection, field_name: str) -> dict[int, int]:

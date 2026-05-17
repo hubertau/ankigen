@@ -32,6 +32,7 @@ import csv
 import logging
 import os
 import sys
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import cast
@@ -42,6 +43,7 @@ from ankigen.anki_db import (
     get_anki_field,
     load_anki_notes,
     load_anki_words,
+    load_deck_names,
     normalize_anki_term,
 )
 from ankigen.audit import (
@@ -959,10 +961,23 @@ def cmd_backfill(args: argparse.Namespace) -> None:
         inferred_lang = peek_audit_lang(args.input_file)
         output_stem = _default_backfill_output_stem(args.input_file, inferred_lang)
 
+    # Resolve real deck names from the Anki DB so the TSV #deck column
+    # carries the note's actual deck instead of the literal "deck".
+    deck_name_for: Callable[[int], str] | None = None
+    db_path: Path | None = args.anki_db or get_anki_db_path()
+    if db_path is not None:
+        deck_names = load_deck_names(db_path)
+        if deck_names:
+
+            def deck_name_for(did: int) -> str:
+                return deck_names.get(did, "deck")
+
     paths = backfill_jsonl(
         args.input_file,
         output_stem,
         target_sentences=args.sentences,
+        deck_name_for=deck_name_for,
+        overwrite=args.overwrite,
     )
 
     if not paths:
@@ -1400,6 +1415,13 @@ def main() -> None:
             "inferred from the audit JSONL's first row."
         ),
     )
+    backfill_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        default=False,
+        help="Delete existing TSV(s) and regenerate all notes from scratch (default: resume).",
+    )
+    _add_anki_args(backfill_parser)
 
     # 'status' subcommand
     subparsers.add_parser(

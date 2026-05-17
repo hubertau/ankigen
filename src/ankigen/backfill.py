@@ -28,6 +28,7 @@ from ankigen.cleaner import parse_hanja_token
 from ankigen.formatter import BR_SPLIT_RE, format_sentences
 from ankigen.hanja_lookup import resolve_hanja
 from ankigen.llm import generate_sentences, translate_word
+from ankigen.resume import durable_write
 
 logger = logging.getLogger("ankigen.backfill")
 
@@ -283,6 +284,44 @@ def write_update_tsvs(
     return written
 
 
+def _tsv_done_guids(output_stem: Path) -> set[str]:
+    """Return GUIDs already written to any TSV for this output stem."""
+    done: set[str] = set()
+    for tsv in output_stem.parent.glob(f"{output_stem.name}__*.tsv"):
+        with open(tsv, encoding="utf-8", newline="") as f:
+            for line in f:
+                if line.startswith("#"):
+                    continue
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) >= 3 and parts[2]:
+                    done.add(parts[2])
+    return done
+
+
+def _write_backfilled_row(path: Path, row: _Backfilled) -> None:
+    """Append one row to ``path``, writing TSV directives first if the file is new."""
+    is_new = not path.exists()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w" if is_new else "a", encoding="utf-8", newline="") as f:
+        if is_new:
+            header_columns = ["notetype", "deck", "guid", *row.field_order]
+            f.write("#separator:tab\n")
+            f.write("#html:true\n")
+            f.write("#notetype column:1\n")
+            f.write("#deck column:2\n")
+            f.write("#guid column:3\n")
+            f.write("#columns:" + "\t".join(header_columns) + "\n")
+        values = [
+            _sanitize_for_tsv(row.model_name),
+            _sanitize_for_tsv(row.deck_name),
+            _sanitize_for_tsv(row.guid),
+        ]
+        for col in row.field_order:
+            values.append(_sanitize_for_tsv(row.fields.get(col, "")))
+        f.write("\t".join(values) + "\n")
+        durable_write(f)
+
+
 def _write_one_tsv(
     path: Path,
     model_name: str,
@@ -331,8 +370,14 @@ def backfill_jsonl(
     target_sentences: int = 3,
     deck_name_for: Callable[[int], str] | None = None,
     jyutping_resolver: Callable[[str], str] | None = None,
+    overwrite: bool = False,
 ) -> list[Path]:
     """Read ``input_path``, regenerate flagged fields, write TSV(s) per model.
+
+    Each row is fsynced to disk as it is produced so a hard kill loses at most
+    one note. On re-run the existing TSVs are scanned for already-written GUIDs
+    and those notes are skipped. Pass ``overwrite=True`` to delete existing TSVs
+    and regenerate everything from scratch.
 
     Args:
         input_path: Path to the audit JSONL written by ``ankigen audit``.
@@ -347,17 +392,33 @@ def backfill_jsonl(
             back to the literal string ``"deck"`` (a placeholder Anki will
             simply log and ignore for matched updates).
         jyutping_resolver: Override for the Jyutping helper (testability).
+        overwrite: If True, delete existing TSVs and regenerate all notes.
     """
     entries = read_audit_jsonl(input_path)
     if not entries:
         logger.info("No audit entries in %s — nothing to backfill", input_path)
         return []
 
+    if overwrite:
+        for tsv in output_stem.parent.glob(f"{output_stem.name}__*.tsv"):
+            tsv.unlink()
+        done_guids: set[str] = set()
+    else:
+        done_guids = _tsv_done_guids(output_stem)
+
+    if done_guids:
+        logger.info("Resuming: %d GUID(s) already written — skipping", len(done_guids))
+
     total = len(entries)
     logger.info("Starting backfill of %d note(s) from %s", total, input_path)
 
-    backfilled: list[_Backfilled] = []
+    new_count = 0
+    skip_count = 0
     for idx, entry in enumerate(entries, start=1):
+        if entry.note.guid in done_guids:
+            skip_count += 1
+            continue
+
         reason_codes = [r.code for r in entry.reasons]
         try:
             new_fields, touched = backfill_note(
@@ -388,19 +449,25 @@ def backfill_jsonl(
         )
 
         deck_name = deck_name_for(entry.note.deck_id) if deck_name_for is not None else "deck"
-        backfilled.append(
-            _Backfilled(
-                mid=entry.note.mid,
-                model_name=entry.note.model_name,
-                deck_name=deck_name,
-                guid=entry.note.guid,
-                field_order=entry.note.field_order,
-                fields=new_fields,
-            )
+        row = _Backfilled(
+            mid=entry.note.mid,
+            model_name=entry.note.model_name,
+            deck_name=deck_name,
+            guid=entry.note.guid,
+            field_order=entry.note.field_order,
+            fields=new_fields,
         )
+        slug = _slugify(row.model_name)
+        tsv_path = output_stem.with_name(f"{output_stem.name}__{slug}.tsv")
+        _write_backfilled_row(tsv_path, row)
+        new_count += 1
 
-    logger.info("Backfill complete: %d of %d note(s) regenerated", len(backfilled), total)
-    return write_update_tsvs(backfilled, output_stem)
+    logger.info(
+        "Backfill complete: %d new, %d skipped (already written)",
+        new_count,
+        skip_count,
+    )
+    return sorted(output_stem.parent.glob(f"{output_stem.name}__*.tsv"))
 
 
 __all__ = [
