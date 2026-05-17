@@ -13,7 +13,7 @@ Generate Anki vocabulary **and grammar** CSVs with LLM-powered example sentences
 - **Input cleaning**: Automatically remove translations, romanization, and annotations from input files
 - **Similarity review**: Scan an Anki deck (or word list) for near-duplicate, variant, and contained terms
 - **Audit & backfill**: Sweep an existing Anki deck for cards missing the current format (e.g. blank Hanja column, too few example sentences) and regenerate only the weak fields into a GUID-keyed Anki-update TSV
-- **Flexible providers**: OpenAI, Anthropic, OpenRouter, or local models (Ollama, vLLM)
+- **Flexible providers**: OpenAI, Anthropic, OpenRouter, DeepSeek, or local models (Ollama, vLLM)
 - **HTML formatting**: Keywords highlighted in red, sentences in blue
 - **Configurable**: Number of sentences, output paths, and more
 
@@ -37,7 +37,7 @@ cp .env.example .env
 Create a `.env` file with your settings:
 
 ```bash
-# LLM Provider: openai, anthropic, openrouter, or local
+# LLM Provider: openai, anthropic, openrouter, deepseek, or local
 LLM_PROVIDER=openrouter
 
 # API key

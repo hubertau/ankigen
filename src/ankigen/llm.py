@@ -62,9 +62,13 @@ PROVIDER_CONFIG = {
         "base_url": "http://localhost:11434/v1",
         "default_model": "llama3",
     },
+    "deepseek": {
+        "base_url": "https://api.deepseek.com/v1",
+        "default_model": "deepseek-v4-flash",
+    },
 }
 
-Provider = Literal["openai", "openrouter", "anthropic", "local"]
+Provider = Literal["openai", "openrouter", "anthropic", "local", "deepseek"]
 
 # Language configurations
 LANGUAGE_CONFIG = {
