@@ -381,7 +381,7 @@ The `audit` + `backfill` pair lets you sweep an Anki vocab deck for cards that d
 The workflow is split into two commands so the slow LLM step is decoupled from the deck read (mirrors `extract` → `generate`):
 
 1. **`ankigen audit`** — read-only on the Anki DB. Scores every note against per-language format rules and writes a JSONL audit file with one entry per flagged note (GUID, current fields, and the reasons it failed).
-2. **`ankigen backfill`** — reads the audit JSONL, regenerates **only the flagged fields**, and writes one Anki-importable TSV per note type. TSVs carry a `#guid column:3` header so Anki updates the original notes by GUID even when headwords collide (e.g. homographs, or grammar duplicates like `~게 되다`).
+2. **`ankigen backfill`** — reads the audit JSONL, regenerates **only the flagged fields**, and writes one Anki-importable TSV per note type. TSVs carry a `#guid column:3` header so Anki updates the original notes by GUID even when headwords collide (e.g. homographs, or grammar duplicates like `~게 되다`). The `#deck column:2` value comes from `deck_name` stored in the audit JSONL at audit time (each note's actual sub-deck); backfill can still fall back to a live `--anki-db` lookup for older JSONLs that lack `deck_name`.
 
 Grammar cards are not yet supported.
 
@@ -414,7 +414,7 @@ Default paths mirror the rest of ankigen: the JSONL audit report lands in `input
 | `missing_jyutping` | — | `Jyutping` blank AND pycantonese can resolve `Hanzi` |
 | `empty_english` | `English` blank | `English` blank |
 | `too_few_sentences` | `Comments` has fewer than `-n` sentence blocks | `Sentence` has fewer than `-n` blocks |
-| `keyword_not_highlighted` | `Comments` non-empty but no red `<span>` matches `Korean` | `Sentence` non-empty but no red `<span>` matches `Hanzi` |
+| `keyword_not_highlighted` | `Comments` non-empty, formatted with spans, but no red `<span>` related to `Korean` (conjugated/particled forms count as related) | `Sentence` non-empty but no red `<span>` matches `Hanzi` |
 | `plain_text_sentences` | `Comments` non-empty but contains no `<span` tags (legacy) | `Sentence` non-empty but contains no `<span` tags |
 
 **Backfill actions**
@@ -426,7 +426,8 @@ Default paths mirror the rest of ankigen: the JSONL audit report lands in `input
 | `missing_jyutping` | `pycantonese` (no LLM) |
 | `empty_english` | LLM `translate_word` |
 | `too_few_sentences` | Existing sentences are preserved; LLM `generate_sentences` is asked for the shortfall only, then `format_sentences` re-renders the whole field |
-| `keyword_not_highlighted` / `plain_text_sentences` | `format_sentences` re-run over the existing text (no LLM) |
+| `keyword_not_highlighted` | Preserve existing red spans as `**markers**` and re-run `format_sentences` (no LLM); if there are no red spans, LLM `remark_sentences` then `format_sentences` |
+| `plain_text_sentences` | `format_sentences` re-run over the existing text (no LLM) |
 
 The headword (`Korean` / `Hanzi`) is **immutable** — backfill never overwrites it.
 

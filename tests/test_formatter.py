@@ -163,3 +163,41 @@ class TestFormatSentencesMarkers:
         text = "1. 促使他努力工作。"
         result = format_sentences(text, "促使")
         assert '<span style="color: red;">促使</span>' in result
+
+
+class TestHighlightHelpers:
+    def test_split_sentences_with_highlights(self):
+        from ankigen.formatter import split_sentences_with_highlights
+
+        html = format_sentences("1. 저는 **음식을** 먹었어요. 2. **도와요** 항상.", "음식")
+        pairs = split_sentences_with_highlights(html)
+        assert pairs == [
+            ("저는 음식을 먹었어요.", ["음식을"]),
+            ("도와요 항상.", ["도와요"]),
+        ]
+
+    def test_apply_markers(self):
+        from ankigen.formatter import apply_markers
+
+        assert apply_markers("저는 음식을 먹었어요.", ["음식을"]) == "저는 **음식을** 먹었어요."
+
+    def test_headword_matches_highlight_korean(self):
+        from ankigen.formatter import headword_matches_highlight
+
+        assert headword_matches_highlight("듣다", "들어요", "ko") is True
+        assert headword_matches_highlight("국적", "국적이", "ko") is True
+        assert headword_matches_highlight("음료", "음식", "ko") is False
+
+    def test_preserve_red_round_trip(self):
+        from ankigen.formatter import apply_markers, split_sentences_with_highlights
+
+        text = "1. 저는 매일 아침 음악을 **들어요**. 2. 어제 선생님의 말씀을 잘 **들었어요**."
+        html = format_sentences(text, "듣다")
+        pairs = split_sentences_with_highlights(html)
+        marked = [apply_markers(s, reds) for s, reds in pairs]
+        restored = format_sentences(
+            " ".join(f"{i + 1}. {s}" for i, s in enumerate(marked)),
+            "듣다",
+        )
+        assert '<span style="color: red;">들어요</span>' in restored
+        assert '<span style="color: red;">들었어요</span>' in restored

@@ -1,6 +1,11 @@
 """HTML formatting for vocabulary sentences."""
 
 import re
+from typing import Literal
+
+from ankigen.similarity import ko_highlight_related
+
+Language = Literal["ko", "zh"]
 
 # Matches the <br> separator used between sentences. Shared by audit and backfill
 # for counting and splitting sentence HTML produced by format_sentences().
@@ -9,9 +14,74 @@ BR_SPLIT_RE = re.compile(r"<br\s*/?>", flags=re.IGNORECASE)
 # Matches **marked** spans that the LLM inserts to identify the keyword form.
 _MARKER_RE = re.compile(r"\*\*(.+?)\*\*")
 
+RED_SPAN_RE = re.compile(
+    r'<span style="color: red;">([^<]*)</span>',
+    flags=re.IGNORECASE,
+)
+
+_ANY_SPAN_RE = re.compile(r"<span[^>]*>|</span>", flags=re.IGNORECASE)
+
 _RED = '<span style="color: red;">'
 _BLUE = '<span style="color: blue;">'
 _END = "</span>"
+
+
+def extract_red_spans(html: str) -> list[str]:
+    """Return the text content of every red ``<span>`` in ``html``."""
+    return RED_SPAN_RE.findall(html)
+
+
+def split_sentences_with_highlights(html: str) -> list[tuple[str, list[str]]]:
+    """Split formatted HTML into plain sentences and per-sentence red substrings.
+
+    For each ``<br>``-delimited piece, red span texts are collected in document
+    order, then all span tags are stripped to recover the plain sentence.
+    """
+    if not html.strip():
+        return []
+    pairs: list[tuple[str, list[str]]] = []
+    for piece in BR_SPLIT_RE.split(html):
+        reds = RED_SPAN_RE.findall(piece)
+        body = _ANY_SPAN_RE.sub("", piece).strip()
+        if body:
+            pairs.append((body, reds))
+    return pairs
+
+
+def apply_markers(sentence: str, red_texts: list[str]) -> str:
+    """Wrap each red substring in ``sentence`` once with ``**...**`` markers."""
+    marked = sentence
+    for text in red_texts:
+        if text and text in marked:
+            marked = marked.replace(text, f"**{text}**", 1)
+    return marked
+
+
+def headword_matches_highlight(
+    headword: str,
+    red_text: str,
+    lang: Language = "ko",
+) -> bool:
+    """True when ``red_text`` plausibly highlights ``headword``."""
+    if not headword.strip() or not red_text.strip():
+        return False
+    if lang == "zh":
+        return headword == red_text or headword in red_text or red_text in headword
+    return ko_highlight_related(headword, red_text)
+
+
+def has_keyword_highlight(
+    html: str,
+    keyword: str,
+    lang: Language = "ko",
+) -> bool:
+    """True if ``html`` has a red span related to ``keyword``."""
+    if not keyword.strip():
+        return False
+    reds = extract_red_spans(html)
+    if not reds:
+        return False
+    return any(headword_matches_highlight(keyword, red, lang) for red in reds)
 
 
 def format_sentences(text: str, keyword: str) -> str:

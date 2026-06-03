@@ -15,7 +15,6 @@ JSONL are recomputed; every other column is passed through verbatim.
 from __future__ import annotations
 
 import logging
-import re
 from collections.abc import Callable
 from pathlib import Path
 from typing import NamedTuple
@@ -25,9 +24,15 @@ from ankigen.audit import (
     read_audit_jsonl,
 )
 from ankigen.cleaner import parse_hanja_token
-from ankigen.formatter import BR_SPLIT_RE, format_sentences
+from ankigen.formatter import (
+    _ANY_SPAN_RE,
+    BR_SPLIT_RE,
+    apply_markers,
+    format_sentences,
+    split_sentences_with_highlights,
+)
 from ankigen.hanja_lookup import resolve_hanja
-from ankigen.llm import generate_sentences, translate_word
+from ankigen.llm import generate_sentences, remark_sentences, translate_word
 from ankigen.resume import durable_write
 
 logger = logging.getLogger("ankigen.backfill")
@@ -36,9 +41,6 @@ logger = logging.getLogger("ankigen.backfill")
 # ---------------------------------------------------------------------------
 # Inverse of `format_sentences` — strip the blue/red spans back to plain text
 # ---------------------------------------------------------------------------
-
-
-_ANY_SPAN_RE = re.compile(r"<span[^>]*>|</span>", flags=re.IGNORECASE)
 
 
 def split_sentences_from_html(html: str) -> list[str]:
@@ -160,9 +162,7 @@ def backfill_note(
                     try:
                         translation_result = translate_word(headword, lang)
                     except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "LLM hanja fallback failed for '%s': %s", headword, exc
-                        )
+                        logger.warning("LLM hanja fallback failed for '%s': %s", headword, exc)
                 if translation_result is not None and translation_result.hanja:
                     _set(resolved.secondary, translation_result.hanja)
         elif needs_llm_hanja and translation_result is not None:
@@ -222,13 +222,24 @@ def backfill_note(
         and "plain_text_sentences" not in reason_codes
         and "too_few_sentences" not in reason_codes
     ):
-        # The card already has the right number of sentences and is wrapped
-        # in spans, but the headword isn't highlighted (likely the user
-        # renamed the headword without re-running format_sentences). Strip
-        # and re-apply over the existing sentences.
-        existing_sentences = split_sentences_from_html(fields.get(sentence_field, ""))
-        if existing_sentences:
-            numbered = " ".join(f"{i + 1}. {s}" for i, s in enumerate(existing_sentences))
+        existing_html = fields.get(sentence_field, "")
+        pairs = split_sentences_with_highlights(existing_html)
+        if pairs:
+            reds_exist = any(reds for _, reds in pairs)
+            if reds_exist:
+                marked = [apply_markers(s, reds) for s, reds in pairs]
+            else:
+                try:
+                    remarked = remark_sentences(headword, [s for s, _ in pairs], lang)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Sentence remark failed for '%s' (%s); keeping unmarked text",
+                        headword,
+                        exc,
+                    )
+                    remarked = [s for s, _ in pairs]
+                marked = remarked
+            numbered = " ".join(f"{i + 1}. {s}" for i, s in enumerate(marked))
             _set(sentence_field, format_sentences(numbered, headword))
 
     # Headword sanity check — backfill must never overwrite it.
@@ -448,7 +459,12 @@ def backfill_jsonl(
             touched or ["(none)"],
         )
 
-        deck_name = deck_name_for(entry.note.deck_id) if deck_name_for is not None else "deck"
+        if entry.deck_name.strip():
+            deck_name = entry.deck_name.strip()
+        elif deck_name_for is not None:
+            deck_name = deck_name_for(entry.note.deck_id)
+        else:
+            deck_name = "deck"
         row = _Backfilled(
             mid=entry.note.mid,
             model_name=entry.note.model_name,

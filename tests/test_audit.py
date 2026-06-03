@@ -157,9 +157,21 @@ class TestHasKeywordHighlight:
         html = format_sentences("1. 저는 음식을 좋아해요.", "음식")
         assert has_keyword_highlight(html, "음식") is True
 
+    def test_returns_true_for_conjugated_korean_verb(self):
+        html = format_sentences("1. 그가 나를 **도와요**.", "돕다")
+        assert has_keyword_highlight(html, "돕다", "ko") is True
+
+    def test_returns_true_for_noun_with_particle(self):
+        html = format_sentences("1. 저는 **국적이** 한국입니다.", "국적")
+        assert has_keyword_highlight(html, "국적", "ko") is True
+
     def test_returns_false_for_different_keyword(self):
         html = format_sentences("1. 저는 음식을 좋아해요.", "음식")
         assert has_keyword_highlight(html, "사과") is False
+
+    def test_returns_false_for_stale_headword_vs_red(self):
+        html = format_sentences("1. 저는 **음식을** 좋아해요.", "음식")
+        assert has_keyword_highlight(html, "음료", "ko") is False
 
     def test_returns_false_for_blank_keyword(self):
         html = format_sentences("1. anything.", "음식")
@@ -260,6 +272,17 @@ class TestKoreanRules:
         results = audit_notes([note], target_sentences=3, jyutping_resolver=_fake_jyutping)
         codes = {r.code for r in results[0].reasons}
         assert "keyword_not_highlighted" in codes
+
+    def test_conjugated_highlight_not_flagged(self):
+        html = format_sentences(
+            "1. 저는 매일 아침 음악을 **들어요**. "
+            "2. 어제 선생님의 말씀을 잘 **들었어요**. "
+            "3. 이 노래를 한 번 **들어** 보세요.",
+            "듣다",
+        )
+        note = _ko_note(korean="듣다", comments=html)
+        results = audit_notes([note], target_sentences=3, jyutping_resolver=_fake_jyutping)
+        assert results == []
 
     def test_plain_text_sentences(self):
         note = _ko_note(comments="저는 음식을 좋아해요. 한국 음식이 맛있어요. 매일 음식을 먹어요.")
@@ -367,10 +390,11 @@ class TestAuditJsonlRoundTrip:
             ],
         )
         path = tmp_path / "audit.jsonl"
-        n = write_audit_jsonl([entry], path)
+        n = write_audit_jsonl([entry], path, deck_names={note.deck_id: "Korean vocab"})
         assert n == 1
         loaded = read_audit_jsonl(path)
         assert len(loaded) == 1
+        assert loaded[0].deck_name == "Korean vocab"
         assert loaded[0].note.guid == note.guid
         assert loaded[0].note.fields == note.fields
         assert loaded[0].note.field_order == note.field_order
