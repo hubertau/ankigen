@@ -263,24 +263,41 @@ class TestBackfillNoteKorean:
         assert '<span style="color: blue;">' in out["Comments"]
         assert '<span style="color: red;">음식</span>' in out["Comments"]
 
+    def test_keyword_not_highlighted_preserves_conjugated_red(self, mocker):
+        existing = format_sentences(
+            "1. 저는 매일 아침 음악을 **들어요**. "
+            "2. 어제 선생님의 말씀을 잘 **들었어요**. "
+            "3. 이 노래를 한 번 **들어** 보세요.",
+            "듣다",
+        )
+        mocker.patch("ankigen.backfill.generate_sentences")
+        remark_mock = mocker.patch("ankigen.backfill.remark_sentences")
+        note = _ko_note(korean="듣다", comments=existing)
+        out, touched = backfill_note(
+            _entry(note, reasons=[("keyword_not_highlighted", "")]),
+            target_sentences=3,
+        )
+        remark_mock.assert_not_called()
+        assert touched == ["Comments"]
+        assert '<span style="color: red;">들어요</span>' in out["Comments"]
+        assert '<span style="color: red;">들었어요</span>' in out["Comments"]
+
     def test_keyword_not_highlighted_reformatted_no_llm(self, mocker):
         # 3 sentences with keyword "음식" highlighted, but headword renamed
-        # to "사과" — backfill should re-format over the existing text with
-        # the new keyword.
+        # to "사과" — backfill preserves existing red spans (still 음식).
         existing = format_sentences(
-            "1. 저는 음식을 좋아해요. 2. 한국 음식이 맛있어요. 3. 매일 음식을 먹어요.",
+            "1. 저는 **음식을** 좋아해요. 2. 한국 **음식**이 맛있어요. 3. 매일 **음식을** 먹어요.",
             "음식",
         )
         sentences_mock = mocker.patch("ankigen.backfill.generate_sentences")
+        remark_mock = mocker.patch("ankigen.backfill.remark_sentences")
         note = _ko_note(korean="사과", hanja="", english="apple", comments=existing)
         out, _ = backfill_note(
             _entry(note, reasons=[("keyword_not_highlighted", "")]),
             target_sentences=3,
         )
         sentences_mock.assert_not_called()
-        # The new HTML should highlight "사과" (won't appear in any sentence,
-        # but the absence of red spans is fine — what matters is the sentences
-        # were preserved verbatim).
+        remark_mock.assert_not_called()
         from ankigen.backfill import split_sentences_from_html
 
         assert split_sentences_from_html(out["Comments"]) == [
@@ -288,6 +305,32 @@ class TestBackfillNoteKorean:
             "한국 음식이 맛있어요.",
             "매일 음식을 먹어요.",
         ]
+        assert '<span style="color: red;">음식</span>' in out["Comments"]
+
+    def test_keyword_not_highlighted_all_blue_calls_remark(self, mocker):
+        existing = format_sentences(
+            "1. 요즘 프로젝트 마감 때문에 너무 바빠요. "
+            "2. 저는 주말에도 바쁘게 일하는 편이에요. "
+            "3. 바쁘더라도 운동은 해요.",
+            "바쁘다",
+        )
+        mocker.patch("ankigen.backfill.generate_sentences")
+        remark_mock = mocker.patch(
+            "ankigen.backfill.remark_sentences",
+            return_value=[
+                "요즘 프로젝트 마감 때문에 너무 **바빠요**.",
+                "저는 주말에도 **바쁘게** 일하는 편이에요.",
+                "**바쁘더라도** 운동은 해요.",
+            ],
+        )
+        note = _ko_note(korean="바쁘다", comments=existing)
+        out, touched = backfill_note(
+            _entry(note, reasons=[("keyword_not_highlighted", "")]),
+            target_sentences=3,
+        )
+        remark_mock.assert_called_once()
+        assert touched == ["Comments"]
+        assert '<span style="color: red;">바빠요</span>' in out["Comments"]
 
     def test_headword_never_overwritten(self, mocker):
         mocker.patch(
@@ -450,6 +493,28 @@ class TestBackfillJsonl:
         )
         _, rows = _read_tsv(paths[0])
         assert rows[0][1] == "Deck::1"  # deck column
+
+    def test_deck_name_from_audit_jsonl_without_db(self, tmp_path: Path, mocker):
+        mocker.patch(
+            "ankigen.backfill.translate_word",
+            return_value=TranslationResult(translation="x", hanja=""),
+        )
+        note = _ko_note(english="", comments="")
+        from ankigen.audit import AuditedNote, AuditReason, write_audit_jsonl
+
+        entry = AuditedNote(
+            note=note,
+            lang="ko",
+            resolved=_KO_DEFAULT_RESOLVED,
+            reasons=[AuditReason("empty_english", "")],
+            deck_name="Korean vocab",
+        )
+        jsonl = tmp_path / "audit.jsonl"
+        write_audit_jsonl([entry], jsonl)
+
+        paths = backfill_jsonl(jsonl, tmp_path / "update", deck_name_for=None)
+        _, rows = _read_tsv(paths[0])
+        assert rows[0][1] == "Korean vocab"
 
     def test_per_note_failure_is_logged_and_skipped(self, tmp_path: Path, mocker, caplog):
         # Force a failure during regeneration by raising from translate_word.

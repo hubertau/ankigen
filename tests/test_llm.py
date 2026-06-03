@@ -7,6 +7,7 @@ from ankigen.llm import (
     generate_sentences,
     get_client,
     get_model,
+    remark_sentences,
     translate_word,
 )
 from ankigen.models import (
@@ -14,6 +15,25 @@ from ankigen.models import (
     TranslationResponse,
     create_sentence_response,
 )
+
+
+class TestRemarkSentences:
+    def test_remark_sentences_korean(self, mocker):
+        remarked = [
+            "요즘 너무 **바빠요**.",
+            "주말에도 **바쁘게** 일해요.",
+        ]
+        SentenceResponse = create_sentence_response(2)
+        mocker.patch(
+            "ankigen.llm.generate_structured_response",
+            return_value=SentenceResponse(sentences=remarked),
+        )
+        plain = ["요즘 너무 바빠요.", "주말에도 바쁘게 일해요."]
+        result = remark_sentences("바쁘다", plain, lang="ko")
+        assert result == remarked
+
+    def test_remark_sentences_empty(self):
+        assert remark_sentences("바쁘다", [], lang="ko") == []
 
 
 class TestGenerateSentences:

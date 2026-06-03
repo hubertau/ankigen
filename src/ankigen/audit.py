@@ -48,7 +48,7 @@ from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
 from ankigen.anki_db import AnkiNote
-from ankigen.formatter import BR_SPLIT_RE
+from ankigen.formatter import BR_SPLIT_RE, has_keyword_highlight
 from ankigen.hanja_lookup import extract_hanja_chars
 from ankigen.llm import Language
 
@@ -365,6 +365,7 @@ class AuditedNote(NamedTuple):
     lang: Language
     resolved: ResolvedFields
     reasons: list[AuditReason]
+    deck_name: str = ""  # resolved from deck_id at audit time; used by backfill TSV
 
 
 # ---------------------------------------------------------------------------
@@ -408,19 +409,6 @@ def count_sentence_blocks(html: str) -> int:
     if not html.strip():
         return 0
     return sum(1 for piece in BR_SPLIT_RE.split(html) if piece.strip())
-
-
-def has_keyword_highlight(html: str, keyword: str) -> bool:
-    """True if ``html`` contains a red ``<span>`` whose text matches ``keyword``.
-
-    The keyword check is intentionally exact-match: a stale card whose red
-    span carries a slightly different conjugation will be flagged so the
-    backfill step can re-format it.
-    """
-    if not keyword.strip():
-        return False
-    needle = f'<span style="color: red;">{keyword}</span>'
-    return needle in html
 
 
 def is_plain_text(html: str) -> bool:
@@ -544,7 +532,7 @@ def _rule_too_few_sentences(
 
 
 def _rule_keyword_not_highlighted(
-    note: AnkiNote, *, resolved: ResolvedFields
+    note: AnkiNote, *, resolved: ResolvedFields, lang: Language
 ) -> AuditReason | None:
     """Flag a non-empty sentence field that doesn't highlight the headword.
 
@@ -559,9 +547,12 @@ def _rule_keyword_not_highlighted(
     if is_plain_text(html):
         return None
     headword = note.fields.get(resolved.headword, "")
-    if has_keyword_highlight(html, headword):
+    if has_keyword_highlight(html, headword, lang):
         return None
-    return AuditReason("keyword_not_highlighted", f"no red <span> for {headword!r}")
+    return AuditReason(
+        "keyword_not_highlighted",
+        f"no related red <span> for {headword!r}",
+    )
 
 
 def _rule_plain_text_sentences(note: AnkiNote, *, resolved: ResolvedFields) -> AuditReason | None:
@@ -672,7 +663,7 @@ def audit_notes(
         reason = _rule_too_few_sentences(note, resolved=resolved, target=target_sentences)
         if reason is not None:
             reasons.append(reason)
-        reason = _rule_keyword_not_highlighted(note, resolved=resolved)
+        reason = _rule_keyword_not_highlighted(note, resolved=resolved, lang=lang)
         if reason is not None:
             reasons.append(reason)
         reason = _rule_plain_text_sentences(note, resolved=resolved)
@@ -711,20 +702,33 @@ def summarize_audit(audited: list[AuditedNote]) -> dict[str, int]:
 # ---------------------------------------------------------------------------
 
 
-def write_audit_jsonl(audited: list[AuditedNote], path: Path) -> int:
+def write_audit_jsonl(
+    audited: list[AuditedNote],
+    path: Path,
+    *,
+    deck_names: dict[int, str] | None = None,
+) -> int:
     """Write one JSON object per flagged note to ``path``.
 
     Output schema:
 
-    ``{"guid", "nid", "mid", "model", "lang", "deck_id",
+    ``{"guid", "nid", "mid", "model", "lang", "deck_id", "deck_name",
        "fields": {...}, "field_order": [...],
        "resolved": {"headword", "secondary", "english", "sentence"},
        "reasons": [{"code", "detail"}, ...]}``
+
+    When ``deck_names`` is supplied (a ``{deck_id: name}`` map from
+    :func:`ankigen.anki_db.load_deck_names`), each row's ``deck_name`` is
+    filled from the note's ``deck_id`` so backfill can write the real deck
+    into the TSV without reopening the Anki database.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         for entry in audited:
             note = entry.note
+            resolved_deck = entry.deck_name
+            if not resolved_deck and deck_names is not None:
+                resolved_deck = deck_names.get(note.deck_id, "")
             row = {
                 "guid": note.guid,
                 "nid": note.nid,
@@ -732,6 +736,7 @@ def write_audit_jsonl(audited: list[AuditedNote], path: Path) -> int:
                 "model": note.model_name,
                 "lang": entry.lang,
                 "deck_id": note.deck_id,
+                "deck_name": resolved_deck,
                 "fields": note.fields,
                 "field_order": note.field_order,
                 "resolved": {
@@ -815,7 +820,13 @@ def read_audit_jsonl(path: Path) -> list[AuditedNote]:
                 lang: Language = lang_raw  # type: ignore[assignment]
                 resolved = _resolved_from_row(row, lang)
                 audited.append(
-                    AuditedNote(note=note, lang=lang, resolved=resolved, reasons=reasons)
+                    AuditedNote(
+                        note=note,
+                        lang=lang,
+                        resolved=resolved,
+                        reasons=reasons,
+                        deck_name=str(row.get("deck_name", "")),
+                    )
                 )
             except (KeyError, ValueError, TypeError, json.JSONDecodeError) as exc:
                 logger.warning(

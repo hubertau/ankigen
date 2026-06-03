@@ -696,11 +696,7 @@ def _render_similar_clusters(
         member_set = set(members)
         group_pairs = [p for p in pairs if p.a in member_set and p.b in member_set]
         in_anki = {m for m in members if normalize_anki_term(m) in anki_tag_set}
-        keep = (
-            next(iter(sorted(in_anki)))
-            if in_anki
-            else min(members, key=lambda m: (len(m), m))
-        )
+        keep = next(iter(sorted(in_anki))) if in_anki else min(members, key=lambda m: (len(m), m))
         if for_file:
             lines.append(f"Group {idx} (suggest keep: {keep})")
             m_indent, p_indent = "  ", "    "
@@ -924,7 +920,8 @@ def cmd_audit(args: argparse.Namespace) -> None:
     else:
         output_path = _default_audit_output(args.lang)
 
-    write_audit_jsonl(audited, output_path)
+    deck_names = load_deck_names(db_path)
+    write_audit_jsonl(audited, output_path, deck_names=deck_names)
 
     summary = summarize_audit(audited)
     print("=" * 60)
@@ -971,6 +968,14 @@ def cmd_backfill(args: argparse.Namespace) -> None:
 
             def deck_name_for(did: int) -> str:
                 return deck_names.get(did, "deck")
+
+        elif peek_audit_lang(args.input_file) is not None:
+            logger.warning(
+                "Could not read deck names from %s — TSV deck column will use "
+                "deck_name from the audit JSONL when present, else the literal "
+                "'deck'. Re-run audit to embed deck_name in the JSONL.",
+                db_path,
+            )
 
     paths = backfill_jsonl(
         args.input_file,

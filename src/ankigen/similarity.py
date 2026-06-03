@@ -120,6 +120,20 @@ def _ko_stem(word: str) -> str:
     return jamo
 
 
+def ko_highlight_related(headword: str, red_text: str, *, max_stem_edit: int = 2) -> bool:
+    """True when a red span plausibly highlights ``headword`` (Korean morphology).
+
+    Used by audit/backfill to accept conjugated or particle-bearing surface forms
+    (e.g. headword ``듣다``, red ``들어요``) while rejecting unrelated words
+    (e.g. headword ``음료``, red ``음식``).
+    """
+    if not headword.strip() or not red_text.strip():
+        return False
+    if headword == red_text or headword in red_text or red_text in headword:
+        return True
+    return _edit_distance(_ko_stem(headword), _ko_stem(red_text)) <= max_stem_edit
+
+
 def _comparison_units(word: str, lang: Language) -> str:
     """Sequence used for edit-distance/ratio: jamo for ko, characters for zh."""
     return _decompose_hangul(word) if lang == "ko" else word

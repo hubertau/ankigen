@@ -81,6 +81,13 @@ LANGUAGE_CONFIG = {
             "in double asterisks, e.g. **{word}**. "
             "Return only the sentences, no translations or explanations."
         ),
+        "remark_prompt": (
+            "You are given exactly {num_sentences} existing Chinese example sentences. "
+            "Return the same sentences verbatim — do not rewrite, reorder, merge, or "
+            "add sentences. Wrap the target word '{word}' exactly as it appears in each "
+            "sentence in double asterisks, e.g. **{word}**. "
+            "Sentences:\n{sentences}"
+        ),
         "translation_prompt": "Translate the Chinese word '{word}' to English. Include the part of speech and any common meanings or usages. Do NOT include pinyin or the original Chinese characters. Be concise.",
         "grammar_extraction_system": (
             "You are a Chinese language expert helping a learner build Anki grammar cards "
@@ -116,6 +123,14 @@ LANGUAGE_CONFIG = {
             "sentence (conjugated or with particles) in double asterisks, "
             "e.g. **먹었어요** for 먹다 or **음식을** for 음식. "
             "Return only the sentences, no translations or explanations."
+        ),
+        "remark_prompt": (
+            "You are given exactly {num_sentences} existing Korean example sentences. "
+            "Return the same sentences verbatim — do not rewrite, reorder, merge, or "
+            "add sentences. Wrap the vocabulary word '{word}' in each sentence using "
+            "its natural surface form (conjugated or with particles) in double asterisks, "
+            "e.g. **먹었어요** for 먹다 or **음식을** for 음식. "
+            "Sentences:\n{sentences}"
         ),
         "translation_prompt": (
             "Translate the Korean word '{word}' to English. Include the part of speech "
@@ -588,6 +603,41 @@ def generate_sentences(word: str, lang: Language = "zh", num_sentences: int = 3)
     sentences = response.sentences  # type: ignore[attr-defined]
     logger.debug("Generated %d sentences in %.2fs", len(sentences), elapsed)
     return sentences  # type: ignore[no-any-return]
+
+
+def remark_sentences(word: str, sentences: list[str], lang: Language = "zh") -> list[str]:
+    """Add ``**surface**`` markers to existing sentences without rewriting them.
+
+    Used by backfill when example sentences exist but lack red keyword spans.
+    """
+    if not sentences:
+        return []
+    model = get_model()
+    config = LANGUAGE_CONFIG[lang]
+    num = len(sentences)
+    SentenceResponse = create_sentence_response(num)
+    numbered = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(sentences))
+
+    logger.debug("Remarking %d sentence(s) for '%s' using %s", num, word, model)
+    start_time = time.time()
+
+    response = generate_structured_response(
+        response_model=SentenceResponse,
+        system_prompt=(
+            f"You are a helpful {config['name']} language tutor. "
+            "Mark vocabulary in existing sentences; never change their wording."
+        ),
+        user_prompt=config["remark_prompt"].format(
+            word=word,
+            num_sentences=num,
+            sentences=numbered,
+        ),
+    )
+
+    elapsed = time.time() - start_time
+    remarked = response.sentences  # type: ignore[attr-defined]
+    logger.debug("Remarked %d sentence(s) in %.2fs", len(remarked), elapsed)
+    return remarked  # type: ignore[no-any-return]
 
 
 def translate_word(word: str, lang: Language = "zh") -> TranslationResult:
