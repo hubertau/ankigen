@@ -19,18 +19,28 @@ from pypdf import PdfReader
 from ankigen.anki_db import normalize_anki_term
 from ankigen.chunking import estimate_tokens, split_text_for_extraction
 from ankigen.cleaner import parse_hanja_token
+from ankigen.extract_checkpoint import (
+    ExtractRunCheckpoint,
+    FileCheckpoint,
+    clear_grammar_chunks,
+    clear_vocab_chunks,
+    source_changed,
+)
 from ankigen.llm import (
     LANGUAGE_CONFIG,
     PROVIDER_CONFIG,
     Language,
+    format_llm_error,
     generate_structured_response,
     get_anthropic_client,
+    get_extract_chunk_tokens,
+    get_llm_max_output_tokens,
     get_model,
     get_provider,
+    vocabulary_json_format_block,
 )
 from ankigen.models import GrammarItem
-
-_DEFAULT_CHUNK_TOKENS = 20_000
+from ankigen.resume import durable_write
 
 ExtractMode = Literal["vocab", "grammar", "all"]
 
@@ -276,7 +286,7 @@ def extract_text_from_image(path: Path, lang: Language = "zh") -> str:
         ]
         anthropic_response = anthropic_client.messages.create(
             model=model,
-            max_tokens=4096,
+            max_tokens=get_llm_max_output_tokens(),
             system=(
                 f"You are an OCR assistant. Extract all {lang_name} text from the image. "
                 "Preserve the original text exactly as it appears. "
@@ -321,7 +331,7 @@ def extract_text_from_image(path: Path, lang: Language = "zh") -> str:
                     ],
                 },
             ],
-            max_tokens=4096,
+            max_tokens=get_llm_max_output_tokens(),
         )
         extracted_text = openai_response.choices[0].message.content or ""
 
@@ -329,23 +339,6 @@ def extract_text_from_image(path: Path, lang: Language = "zh") -> str:
     logger.debug("OCR completed in %.2fs", elapsed)
     logger.info("Extracted %d characters from image", len(extracted_text))
     return extracted_text
-
-
-def _get_chunk_tokens() -> int:
-    """Read ``ANKIGEN_LLM_CHUNK_TOKENS`` (default 20k) for extract chunking."""
-    raw = os.getenv("ANKIGEN_LLM_CHUNK_TOKENS")
-    if not raw:
-        return _DEFAULT_CHUNK_TOKENS
-    try:
-        value = int(raw)
-    except ValueError:
-        logger.warning(
-            "Invalid ANKIGEN_LLM_CHUNK_TOKENS=%r; using default %d",
-            raw,
-            _DEFAULT_CHUNK_TOKENS,
-        )
-        return _DEFAULT_CHUNK_TOKENS
-    return max(1, value)
 
 
 def _merge_vocab_words(chunks_words: list[list[str]], lang: Language) -> list[str]:
@@ -379,12 +372,33 @@ def _merge_vocab_words(chunks_words: list[list[str]], lang: Language) -> list[st
     return [merged[k] for k in ko_order]
 
 
-def identify_vocabulary(text: str, lang: Language = "zh") -> list[str]:
+def _vocab_from_checkpoint(
+    run_checkpoint: ExtractRunCheckpoint,
+    file_entry: FileCheckpoint,
+    lang: Language,
+) -> list[str] | None:
+    """Rebuild merged vocab from saved chunk JSONL when vocab pass already finished."""
+    if file_entry.status not in ("vocab_done", "grammar_done"):
+        return None
+    by_index = run_checkpoint.load_all_vocab_chunks(file_entry)
+    if not by_index:
+        return None
+    ordered = [by_index[i] for i in sorted(by_index)]
+    return _merge_vocab_words(ordered, lang)
+
+
+def identify_vocabulary(
+    text: str,
+    lang: Language = "zh",
+    *,
+    run_checkpoint: ExtractRunCheckpoint | None = None,
+    file_entry: FileCheckpoint | None = None,
+) -> list[str]:
     """
     Identify vocabulary words from text using LLM.
 
     Long inputs are automatically split into chunks (each under
-    ``ANKIGEN_LLM_CHUNK_TOKENS`` tokens) so a single call never exceeds the
+    ``get_extract_chunk_tokens()``) so a single call never exceeds the
     provider's per-minute input-token budget. Results are merged with order
     preserved and duplicates removed; Korean Hanja annotations win over bare
     forms when both appear across chunks.
@@ -420,36 +434,80 @@ def identify_vocabulary(text: str, lang: Language = "zh") -> list[str]:
         "Return each word in its dictionary/base form. "
         f"IMPORTANT: Return ONLY the {lang_name} characters/script. "
         "Do NOT include any romanization (pinyin, romaja, etc.), "
-        "pronunciation guides, or parenthetical annotations." + hanja_rule
+        "pronunciation guides, or parenthetical annotations."
+        + hanja_rule
+        + "\n\n"
+        + vocabulary_json_format_block(lang)
     )
 
-    chunks = split_text_for_extraction(text, _get_chunk_tokens())
+    chunk_limit = get_extract_chunk_tokens()
+    chunks = split_text_for_extraction(text, chunk_limit)
+    total_est = estimate_tokens(text)
     if len(chunks) > 1:
         logger.info(
-            "Splitting extract into %d chunks (~%d tokens total) to respect rate limit",
+            "Splitting vocab extract into %d chunks (~%d est. tokens total, max %d tokens/chunk)",
             len(chunks),
-            estimate_tokens(text),
+            total_est,
+            chunk_limit,
         )
 
-    logger.debug("Calling %s for %s vocabulary identification", model, lang_name)
     start_time = time.time()
-
     chunks_words: list[list[str]] = []
-    for idx, chunk in enumerate(chunks, start=1):
-        if len(chunks) > 1:
-            logger.info("Identifying vocabulary from chunk %d/%d", idx, len(chunks))
+    for idx, chunk in enumerate(chunks):
+        chunk_num = idx + 1
+        chunk_est = estimate_tokens(chunk)
+        cached: list[str] | None = None
+        if run_checkpoint is not None and file_entry is not None:
+            cached = run_checkpoint.load_vocab_chunk(file_entry, idx)
+
+        if cached is not None:
+            logger.info(
+                "Resuming vocab chunk %d/%d (%d words cached, model=%s)",
+                chunk_num,
+                len(chunks),
+                len(cached),
+                model,
+            )
+            chunks_words.append(cached)
+            continue
+
+        logger.info(
+            "LLM vocab chunk %d/%d (~%d est. tokens, model=%s)",
+            chunk_num,
+            len(chunks),
+            chunk_est,
+            model,
+        )
+        chunk_start = time.time()
         response = generate_structured_response(
             response_model=VocabularyResponse,
             system_prompt=system_prompt,
-            user_prompt=f"Extract vocabulary words from this {lang_name} text:\n\n{chunk}",
+            user_prompt=(
+                f"Extract vocabulary words from this {lang_name} text and respond in JSON:\n\n{chunk}"
+            ),
         )
-        chunk_words = response.words  # type: ignore[attr-defined]
-        chunks_words.append(list(chunk_words))
+        chunk_words = list(response.words)  # type: ignore[attr-defined]
+        chunks_words.append(chunk_words)
+        logger.info(
+            "LLM vocab chunk %d/%d finished in %.2fs → %d words",
+            chunk_num,
+            len(chunks),
+            time.time() - chunk_start,
+            len(chunk_words),
+        )
+        if run_checkpoint is not None and file_entry is not None:
+            run_checkpoint.save_vocab_chunk(file_entry, idx, chunk_words)
 
     merged = _merge_vocab_words(chunks_words, lang)
     elapsed = time.time() - start_time
-    logger.debug("Vocabulary identification completed in %.2fs", elapsed)
-    logger.info("Identified %d vocabulary words", len(merged))
+    logger.info(
+        "Identified %d vocabulary words in %.2fs (%d chunk(s))",
+        len(merged),
+        elapsed,
+        len(chunks),
+    )
+    if run_checkpoint is not None and file_entry is not None:
+        run_checkpoint.mark_vocab_done(file_entry)
     return merged
 
 
@@ -603,12 +661,14 @@ def _write_vocab_output(unique_words: list[str], output_path: Path) -> None:
             with open(output_path, "a", encoding="utf-8") as f:
                 for word in new_words:
                     f.write(word + "\n")
+                durable_write(f)
         else:
             logger.info("All words already exist in %s", output_path)
     else:
         with open(output_path, "w", encoding="utf-8") as f:
             for word in unique_words:
                 f.write(word + "\n")
+            durable_write(f)
     logger.info("Vocab output written to %s", output_path)
 
 
@@ -621,6 +681,8 @@ def process_folder(
     recursive: bool = False,
     exclude_words: set[str] | None = None,
     exclude_patterns: set[str] | None = None,
+    use_checkpoint: bool = True,
+    fresh: bool = False,
 ) -> FolderResult:
     """
     Process all supported files from a directory (watch folder or ad-hoc).
@@ -650,8 +712,11 @@ def process_folder(
         recursive: When ``True``, walk subdirectories of ``source_dir``.
         exclude_words: NFC-normalised words to skip in the vocab pass.
         exclude_patterns: NFC-normalised patterns to skip in the grammar pass.
+        use_checkpoint: When True, write staging checkpoints and incremental outputs.
+        fresh: When True, ignore existing staging for this run key and start clean.
     """
     # Lazy import to avoid an extractor↔grammar circular dependency at import time.
+    from ankigen.extract_checkpoint import ExtractRunCheckpoint, init_manifest
     from ankigen.grammar import (
         extract_grammar_items,
         write_grammar_jsonl,
@@ -673,51 +738,158 @@ def process_folder(
     logger.info("Found %d files to process in %s (mode=%s)", len(files), source_dir, mode)
 
     today = datetime.now().strftime("%Y%m%d")
+    vocab_output = output_dir / lang / f"{today}.txt" if mode in ("vocab", "all") else None
+    grammar_output = (
+        output_dir / lang / f"{today}_grammar.jsonl" if mode in ("grammar", "all") else None
+    )
+
+    run_checkpoint: ExtractRunCheckpoint | None = None
+    if use_checkpoint:
+        manifest = init_manifest(
+            lang=lang,
+            mode=mode,
+            source_dir=source_dir,
+            date=today,
+            file_paths=files,
+            fresh=fresh,
+        )
+        run_checkpoint = ExtractRunCheckpoint(manifest)
+        done, total = run_checkpoint.count_resumable(mode)
+        if done:
+            logger.info("Resuming extract run (%d/%d files already complete)", done, total)
 
     all_words: list[str] = []
     all_grammar_items: list[GrammarItem] = []
     processed_files: list[Path] = []
+    num_files = len(files)
 
-    for file_path in files:
+    for file_index, file_path in enumerate(files, start=1):
         try:
-            logger.info("Processing: %s", file_path.name)
+            file_entry: FileCheckpoint | None = None
+            if run_checkpoint is not None:
+                from ankigen.extract_checkpoint import find_file_entry
 
-            text = extract_source_text(
-                file_path,
-                lang,
-                with_headings=(mode in ("grammar", "all")),
-            )
+                file_entry = find_file_entry(run_checkpoint.manifest, file_path)
+                if file_entry and run_checkpoint.should_skip_file(file_entry, mode):
+                    logger.info(
+                        "Skipping file %d/%d (already complete): %s",
+                        file_index,
+                        num_files,
+                        file_path.name,
+                    )
+                    processed_files.append(file_path)
+                    continue
+
+            logger.info("Processing file %d/%d: %s", file_index, num_files, file_path.name)
+
+            text: str | None = None
+            if run_checkpoint is not None and file_entry is not None:
+                if source_changed(file_entry, file_path):
+                    clear_vocab_chunks(file_entry, run_checkpoint)
+                    clear_grammar_chunks(file_entry, run_checkpoint)
+                    file_entry.status = "pending"
+                    file_entry.vocab_chunks = 0
+                    file_entry.grammar_chunks = 0
+                else:
+                    text = run_checkpoint.load_cached_text(file_entry, file_path)
+
+            if text is None:
+                text = extract_source_text(
+                    file_path,
+                    lang,
+                    with_headings=(mode in ("grammar", "all")),
+                )
+                if run_checkpoint is not None and file_entry is not None and text.strip():
+                    run_checkpoint.save_text(file_entry, file_path, text)
+
             if not text.strip():
                 logger.warning("No text extracted from %s", file_path.name)
                 continue
+
+            logger.info(
+                "Extracted %d characters (~%d est. tokens) from %s",
+                len(text),
+                estimate_tokens(text),
+                file_path.name,
+            )
 
             file_succeeded = True
 
             if mode in ("vocab", "all"):
                 try:
-                    words = identify_vocabulary(text, lang)
+                    words: list[str] | None = None
+                    if (
+                        run_checkpoint is not None
+                        and file_entry is not None
+                        and file_entry.status in ("vocab_done", "grammar_done")
+                    ):
+                        words = _vocab_from_checkpoint(run_checkpoint, file_entry, lang)
+                        if words is not None:
+                            logger.info(
+                                "Reusing %d cached vocab words for %s",
+                                len(words),
+                                file_path.name,
+                            )
+                    if words is None:
+                        words = identify_vocabulary(
+                            text,
+                            lang,
+                            run_checkpoint=run_checkpoint,
+                            file_entry=file_entry,
+                        )
                     all_words.extend(words)
                     logger.info("Extracted %d words from %s", len(words), file_path.name)
+                    if vocab_output is not None:
+                        _write_vocab_output(words, vocab_output)
                 except Exception as exc:
-                    logger.error("Vocab extraction failed for %s: %s", file_path.name, exc)
+                    err = format_llm_error(exc)
+                    logger.error("Vocab extraction failed for %s: %s", file_path.name, err)
+                    if run_checkpoint is not None and file_entry is not None:
+                        run_checkpoint.mark_failed(file_entry, err)
                     file_succeeded = False
 
             if mode in ("grammar", "all"):
                 try:
-                    items = extract_grammar_items(text, lang)
+                    from ankigen.grammar import _grammar_from_checkpoint
+
+                    items: list[GrammarItem] | None = None
+                    if (
+                        run_checkpoint is not None
+                        and file_entry is not None
+                        and file_entry.status == "grammar_done"
+                    ):
+                        items = _grammar_from_checkpoint(run_checkpoint, file_entry)
+                        if items is not None:
+                            logger.info(
+                                "Reusing %d cached grammar item(s) for %s",
+                                len(items),
+                                file_path.name,
+                            )
+                    if items is None:
+                        items = extract_grammar_items(
+                            text,
+                            lang,
+                            run_checkpoint=run_checkpoint,
+                            file_entry=file_entry,
+                        )
                     all_grammar_items.extend(items)
                     logger.info("Extracted %d grammar item(s) from %s", len(items), file_path.name)
+                    if grammar_output is not None:
+                        write_grammar_jsonl(items, grammar_output, append=True)
                 except Exception as exc:
-                    logger.error("Grammar extraction failed for %s: %s", file_path.name, exc)
+                    err = format_llm_error(exc)
+                    logger.error("Grammar extraction failed for %s: %s", file_path.name, err)
+                    if run_checkpoint is not None and file_entry is not None:
+                        run_checkpoint.mark_failed(file_entry, err)
                     file_succeeded = False
 
             if file_succeeded:
                 processed_files.append(file_path)
         except Exception as exc:  # belt-and-braces around the whole per-file block
-            logger.error("Failed to process %s: %s", file_path.name, exc)
+            logger.error("Failed to process %s: %s", file_path.name, format_llm_error(exc))
 
-    vocab_output: Path | None = None
-    grammar_output: Path | None = None
+    if run_checkpoint is not None and run_checkpoint.all_files_complete(mode):
+        run_checkpoint.mark_run_complete()
 
     if mode in ("vocab", "all"):
         if all_words:
@@ -747,8 +919,10 @@ def process_folder(
                         len(unique_words),
                     )
 
-            vocab_output = output_dir / lang / f"{today}.txt"
-            _write_vocab_output(unique_words, vocab_output)
+            if vocab_output is not None and not vocab_output.exists():
+                _write_vocab_output(unique_words, vocab_output)
+            elif vocab_output is not None:
+                logger.info("Vocab output already written incrementally to %s", vocab_output)
         else:
             logger.warning("No vocabulary extracted from any files")
 
@@ -765,8 +939,13 @@ def process_folder(
                 if skipped:
                     logger.info("Skipped %d grammar pattern(s) already present in Anki", skipped)
 
-            grammar_output = output_dir / lang / f"{today}_grammar.jsonl"
-            write_grammar_jsonl(all_grammar_items, grammar_output, append=True)
+            if grammar_output is not None and not grammar_output.exists():
+                write_grammar_jsonl(all_grammar_items, grammar_output, append=False)
+            elif grammar_output is not None:
+                logger.info(
+                    "Grammar output already written incrementally to %s",
+                    grammar_output,
+                )
         else:
             logger.warning("No grammar items extracted from any files")
 

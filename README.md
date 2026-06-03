@@ -78,10 +78,18 @@ Every LLM-bound subcommand (`extract`, `generate`, `audit`/`backfill`) routes th
 | --- | --- | --- |
 | `ANKIGEN_LLM_RATE_LIMIT_TPM` | `30000` | Proactive rolling-60s input-token ceiling. ankigen estimates each call's token cost and sleeps before sending if the recent sum would exceed this. Set to `0` to disable proactive pacing. |
 | `ANKIGEN_LLM_RATE_LIMIT_RPM` | `50` | Proactive rolling-60s requests-per-minute ceiling. Useful for `backfill` loops that issue many small per-card prompts (low tokens, high request count). Set to `0` to disable. |
-| `ANKIGEN_LLM_CHUNK_TOKENS` | `20000` | Target tokens per chunked LLM call during `extract`. Long inputs are split on `[H1]`/`[H2]`/`[H3]` heading and paragraph boundaries to fit under this size, then results are merged with dedupe. Keep below `ANKIGEN_LLM_RATE_LIMIT_TPM` so a single chunk can't trip the limit. |
-| `ANKIGEN_LLM_MAX_RETRIES` | `4` | How many times to retry an LLM call that returns a 429 / rate-limit error before giving up. Each retry uses exponential backoff (5s, 15s, 45s, 90s, capped). |
+| `ANKIGEN_LLM_CHUNK_TOKENS` | `20000` | Upper bound on input tokens per extract chunk. Long inputs are split on `[H1]`/`[H2]`/`[H3]` heading and paragraph boundaries. Also capped by `ANKIGEN_LLM_MAX_OUTPUT_TOKENS` × `ANKIGEN_LLM_CHUNK_OUTPUT_RATIO` so JSON responses fit in the completion budget. |
+| `ANKIGEN_LLM_CHUNK_OUTPUT_RATIO` | `0.25` | Fraction of `(MAX_OUTPUT_TOKENS − overhead)` used as the per-chunk input token cap during `extract`. Raise with `MAX_OUTPUT_TOKENS` if you want fewer, larger chunks. |
+| `ANKIGEN_LLM_MAX_RETRIES` | `4` | How many times to retry an LLM call on transient errors (429, connection failures, timeouts) before giving up. Exponential backoff (5s, 15s, 45s, 90s, capped). |
+| `ANKIGEN_LLM_TIMEOUT_SEC` | `300` | HTTP timeout for LLM API clients (seconds). Set `0` to disable. |
+| `ANKIGEN_LLM_MAX_OUTPUT_TOKENS` | `4096` | Max completion tokens per LLM response (extract vocab/grammar, generate, OCR). Also drives extract chunk sizing via `CHUNK_OUTPUT_RATIO`. |
+| `ANKIGEN_STAGING_DIR` | `{ANKIGEN_OUTPUT_DIR}/.staging` | Extract checkpoints (manifests, cached text, per-chunk LLM results) for resume after crashes. |
+| `ANKIGEN_LLM_STREAM_PROGRESS` | on for `deepseek` only | Stream completions and log byte progress during long LLM calls (`first bytes`, periodic updates, `complete`). Set `1`/`0` to force on/off. |
+| `ANKIGEN_LLM_STREAM_LOG_INTERVAL_SEC` | `15` | Minimum seconds between streaming progress log lines. |
 
 When either bucket fires, ankigen logs an `INFO` line naming the dimension that drove the pause (tokens vs requests) so progress stays visible during long backfills.
+
+**LLM connectivity:** After a failed LLM call, ankigen logs a short diagnostic block (DNS, `/models` reachability, hints). Run `ankigen llm-check` anytime to probe the configured provider before a long extract run.
 
 ### Anki database filtering (optional)
 
@@ -273,9 +281,10 @@ ankigen extract --lang ko --mode all --no-move
 
 Watch / folder behavior:
 1. Reads all supported files from the directory (the configured `{ANKIGEN_WATCH_DIR}/{lang}/` or whichever directory you pass on the command line).
-2. Combines extracted output into `{ANKIGEN_OUTPUT_DIR}/{lang}/{YYYYMMDD}.txt` (vocab) and/or `{ANKIGEN_OUTPUT_DIR}/{lang}/{YYYYMMDD}_grammar.jsonl` (grammar).
-3. With `--mode all` only, moves each successfully-processed source file to `{ANKIGEN_PROCESSED_DIR}/{lang}/` (use `--no-move` to opt out).
-4. Re-runs on the same day append+dedupe instead of overwriting.
+2. Writes vocab/grammar incrementally after each file and checkpoints under `{ANKIGEN_STAGING_DIR}` (default: `{ANKIGEN_OUTPUT_DIR}/.staging`) so a crash or connection failure can resume without re-parsing or re-calling finished LLM chunks.
+3. Combines extracted output into `{ANKIGEN_OUTPUT_DIR}/{lang}/{YYYYMMDD}.txt` (vocab) and/or `{ANKIGEN_OUTPUT_DIR}/{lang}/{YYYYMMDD}_grammar.jsonl` (grammar).
+4. With `--mode all` only, moves each successfully-processed source file to `{ANKIGEN_PROCESSED_DIR}/{lang}/` (use `--no-move` to opt out).
+5. Re-runs on the same day append+dedupe instead of overwriting. Use `--fresh` to discard staging for the current run key.
 
 **Options**:
 
@@ -288,6 +297,9 @@ Watch / folder behavior:
 | `--overwrite` | Wipe the output file before writing (defeats the default append+dedupe). |
 | `--no-move` | Don't move processed files (only meaningful in folder/watch mode with `--mode all`) |
 | `--recursive` | When the input is a directory, also walk subdirectories |
+| `--no-checkpoint` | Disable staging checkpoints (enabled by default for folder/watch; off for single-file) |
+| `--fresh` | Ignore existing staging for this run and start clean (folder/watch) |
+| `-v, --verbose` | DEBUG-level progress on the console during long LLM steps |
 | `--anki-db`, `--anki-deck`, `--anki-field` | Skip words/patterns already in Anki (see [Anki database filtering](#anki-database-filtering-optional)) |
 
 **Supported formats**: PDF, DOCX, PNG, JPG, JPEG, GIF, WEBP

@@ -573,6 +573,7 @@ def cmd_extract(args: argparse.Namespace) -> None:
         )
 
         move_override: bool | None = False if args.no_move else None
+        use_checkpoint = not args.no_checkpoint
 
         result = process_folder(
             lang=args.lang,
@@ -582,6 +583,8 @@ def cmd_extract(args: argparse.Namespace) -> None:
             recursive=args.recursive,
             exclude_words=exclude_words or None,
             exclude_patterns=exclude_patterns or None,
+            use_checkpoint=use_checkpoint,
+            fresh=args.fresh,
         )
         _log_folder_result(result, mode)
         return
@@ -598,6 +601,7 @@ def cmd_extract(args: argparse.Namespace) -> None:
             _resolve_anki_words(args, args.lang) if mode in ("grammar", "all") else None
         )
         move_override = False if args.no_move else None
+        use_checkpoint = not args.no_checkpoint
         result = process_folder(
             lang=args.lang,
             source_dir=args.input_file,
@@ -606,6 +610,8 @@ def cmd_extract(args: argparse.Namespace) -> None:
             recursive=args.recursive,
             exclude_words=exclude_words or None,
             exclude_patterns=exclude_patterns or None,
+            use_checkpoint=use_checkpoint,
+            fresh=args.fresh,
         )
         _log_folder_result(result, mode)
         return
@@ -999,6 +1005,24 @@ def cmd_backfill(args: argparse.Namespace) -> None:
     print("  Anki matches by GUID (#guid column:3 header) so existing notes update in place.")
 
 
+def cmd_llm_check(args: argparse.Namespace) -> None:
+    """Probe LLM provider connectivity (DNS, API reachability)."""
+    from ankigen.llm_diagnostics import format_diagnostics_report, run_llm_diagnostics
+
+    print("=" * 60)
+    print("LLM CONNECTIVITY CHECK")
+    print("=" * 60)
+    probes = run_llm_diagnostics()
+    for line in format_diagnostics_report(probes):
+        print(line)
+    critical = {"dns", "api_reachable", "api_key"}
+    failed = [p for p in probes if p.name in critical and not p.ok]
+    if failed:
+        print("\nSome checks failed — fix the items above before running extract/generate.")
+        sys.exit(1)
+    print("\nAll critical checks passed.")
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     """Handle the 'status' subcommand - show configuration health check."""
     print("=" * 60)
@@ -1259,6 +1283,22 @@ def main() -> None:
         action="store_true",
         help="When the input is a directory, also walk into subdirectories.",
     )
+    ext_parser.add_argument(
+        "--no-checkpoint",
+        action="store_true",
+        help=(
+            "Disable staging checkpoints (no resume across crashes). "
+            "Default for single-file mode; enabled for folder/watch runs."
+        ),
+    )
+    ext_parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help=(
+            "Ignore existing staging for this run and start a clean checkpoint "
+            "(folder/watch mode only)."
+        ),
+    )
     _add_anki_args(ext_parser)
 
     # 'clean' subcommand
@@ -1435,6 +1475,15 @@ def main() -> None:
         description="Display current configuration, folder paths, and verify setup",
     )
 
+    subparsers.add_parser(
+        "llm-check",
+        help="Probe LLM API connectivity (DNS, /models endpoint)",
+        description=(
+            "Run connectivity diagnostics against the configured LLM provider. "
+            "Useful when extract/generate fails with connection or timeout errors."
+        ),
+    )
+
     args = parser.parse_args()
 
     # Configure logging with file and console handlers
@@ -1455,6 +1504,8 @@ def main() -> None:
         cmd_backfill(args)
     elif args.command == "status":
         cmd_status(args)
+    elif args.command == "llm-check":
+        cmd_llm_check(args)
     else:
         parser.print_help()
         sys.exit(1)

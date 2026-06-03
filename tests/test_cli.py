@@ -81,9 +81,7 @@ class TestGenerateCsvResume:
         monkeypatch.setattr("ankigen.cli.process_word", self._fake_pw(calls))
 
         out = tmp_path / "out.csv"
-        out.write_text(
-            "Hanzi,Jyutping,English,Sentence\n甲,,old,\n", encoding="utf-8"
-        )
+        out.write_text("Hanzi,Jyutping,English,Sentence\n甲,,old,\n", encoding="utf-8")
 
         inp = tmp_path / "in.txt"
         inp.write_text("甲\n乙\n", encoding="utf-8")
