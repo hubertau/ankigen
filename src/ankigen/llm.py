@@ -293,6 +293,53 @@ def grammar_json_format_block(lang: Language) -> str:
     )
 
 
+def structured_json_format_block(
+    response_model: type[BaseModel],
+    *,
+    lang: Language | None = None,
+) -> str:
+    """DeepSeek ``json_object`` hint for generate/backfill structured response models."""
+    name = response_model.__name__
+    if name == "SentenceResponse":
+        if lang == "ko":
+            example: dict[str, object] = {"sentences": ["먹었어요.", "음식을 주문했어요."]}
+        else:
+            example = {"sentences": ["我会说中文。", "他在吃饭。"]}
+    elif name == "TranslationResponse":
+        example = {"translation": "to eat; verb"}
+    elif name == "KoreanTranslationResponse":
+        example = {"translation": "food; noun", "hanja": "飮食"}
+    elif name == "GrammarExampleResponse":
+        if lang == "ko":
+            example = {
+                "examples": [
+                    {"target": "내일 갈 거예요.", "english": "I will go tomorrow."},
+                ]
+            }
+        else:
+            example = {
+                "examples": [
+                    {"target": "我会说中文。", "english": "I can speak Chinese."},
+                ]
+            }
+    else:
+        example = dict(response_model.model_json_schema().get("properties", {}))
+    return (
+        "Output valid JSON only. Respond in json format matching the example shape.\n"
+        f"EXAMPLE JSON OUTPUT:\n{json.dumps(example, ensure_ascii=False)}"
+    )
+
+
+def _system_prompt_with_json(
+    role_prompt: str,
+    response_model: type[BaseModel],
+    *,
+    lang: Language | None = None,
+) -> str:
+    """Role instructions plus a json_object-compatible format block (DeepSeek requirement)."""
+    return f"{role_prompt.rstrip()}\n\n{structured_json_format_block(response_model, lang=lang)}"
+
+
 def _stream_openai_chat_json(
     client: OpenAI,
     *,
@@ -1056,9 +1103,11 @@ def generate_sentences(word: str, lang: Language = "zh", num_sentences: int = 3)
 
     response = generate_structured_response(
         response_model=SentenceResponse,
-        system_prompt=(
+        system_prompt=_system_prompt_with_json(
             f"You are a helpful {config['name']} language tutor. "
-            "Generate natural, useful example sentences."
+            "Generate natural, useful example sentences.",
+            SentenceResponse,
+            lang=lang,
         ),
         user_prompt=config["sentence_prompt"].format(word=word, num_sentences=num_sentences),
     )
@@ -1089,9 +1138,11 @@ def remark_sentences(word: str, sentences: list[str], lang: Language = "zh") -> 
 
     response = generate_structured_response(
         response_model=SentenceResponse,
-        system_prompt=(
+        system_prompt=_system_prompt_with_json(
             f"You are a helpful {config['name']} language tutor. "
-            "Mark vocabulary in existing sentences; never change their wording."
+            "Mark vocabulary in existing sentences; never change their wording.",
+            SentenceResponse,
+            lang=lang,
         ),
         user_prompt=config["remark_prompt"].format(
             word=word,
@@ -1131,9 +1182,11 @@ def translate_word(word: str, lang: Language = "zh") -> TranslationResult:
     if lang == "ko":
         ko_response = generate_structured_response(
             response_model=KoreanTranslationResponse,
-            system_prompt=(
+            system_prompt=_system_prompt_with_json(
                 f"You are a {config['name']}-English translator. "
-                "Provide accurate, concise translations and include Hanja for Sino-Korean words."
+                "Provide accurate, concise translations and include Hanja for Sino-Korean words.",
+                KoreanTranslationResponse,
+                lang=lang,
             ),
             user_prompt=config["translation_prompt"].format(word=word),
         )
@@ -1142,9 +1195,11 @@ def translate_word(word: str, lang: Language = "zh") -> TranslationResult:
     else:
         zh_response = generate_structured_response(
             response_model=TranslationResponse,
-            system_prompt=(
+            system_prompt=_system_prompt_with_json(
                 f"You are a {config['name']}-English translator. "
-                "Provide accurate, concise translations."
+                "Provide accurate, concise translations.",
+                TranslationResponse,
+                lang=lang,
             ),
             user_prompt=config["translation_prompt"].format(word=word),
         )
@@ -1196,10 +1251,12 @@ def generate_grammar_examples(
 
     response = generate_structured_response(
         response_model=ResponseModel,
-        system_prompt=(
+        system_prompt=_system_prompt_with_json(
             f"You are a helpful {config['name']} language tutor. "
             "Generate natural, useful example sentences for grammar patterns, "
-            "with clear English translations."
+            "with clear English translations.",
+            ResponseModel,
+            lang=lang,
         ),
         user_prompt=config["grammar_example_topup_prompt"].format(  # type: ignore[index]
             pattern=pattern,

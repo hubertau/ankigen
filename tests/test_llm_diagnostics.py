@@ -9,9 +9,11 @@ from ankigen.extractor import VocabularyResponse
 from ankigen.llm import (
     _deepseek_structured_extra_body,
     _parse_structured_json,
+    _system_prompt_with_json,
     get_extract_chunk_tokens,
     get_llm_max_output_tokens,
     grammar_json_format_block,
+    structured_json_format_block,
     use_stream_progress,
     vocabulary_json_format_block,
 )
@@ -21,6 +23,7 @@ from ankigen.llm_diagnostics import (
     format_diagnostics_report,
     run_llm_diagnostics,
 )
+from ankigen.models import KoreanTranslationResponse, TranslationResponse, create_sentence_response
 
 
 class TestDeepseekStructuredExtra:
@@ -66,6 +69,29 @@ class TestLlmMaxOutputTokens:
     def test_invalid_env_falls_back(self, monkeypatch) -> None:
         monkeypatch.setenv("ANKIGEN_LLM_MAX_OUTPUT_TOKENS", "nope")
         assert get_llm_max_output_tokens() == 4096
+
+
+class TestStructuredJsonFormatBlocks:
+    def test_translation_block_contains_json_word(self) -> None:
+        block = structured_json_format_block(KoreanTranslationResponse, lang="ko")
+        assert "json" in block.lower()
+        assert "translation" in block
+        assert "hanja" in block
+
+    def test_sentence_block_contains_json_word(self) -> None:
+        model = create_sentence_response(2)
+        block = structured_json_format_block(model, lang="ko")
+        assert "json" in block.lower()
+        assert "sentences" in block
+
+    def test_system_prompt_appends_block(self) -> None:
+        prompt = _system_prompt_with_json(
+            "You are a translator.",
+            TranslationResponse,
+            lang="zh",
+        )
+        assert "json" in prompt.lower()
+        assert "translator" in prompt
 
 
 class TestJsonFormatBlocks:
