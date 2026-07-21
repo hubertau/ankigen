@@ -14,7 +14,7 @@ import instructor
 from anthropic import Anthropic
 from dotenv import load_dotenv
 from openai import OpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from ankigen.chunking import estimate_tokens
 from ankigen.models import (
@@ -184,6 +184,33 @@ def get_provider() -> Provider:
     return provider  # type: ignore
 
 
+def create_openai_client() -> OpenAI:
+    """Raw OpenAI-compatible client (no Instructor wrapper)."""
+    provider = get_provider()
+    if provider == "anthropic":
+        raise ValueError("LLM_PROVIDER=anthropic does not use the OpenAI client.")
+
+    config = PROVIDER_CONFIG[provider]
+    base_url = os.getenv("LLM_BASE_URL") or config["base_url"]
+    api_key = os.getenv("LLM_API_KEY", "") or "not-needed"
+
+    default_headers: dict[str, str] = {}
+    if provider == "openrouter" or "openrouter.ai" in base_url:
+        site_url = os.getenv("OPENROUTER_SITE_URL")
+        app_name = os.getenv("OPENROUTER_APP_NAME")
+        if site_url:
+            default_headers["HTTP-Referer"] = site_url
+        if app_name:
+            default_headers["X-Title"] = app_name
+
+    return OpenAI(
+        base_url=base_url,
+        api_key=api_key,
+        default_headers=default_headers if default_headers else None,
+        timeout=_get_llm_timeout(),
+    )
+
+
 def get_client() -> instructor.Instructor:
     """Initialize and return the instructor-wrapped OpenAI client."""
     provider = get_provider()
@@ -193,44 +220,332 @@ def get_client() -> instructor.Instructor:
             "Use generate_structured_response() for structured calls."
         )
 
-    config = PROVIDER_CONFIG[provider]
-
-    # Use explicit base_url if set, otherwise use provider default
-    base_url = os.getenv("LLM_BASE_URL") or config["base_url"]
-    api_key = os.getenv("LLM_API_KEY", "")
-
-    # For local endpoints that don't need auth, use a dummy key
-    if not api_key:
-        api_key = "not-needed"
-
-    # Build default headers
-    default_headers = {}
-
-    # OpenRouter-specific headers
-    if provider == "openrouter" or "openrouter.ai" in base_url:
-        site_url = os.getenv("OPENROUTER_SITE_URL")
-        app_name = os.getenv("OPENROUTER_APP_NAME")
-        if site_url:
-            default_headers["HTTP-Referer"] = site_url
-        if app_name:
-            default_headers["X-Title"] = app_name
-
-    client = OpenAI(
-        base_url=base_url,
-        api_key=api_key,
-        default_headers=default_headers if default_headers else None,
-    )
-    # deepseek-reasoner rejects tool_choice; JSON mode works for all DeepSeek models.
+    client = create_openai_client()
     if provider == "deepseek":
         return instructor.from_openai(client, mode=instructor.Mode.JSON)
     return instructor.from_openai(client)
+
+
+_DEFAULT_STREAM_LOG_INTERVAL_SEC = 15.0
+
+
+def _stream_log_interval_sec() -> float:
+    raw = os.getenv("ANKIGEN_LLM_STREAM_LOG_INTERVAL_SEC")
+    if not raw:
+        return _DEFAULT_STREAM_LOG_INTERVAL_SEC
+    try:
+        return max(1.0, float(raw))
+    except ValueError:
+        return _DEFAULT_STREAM_LOG_INTERVAL_SEC
+
+
+def use_stream_progress(provider: Provider | None = None) -> bool:
+    """Whether to use streaming completions and log byte progress (default: on for DeepSeek)."""
+    provider = provider or get_provider()
+    raw = os.getenv("ANKIGEN_LLM_STREAM_PROGRESS")
+    if raw is not None:
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    return provider == "deepseek"
+
+
+def vocabulary_json_format_block(lang: Language) -> str:
+    """DeepSeek-style JSON shape hint for :class:`~ankigen.extractor.VocabularyResponse`."""
+    if lang == "ko":
+        example: dict[str, list[str]] = {"words": ["단어1", "단어2"]}
+    else:
+        example = {"words": ["词语1", "词语2"]}
+    return (
+        'Output valid JSON only. Use exactly one array field named "words" '
+        '(not "vocabulary" or other keys).\n'
+        f"EXAMPLE JSON OUTPUT:\n{json.dumps(example, ensure_ascii=False)}"
+    )
+
+
+def grammar_json_format_block(lang: Language) -> str:
+    """DeepSeek-style JSON shape hint for :class:`~ankigen.models.GrammarExtractionResponse`."""
+    if lang == "ko":
+        example: dict[str, list[dict[str, object]]] = {
+            "items": [
+                {
+                    "pattern": "~(으)ㄹ 거예요",
+                    "meaning": "going to",
+                    "explanation": "Marks a future intention.",
+                    "hanja": "",
+                    "examples": [{"target": "내일 갈 거예요", "english": "I will go tomorrow."}],
+                }
+            ]
+        }
+    else:
+        example = {
+            "items": [
+                {
+                    "pattern": "会",
+                    "meaning": "know how to",
+                    "explanation": "Ability acquired through learning.",
+                    "hanja": "",
+                    "examples": [{"target": "我会说中文", "english": "I can speak Chinese."}],
+                }
+            ]
+        }
+    return (
+        'Output valid JSON only. Use exactly one array field named "items".\n'
+        f"EXAMPLE JSON OUTPUT:\n{json.dumps(example, ensure_ascii=False)}"
+    )
+
+
+def structured_json_format_block(
+    response_model: type[BaseModel],
+    *,
+    lang: Language | None = None,
+) -> str:
+    """DeepSeek ``json_object`` hint for generate/backfill structured response models."""
+    name = response_model.__name__
+    if name == "SentenceResponse":
+        if lang == "ko":
+            example: dict[str, object] = {"sentences": ["먹었어요.", "음식을 주문했어요."]}
+        else:
+            example = {"sentences": ["我会说中文。", "他在吃饭。"]}
+    elif name == "TranslationResponse":
+        example = {"translation": "to eat; verb"}
+    elif name == "KoreanTranslationResponse":
+        example = {"translation": "food; noun", "hanja": "飮食"}
+    elif name == "GrammarExampleResponse":
+        if lang == "ko":
+            example = {
+                "examples": [
+                    {"target": "내일 갈 거예요.", "english": "I will go tomorrow."},
+                ]
+            }
+        else:
+            example = {
+                "examples": [
+                    {"target": "我会说中文。", "english": "I can speak Chinese."},
+                ]
+            }
+    else:
+        example = dict(response_model.model_json_schema().get("properties", {}))
+    return (
+        "Output valid JSON only. Respond in json format matching the example shape.\n"
+        f"EXAMPLE JSON OUTPUT:\n{json.dumps(example, ensure_ascii=False)}"
+    )
+
+
+def _system_prompt_with_json(
+    role_prompt: str,
+    response_model: type[BaseModel],
+    *,
+    lang: Language | None = None,
+) -> str:
+    """Role instructions plus a json_object-compatible format block (DeepSeek requirement)."""
+    return f"{role_prompt.rstrip()}\n\n{structured_json_format_block(response_model, lang=lang)}"
+
+
+def _stream_openai_chat_json(
+    client: OpenAI,
+    *,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    provider: Provider,
+    max_tokens: int,
+) -> str:
+    """Stream an OpenAI-compatible chat completion; log progress; return full text."""
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    kwargs: dict[str, object] = {
+        "model": model,
+        "messages": messages,
+        "stream": True,
+        "max_tokens": max_tokens,
+    }
+    if provider == "deepseek":
+        kwargs["response_format"] = {"type": "json_object"}
+        extra = _deepseek_structured_extra_body()
+        if extra is not None:
+            kwargs["extra_body"] = extra
+
+    start = time.monotonic()
+    last_log = start
+    interval = _stream_log_interval_sec()
+    parts: list[str] = []
+    first_logged = False
+    byte_count = 0
+
+    stream = client.chat.completions.create(**kwargs)  # type: ignore[arg-type,call-overload]
+    for chunk in stream:
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta.content
+        if not delta:
+            continue
+        parts.append(delta)
+        byte_count += len(delta.encode("utf-8"))
+        now = time.monotonic()
+        elapsed = now - start
+        if not first_logged:
+            logger.info("LLM streaming: first bytes received (%.1fs)", elapsed)
+            first_logged = True
+            last_log = now
+        elif now - last_log >= interval:
+            logger.info(
+                "LLM streaming: ~%d bytes received (%.0fs elapsed)",
+                byte_count,
+                elapsed,
+            )
+            last_log = now
+
+    text = "".join(parts)
+    if first_logged:
+        logger.info(
+            "LLM streaming: complete (~%d bytes, %.1fs)",
+            byte_count,
+            time.monotonic() - start,
+        )
+    return text
 
 
 def get_anthropic_client() -> Anthropic:
     """Initialize and return an Anthropic client."""
     api_key = os.getenv("LLM_API_KEY", "")
     base_url = os.getenv("LLM_BASE_URL") or PROVIDER_CONFIG["anthropic"]["base_url"]
+    timeout = _get_llm_timeout()
+    if timeout is not None:
+        return Anthropic(api_key=api_key, base_url=base_url, timeout=timeout)
     return Anthropic(api_key=api_key, base_url=base_url)
+
+
+_DEFAULT_LLM_TIMEOUT_SEC = 300.0
+_DEFAULT_LLM_MAX_OUTPUT_TOKENS = 4096
+_DEFAULT_CHUNK_TOKENS = 20_000
+_DEFAULT_CHUNK_OUTPUT_RATIO = 0.25
+_JSON_OUTPUT_OVERHEAD_TOKENS = 256
+_MIN_EXTRACT_CHUNK_TOKENS = 256
+
+
+def _deepseek_structured_extra_body() -> dict[str, object] | None:
+    """Disable DeepSeek V4 thinking so JSON lands in ``content``, not ``reasoning_content``."""
+    if get_provider() != "deepseek":
+        return None
+    return {"thinking": {"type": "disabled"}}
+
+
+def get_llm_max_output_tokens() -> int:
+    """Max completion tokens per structured LLM call (``ANKIGEN_LLM_MAX_OUTPUT_TOKENS``)."""
+    raw = os.getenv("ANKIGEN_LLM_MAX_OUTPUT_TOKENS")
+    if not raw:
+        return _DEFAULT_LLM_MAX_OUTPUT_TOKENS
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid ANKIGEN_LLM_MAX_OUTPUT_TOKENS=%r; using default %d",
+            raw,
+            _DEFAULT_LLM_MAX_OUTPUT_TOKENS,
+        )
+        return _DEFAULT_LLM_MAX_OUTPUT_TOKENS
+    return max(1, value)
+
+
+def _get_chunk_tokens_env() -> int:
+    """``ANKIGEN_LLM_CHUNK_TOKENS`` ceiling for extract chunking (default 20k)."""
+    raw = os.getenv("ANKIGEN_LLM_CHUNK_TOKENS")
+    if not raw:
+        return _DEFAULT_CHUNK_TOKENS
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid ANKIGEN_LLM_CHUNK_TOKENS=%r; using default %d",
+            raw,
+            _DEFAULT_CHUNK_TOKENS,
+        )
+        return _DEFAULT_CHUNK_TOKENS
+    return max(1, value)
+
+
+def _get_chunk_output_ratio() -> float:
+    """Input/output ratio for extract chunks (``ANKIGEN_LLM_CHUNK_OUTPUT_RATIO``)."""
+    raw = os.getenv("ANKIGEN_LLM_CHUNK_OUTPUT_RATIO")
+    if not raw:
+        return _DEFAULT_CHUNK_OUTPUT_RATIO
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid ANKIGEN_LLM_CHUNK_OUTPUT_RATIO=%r; using default %.2f",
+            raw,
+            _DEFAULT_CHUNK_OUTPUT_RATIO,
+        )
+        return _DEFAULT_CHUNK_OUTPUT_RATIO
+    return max(0.05, min(1.0, value))
+
+
+def get_extract_chunk_tokens() -> int:
+    """Max input tokens per extract chunk, capped from ``ANKIGEN_LLM_MAX_OUTPUT_TOKENS``.
+
+    Keeps each chunk small enough that a dense vocab/grammar JSON response is unlikely
+    to exceed the configured completion budget. The effective limit is::
+
+        min(ANKIGEN_LLM_CHUNK_TOKENS, (max_output - overhead) * CHUNK_OUTPUT_RATIO)
+    """
+    env_limit = _get_chunk_tokens_env()
+    max_out = get_llm_max_output_tokens()
+    ratio = _get_chunk_output_ratio()
+    budget = max(512, max_out - _JSON_OUTPUT_OVERHEAD_TOKENS)
+    derived = max(_MIN_EXTRACT_CHUNK_TOKENS, int(budget * ratio))
+    effective = min(env_limit, derived)
+    if effective < env_limit:
+        logger.debug(
+            "Extract chunk cap %d tokens (min of ANKIGEN_LLM_CHUNK_TOKENS=%d and "
+            "max_output=%d * ratio=%.2f)",
+            effective,
+            env_limit,
+            max_out,
+            ratio,
+        )
+    return effective
+
+
+def _get_llm_timeout() -> float | None:
+    """HTTP timeout for provider clients (seconds). ``0`` disables the timeout."""
+    raw = os.getenv("ANKIGEN_LLM_TIMEOUT_SEC")
+    if not raw:
+        return _DEFAULT_LLM_TIMEOUT_SEC
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid ANKIGEN_LLM_TIMEOUT_SEC=%r; using default %.0f",
+            raw,
+            _DEFAULT_LLM_TIMEOUT_SEC,
+        )
+        return _DEFAULT_LLM_TIMEOUT_SEC
+    if value <= 0:
+        return None
+    return value
+
+
+def format_llm_error(exc: BaseException) -> str:
+    """One-line summary for logs (strips Instructor ``failed_attempts`` XML)."""
+    text = str(exc).strip()
+    if "<failed_attempts>" not in text:
+        first = text.split("\n", 1)[0]
+        return first[:500] if len(first) > 500 else first
+
+    generations = re.findall(r'<generation number="(\d+)">', text)
+    count = len(generations) if generations else text.count("<generation")
+    last_match = re.search(
+        r"<last_exception>\s*(.*?)\s*</last_exception>",
+        text,
+        flags=re.DOTALL,
+    )
+    msg = last_match.group(1).strip() if last_match else "LLM call failed"
+    msg = " ".join(msg.split())
+    if count:
+        return f"{msg} ({count} attempt(s))"
+    return msg
 
 
 def get_model() -> str:
@@ -265,6 +580,123 @@ def _extract_json_payload(text: str) -> str:
     if match:
         return match.group(0)
     return stripped
+
+
+_DEFAULT_INVALID_JSON_LOG_CHARS = 800
+
+
+def _invalid_json_log_max_chars() -> int:
+    raw = os.getenv("ANKIGEN_LLM_INVALID_JSON_LOG_CHARS")
+    if not raw:
+        return _DEFAULT_INVALID_JSON_LOG_CHARS
+    try:
+        return max(80, int(raw))
+    except ValueError:
+        return _DEFAULT_INVALID_JSON_LOG_CHARS
+
+
+def _snippet_for_log(text: str, *, max_chars: int) -> str:
+    """Single-line preview of model output for error logs."""
+    collapsed = " ".join(text.split())
+    if len(collapsed) <= max_chars:
+        return collapsed
+    return collapsed[:max_chars] + "…"
+
+
+_VOCAB_LIST_ALIASES = ("vocabulary", "terms", "word_list", "words_list")
+
+
+def _normalize_vocab_response_dict(data: dict[str, object]) -> dict[str, object]:
+    """Map common LLM key names (e.g. ``vocabulary``) to ``words`` for VocabularyResponse."""
+    if "words" in data:
+        return data
+    out = dict(data)
+    for alias in _VOCAB_LIST_ALIASES:
+        if alias not in out:
+            continue
+        value = out.pop(alias)
+        if isinstance(value, list):
+            logger.info("Normalized LLM JSON key %r -> 'words' (%d entries)", alias, len(value))
+            out["words"] = value
+            return out
+    return data
+
+
+def _coerce_parsed_dict(data: object, response_model: type[BaseModel]) -> object:
+    """Apply model-specific fixes before Pydantic validation."""
+    if response_model.__name__ == "VocabularyResponse" and isinstance(data, dict):
+        return _normalize_vocab_response_dict(data)
+    return data
+
+
+def log_invalid_json_response(
+    exc: ValidationError,
+    *,
+    model_name: str,
+    raw_text: str | None = None,
+    payload: str | None = None,
+) -> None:
+    """Log a truncated copy of model JSON that failed Pydantic validation."""
+    max_chars = _invalid_json_log_max_chars()
+    logger.error(
+        "%s validation failed (%s)",
+        model_name,
+        exc,
+    )
+    if raw_text is not None:
+        logger.error(
+            "LLM raw response (%d bytes): %s",
+            len(raw_text.encode("utf-8")),
+            _snippet_for_log(raw_text, max_chars=max_chars),
+        )
+    if payload is not None and payload != raw_text:
+        logger.error(
+            "Extracted JSON payload (%d bytes): %s",
+            len(payload.encode("utf-8")),
+            _snippet_for_log(payload, max_chars=max_chars),
+        )
+    elif payload is not None and raw_text is None:
+        logger.error(
+            "Extracted JSON payload (%d bytes): %s",
+            len(payload.encode("utf-8")),
+            _snippet_for_log(payload, max_chars=max_chars),
+        )
+    if raw_text is None and payload is None:
+        logger.error(
+            "Raw LLM body not available on this code path (Instructor). Validation errors: %s",
+            exc.errors(),
+        )
+
+
+def _parse_structured_json[ResponseModelT: BaseModel](
+    response_model: type[ResponseModelT],
+    raw_text: str,
+) -> ResponseModelT:
+    """Parse and validate JSON from an LLM; log snippet on schema mismatch."""
+    payload = _extract_json_payload(raw_text)
+    try:
+        data = json.loads(payload)
+        data = _coerce_parsed_dict(data, response_model)
+        return response_model.model_validate(data)
+    except json.JSONDecodeError:
+        try:
+            return response_model.model_validate_json(payload)
+        except ValidationError as exc:
+            log_invalid_json_response(
+                exc,
+                model_name=response_model.__name__,
+                raw_text=raw_text,
+                payload=payload,
+            )
+            raise
+    except ValidationError as exc:
+        log_invalid_json_response(
+            exc,
+            model_name=response_model.__name__,
+            raw_text=raw_text,
+            payload=payload,
+        )
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -484,26 +916,60 @@ def _is_rate_limit_error(exc: BaseException) -> bool:
     return "rate limit" in message or "429" in message or "tokens per minute" in message
 
 
-def _with_429_retry[T](fn: Callable[[], T]) -> T:
-    """Run ``fn``; on rate-limit errors, sleep and retry with exponential backoff."""
+def _is_transient_error(exc: BaseException) -> bool:
+    """Rate limits, connection drops, and timeouts — safe to retry after a pause."""
+    if _is_rate_limit_error(exc):
+        return True
+    name = exc.__class__.__name__.lower()
+    if any(
+        token in name
+        for token in (
+            "connection",
+            "timeout",
+            "connect",
+            "apiconnection",
+            "apitimeout",
+            "readtimeout",
+        )
+    ):
+        return True
+    message = str(exc).lower()
+    return (
+        "connection error" in message
+        or "connection refused" in message
+        or "timed out" in message
+        or "timeout" in message
+        or "failed to connect" in message
+    )
+
+
+def _with_transient_retry[T](fn: Callable[[], T]) -> T:
+    """Run ``fn``; on transient provider errors, sleep and retry with backoff."""
     max_retries = _get_max_retries()
     attempt = 0
     while True:
         try:
             return fn()
         except Exception as exc:  # noqa: BLE001 — provider SDKs raise heterogeneous types
-            if not _is_rate_limit_error(exc) or attempt >= max_retries:
+            if not _is_transient_error(exc) or attempt >= max_retries:
                 raise
             backoff = min(5.0 * (3.0**attempt), 90.0)
+            kind = "Rate-limit" if _is_rate_limit_error(exc) else "Transient"
             logger.warning(
-                "Rate-limit error from provider (attempt %d/%d): %s — retrying in %.1fs",
+                "%s error from provider (attempt %d/%d): %s — retrying in %.1fs",
+                kind,
                 attempt + 1,
                 max_retries,
-                exc,
+                format_llm_error(exc),
                 backoff,
             )
             time.sleep(backoff)
             attempt += 1
+
+
+def _with_429_retry[T](fn: Callable[[], T]) -> T:
+    """Backwards-compatible alias for :func:`_with_transient_retry`."""
+    return _with_transient_retry(fn)
 
 
 def generate_structured_response[ResponseModelT: BaseModel](
@@ -511,7 +977,7 @@ def generate_structured_response[ResponseModelT: BaseModel](
     response_model: type[ResponseModelT],
     system_prompt: str,
     user_prompt: str,
-    max_tokens: int = 4096,
+    max_tokens: int | None = None,
 ) -> ResponseModelT:
     """
     Generate a structured response for either OpenAI-compatible or Anthropic providers.
@@ -519,15 +985,24 @@ def generate_structured_response[ResponseModelT: BaseModel](
     Calls are paced against both ``ANKIGEN_LLM_RATE_LIMIT_TPM`` (rolling-60s
     token bucket, default 30k) and ``ANKIGEN_LLM_RATE_LIMIT_RPM`` (rolling-60s
     request bucket, default 50) and retried on rate-limit errors up to
-    ``ANKIGEN_LLM_MAX_RETRIES`` times with exponential backoff.
+    ``ANKIGEN_LLM_MAX_RETRIES`` times with exponential backoff on transient
+    errors (rate limits, connection failures, timeouts).
+
+    Output length is capped by ``max_tokens`` or ``ANKIGEN_LLM_MAX_OUTPUT_TOKENS``
+    (default 4096).
     """
     provider = get_provider()
     model = get_model()
+    if max_tokens is None:
+        max_tokens = get_llm_max_output_tokens()
 
     # Estimate tokens for the proactive bucket: prompts + the worst-case reply
     # budget. The estimator is intentionally conservative (upper bound).
     estimate = estimate_tokens(system_prompt) + estimate_tokens(user_prompt) + max_tokens
     _throttle_for_tokens(estimate)
+
+    logger.debug("LLM structured request starting (model=%s, ~%d est. tokens)", model, estimate)
+    call_start = time.time()
 
     def _call() -> ResponseModelT:
         if provider == "anthropic":
@@ -546,22 +1021,60 @@ def generate_structured_response[ResponseModelT: BaseModel](
 
             text_blocks = [block.text for block in response.content if block.type == "text"]
             raw_text = "\n".join(text_blocks).strip()
-            return response_model.model_validate_json(_extract_json_payload(raw_text))
+            return _parse_structured_json(response_model, raw_text)
+
+        if use_stream_progress(provider):
+            raw_client = create_openai_client()
+            raw_text = _stream_openai_chat_json(
+                raw_client,
+                model=model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                provider=provider,
+                max_tokens=max_tokens,
+            )
+            return _parse_structured_json(response_model, raw_text)
 
         openai_client = get_client()
-        # instructor dynamically patches return types from response_model;
-        # generic type inference is limited for static analysis.
-        return openai_client.chat.completions.create(  # type: ignore[no-any-return]
-            model=model,
-            response_model=response_model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        )
+        extra = _deepseek_structured_extra_body()
+        try:
+            if extra is not None:
+                return openai_client.chat.completions.create(  # type: ignore[no-any-return]
+                    model=model,
+                    response_model=response_model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    max_tokens=max_tokens,
+                    extra_body=extra,
+                )
+            return openai_client.chat.completions.create(  # type: ignore[no-any-return]
+                model=model,
+                response_model=response_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_tokens=max_tokens,
+            )
+        except ValidationError as exc:
+            log_invalid_json_response(exc, model_name=response_model.__name__)
+            raise
 
     try:
-        return _with_429_retry(_call)
+        result = _with_transient_retry(_call)
+        logger.debug(
+            "LLM structured request finished in %.2fs (model=%s)",
+            time.time() - call_start,
+            model,
+        )
+        return result
+    except Exception as exc:
+        from ankigen.llm_diagnostics import log_llm_failure_diagnostics
+
+        log_llm_failure_diagnostics(exc)
+        raise
     finally:
         # Record the estimate either way — a failed-but-retried call still
         # consumed tokens (and one request) against the provider's bucket.
@@ -590,9 +1103,11 @@ def generate_sentences(word: str, lang: Language = "zh", num_sentences: int = 3)
 
     response = generate_structured_response(
         response_model=SentenceResponse,
-        system_prompt=(
+        system_prompt=_system_prompt_with_json(
             f"You are a helpful {config['name']} language tutor. "
-            "Generate natural, useful example sentences."
+            "Generate natural, useful example sentences.",
+            SentenceResponse,
+            lang=lang,
         ),
         user_prompt=config["sentence_prompt"].format(word=word, num_sentences=num_sentences),
     )
@@ -623,9 +1138,11 @@ def remark_sentences(word: str, sentences: list[str], lang: Language = "zh") -> 
 
     response = generate_structured_response(
         response_model=SentenceResponse,
-        system_prompt=(
+        system_prompt=_system_prompt_with_json(
             f"You are a helpful {config['name']} language tutor. "
-            "Mark vocabulary in existing sentences; never change their wording."
+            "Mark vocabulary in existing sentences; never change their wording.",
+            SentenceResponse,
+            lang=lang,
         ),
         user_prompt=config["remark_prompt"].format(
             word=word,
@@ -665,9 +1182,11 @@ def translate_word(word: str, lang: Language = "zh") -> TranslationResult:
     if lang == "ko":
         ko_response = generate_structured_response(
             response_model=KoreanTranslationResponse,
-            system_prompt=(
+            system_prompt=_system_prompt_with_json(
                 f"You are a {config['name']}-English translator. "
-                "Provide accurate, concise translations and include Hanja for Sino-Korean words."
+                "Provide accurate, concise translations and include Hanja for Sino-Korean words.",
+                KoreanTranslationResponse,
+                lang=lang,
             ),
             user_prompt=config["translation_prompt"].format(word=word),
         )
@@ -676,9 +1195,11 @@ def translate_word(word: str, lang: Language = "zh") -> TranslationResult:
     else:
         zh_response = generate_structured_response(
             response_model=TranslationResponse,
-            system_prompt=(
+            system_prompt=_system_prompt_with_json(
                 f"You are a {config['name']}-English translator. "
-                "Provide accurate, concise translations."
+                "Provide accurate, concise translations.",
+                TranslationResponse,
+                lang=lang,
             ),
             user_prompt=config["translation_prompt"].format(word=word),
         )
@@ -730,10 +1251,12 @@ def generate_grammar_examples(
 
     response = generate_structured_response(
         response_model=ResponseModel,
-        system_prompt=(
+        system_prompt=_system_prompt_with_json(
             f"You are a helpful {config['name']} language tutor. "
             "Generate natural, useful example sentences for grammar patterns, "
-            "with clear English translations."
+            "with clear English translations.",
+            ResponseModel,
+            lang=lang,
         ),
         user_prompt=config["grammar_example_topup_prompt"].format(  # type: ignore[index]
             pattern=pattern,

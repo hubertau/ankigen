@@ -2,7 +2,7 @@
 
 import csv
 
-from ankigen.resume import completed_csv_keys, durable_write
+from ankigen.resume import completed_csv_keys, durable_write, write_anki_header
 
 
 class TestCompletedCsvKeys:
@@ -45,6 +45,58 @@ class TestCompletedCsvKeys:
         p = tmp_path / "out.csv"
         p.write_text("Hanzi,English\n,empty\n甲,a\n", encoding="utf-8")
         assert completed_csv_keys(p, "Hanzi") == {"甲"}
+
+    def test_reads_keys_with_anki_header_block(self, tmp_path):
+        fieldnames = ["Hanzi", "Pinyin", "Jyutping", "English", "Sentence"]
+        p = tmp_path / "out.csv"
+        with open(p, "w", encoding="utf-8", newline="") as f:
+            write_anki_header(f, fieldnames)
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writerow(
+                {"Hanzi": "甲", "Pinyin": "", "Jyutping": "", "English": "a", "Sentence": ""}
+            )
+            w.writerow(
+                {"Hanzi": "乙", "Pinyin": "", "Jyutping": "", "English": "b", "Sentence": ""}
+            )
+        assert completed_csv_keys(p, "Hanzi") == {"甲", "乙"}
+
+    def test_anki_header_only_returns_empty(self, tmp_path):
+        fieldnames = ["Hanzi", "Pinyin", "Jyutping", "English", "Sentence"]
+        p = tmp_path / "out.csv"
+        with open(p, "w", encoding="utf-8", newline="") as f:
+            write_anki_header(f, fieldnames)
+        assert completed_csv_keys(p, "Hanzi") == set()
+
+    def test_unknown_column_with_header_block_returns_empty(self, tmp_path):
+        fieldnames = ["Pattern", "Hanja", "Meaning", "Examples"]
+        p = tmp_path / "out.csv"
+        with open(p, "w", encoding="utf-8", newline="") as f:
+            write_anki_header(f, fieldnames)
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writerow({"Pattern": "~게 되다", "Hanja": "", "Meaning": "x", "Examples": ""})
+        assert completed_csv_keys(p, "Hanzi") == set()
+
+
+class TestWriteAnkiHeader:
+    def test_emits_directive_block(self, tmp_path):
+        p = tmp_path / "out.csv"
+        with open(p, "w", encoding="utf-8", newline="") as f:
+            write_anki_header(f, ["Hanzi", "Pinyin", "Jyutping", "English", "Sentence"])
+        lines = p.read_text(encoding="utf-8").splitlines()
+        assert lines == [
+            "#separator:comma",
+            "#html:true",
+            "#columns:Hanzi,Pinyin,Jyutping,English,Sentence",
+            "#Hanzi,#Pinyin,#Jyutping,#English,#Sentence",
+        ]
+
+    def test_html_can_be_disabled(self, tmp_path):
+        p = tmp_path / "out.csv"
+        with open(p, "w", encoding="utf-8", newline="") as f:
+            write_anki_header(f, ["Pattern", "Meaning"], html=False)
+        lines = p.read_text(encoding="utf-8").splitlines()
+        assert "#html:true" not in lines
+        assert lines[0] == "#separator:comma"
 
 
 class TestDurableWrite:

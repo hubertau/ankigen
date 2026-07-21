@@ -72,7 +72,7 @@ from ankigen.grammar import (
 from ankigen.hanja_lookup import resolve_hanja
 from ankigen.llm import Language, generate_sentences, translate_word
 from ankigen.logging_config import get_log_dir, get_log_level, get_log_retention, setup_logging
-from ankigen.resume import completed_csv_keys, durable_write
+from ankigen.resume import completed_csv_keys, durable_write, write_anki_header
 from ankigen.similarity import SimilarPair, cluster_pairs, find_similar_pairs
 
 # Configure logging
@@ -99,6 +99,26 @@ def get_jyutping(word: str) -> str:
         # Result is a list of (character, jyutping) tuples
         jyutping_parts = [jp for _, jp in result if jp]
         return " ".join(jyutping_parts) if jyutping_parts else ""
+    except Exception:
+        return ""
+
+
+def get_pinyin(word: str) -> str:
+    """
+    Get tone-marked Pinyin (Mandarin romanization) for a Chinese word.
+
+    Syllables are joined per word with tone marks (e.g. ``新鲜`` -> ``xīnxiān``).
+    Returns an empty string if pypinyin is not available or fails.
+    """
+    try:
+        from pypinyin import Style, pinyin
+    except ImportError:
+        return ""
+
+    try:
+        # pinyin() returns a list of per-character candidate lists.
+        syllables = [group[0] for group in pinyin(word, style=Style.TONE) if group and group[0]]
+        return "".join(syllables) if syllables else ""
     except Exception:
         return ""
 
@@ -148,8 +168,10 @@ def process_word(
 
     if lang == "zh":
         jyutping = get_jyutping(word)
+        pinyin = get_pinyin(word)
         return {
             "Hanzi": word,
+            "Pinyin": pinyin,
             "Jyutping": jyutping,
             "English": translation,
             "Sentence": formatted,
@@ -237,7 +259,7 @@ def generate_csv(
 
     # Language-specific column headers
     if lang == "zh":
-        fieldnames = ["Hanzi", "Jyutping", "English", "Sentence"]
+        fieldnames = ["Hanzi", "Pinyin", "Jyutping", "English", "Sentence"]
     else:  # Korean
         fieldnames = ["Korean", "Hanja", "English", "Comments"]
     key_column = fieldnames[0]
@@ -255,7 +277,7 @@ def generate_csv(
     with open(output_file, "a" if resuming else "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         if not resuming:
-            writer.writeheader()
+            write_anki_header(f, fieldnames)
 
         for raw in words:
             bare, inline_hanja = parse_hanja_token(raw) if lang == "ko" else (raw, "")
@@ -573,6 +595,7 @@ def cmd_extract(args: argparse.Namespace) -> None:
         )
 
         move_override: bool | None = False if args.no_move else None
+        use_checkpoint = not args.no_checkpoint
 
         result = process_folder(
             lang=args.lang,
@@ -582,6 +605,8 @@ def cmd_extract(args: argparse.Namespace) -> None:
             recursive=args.recursive,
             exclude_words=exclude_words or None,
             exclude_patterns=exclude_patterns or None,
+            use_checkpoint=use_checkpoint,
+            fresh=args.fresh,
         )
         _log_folder_result(result, mode)
         return
@@ -598,6 +623,7 @@ def cmd_extract(args: argparse.Namespace) -> None:
             _resolve_anki_words(args, args.lang) if mode in ("grammar", "all") else None
         )
         move_override = False if args.no_move else None
+        use_checkpoint = not args.no_checkpoint
         result = process_folder(
             lang=args.lang,
             source_dir=args.input_file,
@@ -606,6 +632,8 @@ def cmd_extract(args: argparse.Namespace) -> None:
             recursive=args.recursive,
             exclude_words=exclude_words or None,
             exclude_patterns=exclude_patterns or None,
+            use_checkpoint=use_checkpoint,
+            fresh=args.fresh,
         )
         _log_folder_result(result, mode)
         return
@@ -999,6 +1027,24 @@ def cmd_backfill(args: argparse.Namespace) -> None:
     print("  Anki matches by GUID (#guid column:3 header) so existing notes update in place.")
 
 
+def cmd_llm_check(args: argparse.Namespace) -> None:
+    """Probe LLM provider connectivity (DNS, API reachability)."""
+    from ankigen.llm_diagnostics import format_diagnostics_report, run_llm_diagnostics
+
+    print("=" * 60)
+    print("LLM CONNECTIVITY CHECK")
+    print("=" * 60)
+    probes = run_llm_diagnostics()
+    for line in format_diagnostics_report(probes):
+        print(line)
+    critical = {"dns", "api_reachable", "api_key"}
+    failed = [p for p in probes if p.name in critical and not p.ok]
+    if failed:
+        print("\nSome checks failed — fix the items above before running extract/generate.")
+        sys.exit(1)
+    print("\nAll critical checks passed.")
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     """Handle the 'status' subcommand - show configuration health check."""
     print("=" * 60)
@@ -1259,6 +1305,22 @@ def main() -> None:
         action="store_true",
         help="When the input is a directory, also walk into subdirectories.",
     )
+    ext_parser.add_argument(
+        "--no-checkpoint",
+        action="store_true",
+        help=(
+            "Disable staging checkpoints (no resume across crashes). "
+            "Default for single-file mode; enabled for folder/watch runs."
+        ),
+    )
+    ext_parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help=(
+            "Ignore existing staging for this run and start a clean checkpoint "
+            "(folder/watch mode only)."
+        ),
+    )
     _add_anki_args(ext_parser)
 
     # 'clean' subcommand
@@ -1435,6 +1497,15 @@ def main() -> None:
         description="Display current configuration, folder paths, and verify setup",
     )
 
+    subparsers.add_parser(
+        "llm-check",
+        help="Probe LLM API connectivity (DNS, /models endpoint)",
+        description=(
+            "Run connectivity diagnostics against the configured LLM provider. "
+            "Useful when extract/generate fails with connection or timeout errors."
+        ),
+    )
+
     args = parser.parse_args()
 
     # Configure logging with file and console handlers
@@ -1455,6 +1526,8 @@ def main() -> None:
         cmd_backfill(args)
     elif args.command == "status":
         cmd_status(args)
+    elif args.command == "llm-check":
+        cmd_llm_check(args)
     else:
         parser.print_help()
         sys.exit(1)

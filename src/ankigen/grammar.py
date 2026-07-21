@@ -17,13 +17,13 @@ from __future__ import annotations
 
 import csv
 import logging
-import os
 import time
 import unicodedata
 from pathlib import Path
 
 from ankigen.anki_db import normalize_anki_term
 from ankigen.chunking import estimate_tokens, split_text_for_extraction
+from ankigen.extract_checkpoint import ExtractRunCheckpoint, FileCheckpoint
 from ankigen.extractor import extract_source_text
 from ankigen.hanja_lookup import resolve_hanja
 from ankigen.llm import (
@@ -31,37 +31,18 @@ from ankigen.llm import (
     Language,
     generate_grammar_examples,
     generate_structured_response,
+    grammar_json_format_block,
 )
 from ankigen.models import GrammarExample, GrammarExtractionResponse, GrammarItem
-from ankigen.resume import completed_csv_keys, durable_write
+from ankigen.resume import completed_csv_keys, durable_write, write_anki_header
 
 logger = logging.getLogger("ankigen.grammar")
 
 GRAMMAR_CSV_FIELDNAMES = ["Pattern", "Hanja", "Meaning", "Examples"]
 
-_DEFAULT_CHUNK_TOKENS = 20_000
-
-
 # ---------------------------------------------------------------------------
 # Extraction
 # ---------------------------------------------------------------------------
-
-
-def _get_chunk_tokens() -> int:
-    """Read ``ANKIGEN_LLM_CHUNK_TOKENS`` (default 20k) for extract chunking."""
-    raw = os.getenv("ANKIGEN_LLM_CHUNK_TOKENS")
-    if not raw:
-        return _DEFAULT_CHUNK_TOKENS
-    try:
-        value = int(raw)
-    except ValueError:
-        logger.warning(
-            "Invalid ANKIGEN_LLM_CHUNK_TOKENS=%r; using default %d",
-            raw,
-            _DEFAULT_CHUNK_TOKENS,
-        )
-        return _DEFAULT_CHUNK_TOKENS
-    return max(1, value)
 
 
 def _merge_grammar_items(chunks: list[list[GrammarItem]]) -> list[GrammarItem]:
@@ -112,7 +93,27 @@ def _merge_grammar_items(chunks: list[list[GrammarItem]]) -> list[GrammarItem]:
     return [by_key[k] for k in order]
 
 
-def extract_grammar_items(text: str, lang: Language = "ko") -> list[GrammarItem]:
+def _grammar_from_checkpoint(
+    run_checkpoint: ExtractRunCheckpoint,
+    file_entry: FileCheckpoint,
+) -> list[GrammarItem] | None:
+    """Rebuild merged grammar items from chunk JSONL when grammar pass finished."""
+    if file_entry.status != "grammar_done":
+        return None
+    by_index = run_checkpoint.load_all_grammar_chunks(file_entry)
+    if not by_index:
+        return None
+    ordered = [by_index[i] for i in sorted(by_index)]
+    return _merge_grammar_items(ordered)
+
+
+def extract_grammar_items(
+    text: str,
+    lang: Language = "ko",
+    *,
+    run_checkpoint: ExtractRunCheckpoint | None = None,
+    file_entry: FileCheckpoint | None = None,
+) -> list[GrammarItem]:
     """
     Identify grammar items from already-extracted text using the LLM.
 
@@ -120,7 +121,7 @@ def extract_grammar_items(text: str, lang: Language = "ko") -> list[GrammarItem]
     through and used as structural hints by the prompt.
 
     Long inputs are automatically split into chunks (each under
-    ``ANKIGEN_LLM_CHUNK_TOKENS`` tokens) so a single call never exceeds the
+    ``get_extract_chunk_tokens()``) so a single call never exceeds the
     provider's per-minute input-token budget. Grammar items are merged across
     chunks: items sharing an NFC-normalised pattern are coalesced and their
     example lists are concatenated and deduped.
@@ -129,36 +130,79 @@ def extract_grammar_items(text: str, lang: Language = "ko") -> list[GrammarItem]
         return []
 
     config = LANGUAGE_CONFIG[lang]
-    system_prompt = config["grammar_extraction_system"]
+    system_prompt = config["grammar_extraction_system"] + "\n\n" + grammar_json_format_block(lang)
     user_prompt_template = config["grammar_extraction_user"]
 
-    chunks = split_text_for_extraction(text, _get_chunk_tokens())
+    from ankigen.llm import get_extract_chunk_tokens, get_model
+
+    chunk_limit = get_extract_chunk_tokens()
+    chunks = split_text_for_extraction(text, chunk_limit)
     if len(chunks) > 1:
         logger.info(
-            "Splitting grammar extract into %d chunks (~%d tokens total) to respect rate limit",
+            "Splitting grammar extract into %d chunks (~%d tokens total, max %d tokens/chunk)",
             len(chunks),
             estimate_tokens(text),
+            chunk_limit,
         )
 
-    logger.debug("Identifying grammar items from %d characters (%s)", len(text), lang)
+    model = get_model()
     start_time = time.time()
 
     chunk_items: list[list[GrammarItem]] = []
-    for idx, chunk in enumerate(chunks, start=1):
-        if len(chunks) > 1:
-            logger.info("Identifying grammar items from chunk %d/%d", idx, len(chunks))
+    for idx, chunk in enumerate(chunks):
+        chunk_num = idx + 1
+        chunk_est = estimate_tokens(chunk)
+        cached: list[GrammarItem] | None = None
+        if run_checkpoint is not None and file_entry is not None:
+            cached = run_checkpoint.load_grammar_chunk(file_entry, idx)
+
+        if cached is not None:
+            logger.info(
+                "Resuming grammar chunk %d/%d (%d item(s) cached, model=%s)",
+                chunk_num,
+                len(chunks),
+                len(cached),
+                model,
+            )
+            chunk_items.append(cached)
+            continue
+
+        logger.info(
+            "LLM grammar chunk %d/%d (~%d est. tokens, model=%s)",
+            chunk_num,
+            len(chunks),
+            chunk_est,
+            model,
+        )
+        chunk_start = time.time()
         response = generate_structured_response(
             response_model=GrammarExtractionResponse,
             system_prompt=system_prompt,
             user_prompt=user_prompt_template.format(text=chunk),
         )
-        chunk_items.append(list(response.items))
+        items_chunk = list(response.items)
+        chunk_items.append(items_chunk)
+        logger.info(
+            "LLM grammar chunk %d/%d finished in %.2fs → %d item(s)",
+            chunk_num,
+            len(chunks),
+            time.time() - chunk_start,
+            len(items_chunk),
+        )
+        if run_checkpoint is not None and file_entry is not None:
+            run_checkpoint.save_grammar_chunk(file_entry, idx, items_chunk)
 
     items = _merge_grammar_items(chunk_items)
 
     elapsed = time.time() - start_time
-    logger.debug("Grammar identification completed in %.2fs", elapsed)
-    logger.info("Identified %d grammar item(s)", len(items))
+    logger.info(
+        "Identified %d grammar item(s) in %.2fs (%d chunk(s))",
+        len(items),
+        elapsed,
+        len(chunks),
+    )
+    if run_checkpoint is not None and file_entry is not None:
+        run_checkpoint.mark_grammar_done(file_entry)
     return items
 
 
@@ -224,12 +268,14 @@ def write_grammar_jsonl(
         with open(output_path, "a", encoding="utf-8") as f:
             for item in new_items:
                 f.write(item.model_dump_json() + "\n")
+                durable_write(f)
         logger.info("Appended %d grammar item(s) to %s", len(new_items), output_path)
         return len(new_items)
 
     with open(output_path, "w", encoding="utf-8") as f:
         for item in items:
             f.write(item.model_dump_json() + "\n")
+            durable_write(f)
     logger.info("Wrote %d grammar item(s) to %s", len(items), output_path)
     return len(items)
 
@@ -400,7 +446,7 @@ def generate_grammar_csv(
     with open(output_path, "a" if resuming else "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=GRAMMAR_CSV_FIELDNAMES)
         if not resuming:
-            writer.writeheader()
+            write_anki_header(f, GRAMMAR_CSV_FIELDNAMES)
         for item in items:
             if normalize_anki_term(item.pattern) in done:
                 continue
