@@ -8,9 +8,32 @@ from ankigen.cli import (
     _default_audit_output,
     _default_backfill_output_stem,
     generate_csv,
+    get_pinyin,
     process_word,
 )
 from ankigen.llm import TranslationResult
+from ankigen.resume import write_anki_header
+
+
+def _read_anki_csv(path: Path) -> tuple[list[str] | None, list[dict[str, str]]]:
+    """Read a generated Anki CSV, skipping the ``#`` header block.
+
+    Returns ``(columns, rows)`` where ``columns`` come from the ``#columns:``
+    directive (or ``None`` for a legacy plain-header file).
+    """
+    columns: list[str] | None = None
+    data_lines: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines(keepends=True):
+        if line.startswith("#columns:"):
+            columns = next(csv.reader([line[len("#columns:") :].strip()]))
+        elif line.startswith("#"):
+            continue
+        else:
+            data_lines.append(line)
+    reader = csv.DictReader(data_lines, fieldnames=columns)
+    fieldnames = list(reader.fieldnames) if reader.fieldnames else None
+    rows = list(reader)
+    return fieldnames, rows
 
 
 def test_generate_csv_skips_exclude_words(monkeypatch, tmp_path):
@@ -37,10 +60,22 @@ def test_generate_csv_skips_exclude_words(monkeypatch, tmp_path):
 
     assert called == ["乙"]
 
-    with open(out, encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
+    _, rows = _read_anki_csv(out)
     assert len(rows) == 1
     assert rows[0]["Hanzi"] == "乙"
+
+
+class TestGetPinyin:
+    """`get_pinyin` returns tone-marked Mandarin romanization."""
+
+    def test_basic_word(self):
+        assert get_pinyin("新鲜") == "xīnxiān"
+
+    def test_single_char(self):
+        assert get_pinyin("菜") == "cài"
+
+    def test_empty_string(self):
+        assert get_pinyin("") == ""
 
 
 class TestGenerateCsvResume:
@@ -59,11 +94,14 @@ class TestGenerateCsvResume:
         calls: list[str] = []
         monkeypatch.setattr("ankigen.cli.process_word", self._fake_pw(calls))
 
+        fieldnames = ["Hanzi", "Pinyin", "Jyutping", "English", "Sentence"]
         out = tmp_path / "out.csv"
         with open(out, "w", encoding="utf-8", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=["Hanzi", "Jyutping", "English", "Sentence"])
-            w.writeheader()
-            w.writerow({"Hanzi": "甲", "Jyutping": "", "English": "done", "Sentence": ""})
+            write_anki_header(f, fieldnames)
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writerow(
+                {"Hanzi": "甲", "Pinyin": "", "Jyutping": "", "English": "done", "Sentence": ""}
+            )
 
         inp = tmp_path / "in.txt"
         inp.write_text("甲\n乙\n", encoding="utf-8")
@@ -71,8 +109,7 @@ class TestGenerateCsvResume:
 
         # 甲 already in the file -> process_word only called for 乙.
         assert calls == ["乙"]
-        with open(out, encoding="utf-8") as f:
-            rows = list(csv.DictReader(f))
+        _, rows = _read_anki_csv(out)
         assert [r["Hanzi"] for r in rows] == ["甲", "乙"]
         assert rows[0]["English"] == "done"  # original row preserved
 
@@ -88,8 +125,7 @@ class TestGenerateCsvResume:
         generate_csv(inp, out, "zh", 0, overwrite=True)
 
         assert calls == ["甲", "乙"]
-        with open(out, encoding="utf-8") as f:
-            rows = list(csv.DictReader(f))
+        _, rows = _read_anki_csv(out)
         assert [r["Hanzi"] for r in rows] == ["甲", "乙"]
         assert rows[0]["English"] == "x"  # regenerated, not "old"
 
@@ -103,7 +139,7 @@ class TestGenerateCsvResume:
         generate_csv(inp, out, "zh", 0)
 
         content = out.read_text(encoding="utf-8")
-        assert content.count("Hanzi,Jyutping,English,Sentence") == 1
+        assert content.count("#columns:Hanzi,Pinyin,Jyutping,English,Sentence") == 1
 
 
 class TestProcessWordKoreanHanja:
@@ -181,10 +217,8 @@ class TestGenerateCsvKoreanColumns:
         out = tmp_path / "out.csv"
         generate_csv(inp, out, "ko", 0)
 
-        with open(out, encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            assert reader.fieldnames == ["Korean", "Hanja", "English", "Comments"]
-            rows = list(reader)
+        fieldnames, rows = _read_anki_csv(out)
+        assert fieldnames == ["Korean", "Hanja", "English", "Comments"]
 
         assert rows[0]["Korean"] == "음식"
         assert rows[0]["Hanja"] == "飮食"

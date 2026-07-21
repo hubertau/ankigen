@@ -121,7 +121,7 @@ ankigen uses subcommands for different operations:
 
 | `--mode` | Input | Output | Anki note shape |
 |----------|-------|--------|-----------------|
-| `vocab` (default) | `.txt` (one word per line) | `outputs/{lang}/output_{stem}.csv` | zh: Hanzi, Jyutping, English, Sentence — ko: **Korean, Hanja, English, Comments** |
+| `vocab` (default) | `.txt` (one word per line) | `outputs/{lang}/output_{stem}.csv` | zh: Hanzi, Pinyin, Jyutping, English, Sentence — ko: **Korean, Hanja, English, Comments** |
 | `grammar` (auto-detected from `.jsonl`) | `_grammar.jsonl` | `outputs/{lang}/output_{stem}_grammar.csv` | **Pattern, Hanja, Meaning, Examples** (4 cols; Hanja is populated for Sino-Korean roots, empty otherwise; Meaning bolds the short gloss with the longer explanation on the next line) |
 | `all` | Either of the two — sibling is inferred | Both CSVs | both |
 
@@ -137,9 +137,12 @@ ankigen generate inputs/zh/words.txt
 
 **Vocab output (Chinese)** (`outputs/zh/output_words.csv`):
 
-| Hanzi | Jyutping | English | Sentence |
-|-------|----------|---------|----------|
-| 促使 | cuk1sai2 | Verb: to urge, to spur | (HTML formatted sentences) |
+| Hanzi | Pinyin | Jyutping | English | Sentence |
+|-------|--------|----------|---------|----------|
+| 促使 | cùshǐ | cuk1sai2 | Verb: to urge, to spur | (HTML formatted sentences) |
+
+The Pinyin column carries tone-marked Mandarin romanization (via `pypinyin`).
+Add a matching `Pinyin` field to your Chinese note type before importing.
 
 **Vocab output (Korean)** (`outputs/ko/output_words.csv`):
 
@@ -166,6 +169,21 @@ longer explanation (next line) so each Anki card has a single "what does
 this pattern mean?" cell.
 
 The Examples column preserves the teacher's verbatim sentences from the source DOCX. If a pattern has fewer than `-n` examples, the LLM tops up the rest.
+
+**Anki import header.** Every generated vocab and grammar CSV opens with an Anki
+import header block so the file can be imported directly (no manual field
+mapping):
+
+```
+#separator:comma
+#html:true
+#columns:Hanzi,Pinyin,Jyutping,English,Sentence
+#Hanzi,#Pinyin,#Jyutping,#English,#Sentence
+```
+
+The `#columns:` directive names the fields; the trailing `#`-prefixed line is a
+human-readable echo. Resuming an interrupted run recovers the column names from
+this header, so appends stay consistent.
 
 **Options**:
 

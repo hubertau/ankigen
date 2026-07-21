@@ -72,7 +72,7 @@ from ankigen.grammar import (
 from ankigen.hanja_lookup import resolve_hanja
 from ankigen.llm import Language, generate_sentences, translate_word
 from ankigen.logging_config import get_log_dir, get_log_level, get_log_retention, setup_logging
-from ankigen.resume import completed_csv_keys, durable_write
+from ankigen.resume import completed_csv_keys, durable_write, write_anki_header
 from ankigen.similarity import SimilarPair, cluster_pairs, find_similar_pairs
 
 # Configure logging
@@ -99,6 +99,26 @@ def get_jyutping(word: str) -> str:
         # Result is a list of (character, jyutping) tuples
         jyutping_parts = [jp for _, jp in result if jp]
         return " ".join(jyutping_parts) if jyutping_parts else ""
+    except Exception:
+        return ""
+
+
+def get_pinyin(word: str) -> str:
+    """
+    Get tone-marked Pinyin (Mandarin romanization) for a Chinese word.
+
+    Syllables are joined per word with tone marks (e.g. ``新鲜`` -> ``xīnxiān``).
+    Returns an empty string if pypinyin is not available or fails.
+    """
+    try:
+        from pypinyin import Style, pinyin
+    except ImportError:
+        return ""
+
+    try:
+        # pinyin() returns a list of per-character candidate lists.
+        syllables = [group[0] for group in pinyin(word, style=Style.TONE) if group and group[0]]
+        return "".join(syllables) if syllables else ""
     except Exception:
         return ""
 
@@ -148,8 +168,10 @@ def process_word(
 
     if lang == "zh":
         jyutping = get_jyutping(word)
+        pinyin = get_pinyin(word)
         return {
             "Hanzi": word,
+            "Pinyin": pinyin,
             "Jyutping": jyutping,
             "English": translation,
             "Sentence": formatted,
@@ -237,7 +259,7 @@ def generate_csv(
 
     # Language-specific column headers
     if lang == "zh":
-        fieldnames = ["Hanzi", "Jyutping", "English", "Sentence"]
+        fieldnames = ["Hanzi", "Pinyin", "Jyutping", "English", "Sentence"]
     else:  # Korean
         fieldnames = ["Korean", "Hanja", "English", "Comments"]
     key_column = fieldnames[0]
@@ -255,7 +277,7 @@ def generate_csv(
     with open(output_file, "a" if resuming else "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         if not resuming:
-            writer.writeheader()
+            write_anki_header(f, fieldnames)
 
         for raw in words:
             bare, inline_hanja = parse_hanja_token(raw) if lang == "ko" else (raw, "")

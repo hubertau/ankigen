@@ -34,7 +34,7 @@ from ankigen.llm import (
     grammar_json_format_block,
 )
 from ankigen.models import GrammarExample, GrammarExtractionResponse, GrammarItem
-from ankigen.resume import completed_csv_keys, durable_write
+from ankigen.resume import completed_csv_keys, durable_write, write_anki_header
 
 logger = logging.getLogger("ankigen.grammar")
 
@@ -446,7 +446,7 @@ def generate_grammar_csv(
     with open(output_path, "a" if resuming else "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=GRAMMAR_CSV_FIELDNAMES)
         if not resuming:
-            writer.writeheader()
+            write_anki_header(f, GRAMMAR_CSV_FIELDNAMES)
         for item in items:
             if normalize_anki_term(item.pattern) in done:
                 continue
