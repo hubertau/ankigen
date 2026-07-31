@@ -29,6 +29,7 @@ from ankigen.formatter import (
     BR_SPLIT_RE,
     apply_markers,
     format_sentences,
+    split_field,
     split_sentences_with_highlights,
 )
 from ankigen.hanja_lookup import resolve_hanja
@@ -60,11 +61,15 @@ def split_sentences_from_html(html: str) -> list[str]:
     for any ``sentences`` and ``kw``, where ``numbered`` is
     ``"1. s1 2. s2 ..."`` and each sentence has had its leading number
     stripped (``format_sentences`` removes ``\\d+\\. `` prefixes).
+
+    Any context-notes block is dropped rather than returned as a sentence;
+    callers that rewrite the field re-prepend it themselves.
     """
-    if not html.strip():
+    sentences_html, _ = split_field(html)
+    if not sentences_html.strip():
         return []
     sentences: list[str] = []
-    for piece in BR_SPLIT_RE.split(html):
+    for piece in BR_SPLIT_RE.split(sentences_html):
         body = _ANY_SPAN_RE.sub("", piece).strip()
         if body:
             sentences.append(body)
@@ -185,7 +190,11 @@ def backfill_note(
 
     # ----- Sentences -------------------------------------------------------
     sentence_field = resolved.sentence
-    existing_html = fields.get(sentence_field, "")
+    existing_html, notes_html = split_field(fields.get(sentence_field, ""))
+
+    def _set_sentences(sentences_html: str) -> None:
+        """Write the sentence field, preserving the card's context-notes block."""
+        _set(sentence_field, notes_html + sentences_html)
 
     if "plain_text_sentences" in reason_codes:
         # Pure re-format pass — no LLM call. Wrap the existing sentences in
@@ -193,14 +202,14 @@ def backfill_note(
         existing_sentences = split_sentences_from_html(existing_html)
         if existing_sentences:
             numbered = " ".join(f"{i + 1}. {s}" for i, s in enumerate(existing_sentences))
-            _set(sentence_field, format_sentences(numbered, headword))
+            _set_sentences(format_sentences(numbered, headword))
 
     if "too_few_sentences" in reason_codes and target_sentences > 0:
         existing_sentences = split_sentences_from_html(fields.get(sentence_field, ""))
         needed = max(target_sentences - len(existing_sentences), 0)
         if needed > 0:
             try:
-                new_sentences = generate_sentences(headword, lang, needed)
+                new_sentences = generate_sentences(headword, lang, needed).sentences
             except Exception as exc:  # noqa: BLE001 — provider SDKs raise heterogeneous types
                 logger.warning(
                     "Sentence top-up failed for '%s' (%s); keeping %d existing sentence(s)",
@@ -215,14 +224,13 @@ def backfill_note(
 
         if combined:
             numbered = " ".join(f"{i + 1}. {s}" for i, s in enumerate(combined))
-            _set(sentence_field, format_sentences(numbered, headword))
+            _set_sentences(format_sentences(numbered, headword))
 
     if (
         "keyword_not_highlighted" in reason_codes
         and "plain_text_sentences" not in reason_codes
         and "too_few_sentences" not in reason_codes
     ):
-        existing_html = fields.get(sentence_field, "")
         pairs = split_sentences_with_highlights(existing_html)
         if pairs:
             reds_exist = any(reds for _, reds in pairs)
@@ -240,7 +248,7 @@ def backfill_note(
                     remarked = [s for s, _ in pairs]
                 marked = remarked
             numbered = " ".join(f"{i + 1}. {s}" for i, s in enumerate(marked))
-            _set(sentence_field, format_sentences(numbered, headword))
+            _set_sentences(format_sentences(numbered, headword))
 
     # Headword sanity check — backfill must never overwrite it.
     fields[resolved.headword] = headword

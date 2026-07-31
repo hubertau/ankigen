@@ -11,7 +11,7 @@ from ankigen.cli import (
     get_pinyin,
     process_word,
 )
-from ankigen.llm import TranslationResult
+from ankigen.llm import SentenceResult, TranslationResult
 from ankigen.resume import write_anki_header
 
 
@@ -41,7 +41,12 @@ def test_generate_csv_skips_exclude_words(monkeypatch, tmp_path):
     called: list[str] = []
 
     def fake_process_word(
-        word: str, lang: str, num_sentences: int, *, inline_hanja: str = ""
+        word: str,
+        lang: str,
+        num_sentences: int,
+        *,
+        inline_hanja: str = "",
+        include_notes: bool = True,
     ) -> dict[str, str]:
         called.append(word)
         return {
@@ -83,7 +88,12 @@ class TestGenerateCsvResume:
 
     def _fake_pw(self, calls: list[str]):
         def fake_process_word(
-            word: str, lang: str, num_sentences: int, *, inline_hanja: str = ""
+            word: str,
+            lang: str,
+            num_sentences: int,
+            *,
+            inline_hanja: str = "",
+            include_notes: bool = True,
         ) -> dict[str, str]:
             calls.append(word)
             return {"Hanzi": word, "Jyutping": "", "English": "x", "Sentence": ""}
@@ -155,7 +165,7 @@ class TestProcessWordKoreanHanja:
             "Korean": "음식",
             "Hanja": "飮食",
             "English": "food",
-            "Comments": "",
+            "Comment": "",
         }
 
     def test_embedded_hanja_wins_over_llm(self, mocker):
@@ -196,18 +206,74 @@ class TestProcessWordKoreanHanja:
         assert row["Jyutping"] == "cuk1 si2"
 
 
+class TestProcessWordContextNotes:
+    """Context notes are prepended above the sentences in a delimited block."""
+
+    def _patch(self, mocker, *, notes: str, lang: str = "ko"):
+        mocker.patch(
+            "ankigen.cli.translate_word",
+            return_value=TranslationResult(translation="food", hanja=""),
+        )
+        mocker.patch("ankigen.cli.get_jyutping", return_value="")
+        mocker.patch(
+            "ankigen.cli.generate_sentences",
+            return_value=SentenceResult(
+                sentences=["저는 **음식을** 좋아해요."] if lang == "ko" else ["他 **促使** 我。"],
+                notes=notes,
+            ),
+        )
+
+    def test_korean_notes_prepended_above_sentences(self, mocker):
+        self._patch(mocker, notes="Compare 음식 with 요리; neutral register.")
+        field = process_word("음식", "ko", 1)["Comment"]
+
+        assert '<span style="color: red;">음식을</span>' in field
+        assert field.startswith(
+            '<div class="ankigen-notes"><span style="color: gray;">'
+            "Compare 음식 with 요리; neutral register.</span></div>"
+        )
+
+    def test_chinese_notes_prepended_above_sentences(self, mocker):
+        self._patch(mocker, notes="Compare 促使 with 使得; 書面語 register.", lang="zh")
+        field = process_word("促使", "zh", 1)["Sentence"]
+
+        assert '<span style="color: red;">促使</span>' in field
+        assert field.startswith('<div class="ankigen-notes">')
+        assert 'class="ankigen-notes"' in field
+
+    def test_blank_notes_add_nothing(self, mocker):
+        self._patch(mocker, notes="")
+        assert "ankigen-notes" not in process_word("음식", "ko", 1)["Comment"]
+
+    def test_include_notes_false_suppresses_block(self, mocker):
+        self._patch(mocker, notes="Compare 음식 with 요리.")
+        field = process_word("음식", "ko", 1, include_notes=False)["Comment"]
+
+        assert "ankigen-notes" not in field
+        assert '<span style="color: red;">음식을</span>' in field
+
+    def test_zero_sentences_skips_llm_entirely(self, mocker):
+        self._patch(mocker, notes="Compare 음식 with 요리.")
+        assert process_word("음식", "ko", 0)["Comment"] == ""
+
+
 class TestGenerateCsvKoreanColumns:
     """The Korean CSV has the new `Hanja` column threaded through."""
 
     def test_korean_csv_includes_hanja_column(self, monkeypatch, tmp_path):
         def fake_process_word(
-            word: str, lang: str, num_sentences: int, *, inline_hanja: str = ""
+            word: str,
+            lang: str,
+            num_sentences: int,
+            *,
+            inline_hanja: str = "",
+            include_notes: bool = True,
         ) -> dict[str, str]:
             return {
                 "Korean": word,
                 "Hanja": inline_hanja or "TEST",
                 "English": "x",
-                "Comments": "",
+                "Comment": "",
             }
 
         monkeypatch.setattr("ankigen.cli.process_word", fake_process_word)
@@ -218,7 +284,7 @@ class TestGenerateCsvKoreanColumns:
         generate_csv(inp, out, "ko", 0)
 
         fieldnames, rows = _read_anki_csv(out)
-        assert fieldnames == ["Korean", "Hanja", "English", "Comments"]
+        assert fieldnames == ["Korean", "Hanja", "English", "Comment"]
 
         assert rows[0]["Korean"] == "음식"
         assert rows[0]["Hanja"] == "飮食"

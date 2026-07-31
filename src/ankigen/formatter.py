@@ -1,6 +1,7 @@
 """HTML formatting for vocabulary sentences."""
 
 import re
+from html import escape
 from typing import Literal
 
 from ankigen.similarity import ko_highlight_related
@@ -10,6 +11,14 @@ Language = Literal["ko", "zh"]
 # Matches the <br> separator used between sentences. Shared by audit and backfill
 # for counting and splitting sentence HTML produced by format_sentences().
 BR_SPLIT_RE = re.compile(r"<br\s*/?>", flags=re.IGNORECASE)
+
+# The context-notes block lives in the same Anki field as the sentences, so it
+# needs a wrapper that audit/backfill can strip before splitting on <br>.
+NOTES_CLASS = "ankigen-notes"
+NOTES_BLOCK_RE = re.compile(
+    rf'<div class="{NOTES_CLASS}">.*?</div>',
+    flags=re.IGNORECASE | re.DOTALL,
+)
 
 # Matches **marked** spans that the LLM inserts to identify the keyword form.
 _MARKER_RE = re.compile(r"\*\*(.+?)\*\*")
@@ -23,7 +32,35 @@ _ANY_SPAN_RE = re.compile(r"<span[^>]*>|</span>", flags=re.IGNORECASE)
 
 _RED = '<span style="color: red;">'
 _BLUE = '<span style="color: blue;">'
+_GRAY = '<span style="color: gray;">'
 _END = "</span>"
+
+
+def format_context_notes(notes: str) -> str:
+    """Render learner context notes as a delimited block for the sentence field.
+
+    Returns ``""`` for blank input so callers can concatenate unconditionally.
+    """
+    text = notes.strip()
+    if not text:
+        return ""
+    return f'<div class="{NOTES_CLASS}">{_GRAY}{escape(text)}{_END}</div>'
+
+
+def split_field(field_html: str) -> tuple[str, str]:
+    """Split a sentence field into ``(sentences_html, notes_html)``.
+
+    The notes block is optional and may appear above or below the sentences;
+    when absent the second element is ``""``. Callers that parse sentences
+    must go through this so the notes block is never counted or renumbered
+    as a sentence.
+    """
+    match = NOTES_BLOCK_RE.search(field_html)
+    if match is None:
+        return field_html, ""
+    notes_html = match.group(0)
+    sentences_html = NOTES_BLOCK_RE.sub("", field_html)
+    return sentences_html.rstrip(), notes_html
 
 
 def extract_red_spans(html: str) -> list[str]:

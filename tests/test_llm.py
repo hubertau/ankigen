@@ -3,6 +3,7 @@
 import pytest
 
 from ankigen.llm import (
+    SentenceResult,
     TranslationResult,
     generate_sentences,
     get_client,
@@ -35,13 +36,27 @@ class TestRemarkSentences:
     def test_remark_sentences_empty(self):
         assert remark_sentences("바쁘다", [], lang="ko") == []
 
+    def test_remark_never_asks_for_notes(self, mocker):
+        """Remarking must not request notes — it only re-marks existing text."""
+        SentenceResponse = create_sentence_response(1)
+        mock_generate = mocker.patch(
+            "ankigen.llm.generate_structured_response",
+            return_value=SentenceResponse(sentences=["요즘 너무 **바빠요**."]),
+        )
+        remark_sentences("바쁘다", ["요즘 너무 바빠요."], lang="ko")
+
+        call_kwargs = mock_generate.call_args.kwargs
+        assert "notes" not in call_kwargs["response_model"].model_fields
+        assert "notes" not in call_kwargs["system_prompt"]
+        assert "notes" not in call_kwargs["user_prompt"]
+
 
 class TestGenerateSentences:
     """Tests for generate_sentences function."""
 
     def test_generate_sentences_chinese(self, mocker, mock_sentences_zh):
         """Test sentence generation for Chinese."""
-        SentenceResponse = create_sentence_response(3)
+        SentenceResponse = create_sentence_response(3, with_notes=True)
         mock_response = SentenceResponse(sentences=mock_sentences_zh)
 
         mock_generate = mocker.patch(
@@ -51,13 +66,14 @@ class TestGenerateSentences:
 
         result = generate_sentences("促使", lang="zh", num_sentences=3)
 
-        assert result == mock_sentences_zh
-        assert len(result) == 3
+        assert isinstance(result, SentenceResult)
+        assert result.sentences == mock_sentences_zh
+        assert len(result.sentences) == 3
         mock_generate.assert_called_once()
 
     def test_generate_sentences_korean(self, mocker, mock_sentences_ko):
         """Test sentence generation for Korean."""
-        SentenceResponse = create_sentence_response(3)
+        SentenceResponse = create_sentence_response(3, with_notes=True)
         mock_response = SentenceResponse(sentences=mock_sentences_ko)
 
         mocker.patch(
@@ -67,13 +83,13 @@ class TestGenerateSentences:
 
         result = generate_sentences("편한", lang="ko", num_sentences=3)
 
-        assert result == mock_sentences_ko
-        assert len(result) == 3
+        assert result.sentences == mock_sentences_ko
+        assert len(result.sentences) == 3
 
     def test_generate_sentences_custom_count(self, mocker):
         """Test generating custom number of sentences."""
         sentences = ["Sentence 1.", "Sentence 2."]
-        SentenceResponse = create_sentence_response(2)
+        SentenceResponse = create_sentence_response(2, with_notes=True)
         mock_response = SentenceResponse(sentences=sentences)
 
         mocker.patch(
@@ -83,11 +99,36 @@ class TestGenerateSentences:
 
         result = generate_sentences("test", lang="zh", num_sentences=2)
 
-        assert len(result) == 2
+        assert len(result.sentences) == 2
+
+    def test_generate_sentences_returns_notes(self, mocker, mock_sentences_ko):
+        """The notes field is carried through, trimmed."""
+        SentenceResponse = create_sentence_response(3, with_notes=True)
+        mocker.patch(
+            "ankigen.llm.generate_structured_response",
+            return_value=SentenceResponse(
+                sentences=mock_sentences_ko,
+                notes="  Compare 음식 with 요리; neutral register.  ",
+            ),
+        )
+
+        result = generate_sentences("음식", lang="ko", num_sentences=3)
+
+        assert result.notes == "Compare 음식 with 요리; neutral register."
+
+    def test_generate_sentences_notes_default_empty(self, mocker, mock_sentences_ko):
+        """A model that omits notes yields an empty string, not None."""
+        SentenceResponse = create_sentence_response(3, with_notes=True)
+        mocker.patch(
+            "ankigen.llm.generate_structured_response",
+            return_value=SentenceResponse(sentences=mock_sentences_ko),
+        )
+
+        assert generate_sentences("음식", lang="ko", num_sentences=3).notes == ""
 
     def test_generate_sentences_uses_correct_prompt(self, mocker, mock_sentences_zh):
         """Test that the correct language prompt is used."""
-        SentenceResponse = create_sentence_response(3)
+        SentenceResponse = create_sentence_response(3, with_notes=True)
         mock_response = SentenceResponse(sentences=mock_sentences_zh)
 
         mock_generate = mocker.patch(
@@ -100,6 +141,29 @@ class TestGenerateSentences:
         call_kwargs = mock_generate.call_args.kwargs
         assert "Chinese" in call_kwargs["system_prompt"]
         assert "Chinese" in call_kwargs["user_prompt"]
+
+    @pytest.mark.parametrize(
+        ("lang", "word", "forbidden"),
+        [("ko", "음식", "romanization"), ("zh", "促使", "pinyin")],
+    )
+    def test_sentence_prompt_asks_for_context_notes(
+        self, mocker, mock_sentences_zh, lang, word, forbidden
+    ):
+        """Both languages ask for confusable words and register in `notes`."""
+        SentenceResponse = create_sentence_response(3, with_notes=True)
+        mock_generate = mocker.patch(
+            "ankigen.llm.generate_structured_response",
+            return_value=SentenceResponse(sentences=mock_sentences_zh),
+        )
+
+        generate_sentences(word, lang=lang, num_sentences=3)
+
+        user_prompt = mock_generate.call_args.kwargs["user_prompt"]
+        assert "`notes`" in user_prompt
+        assert "easily-confused" in user_prompt
+        assert "register" in user_prompt
+        assert forbidden in user_prompt
+        assert "notes" in mock_generate.call_args.kwargs["system_prompt"]
 
 
 class TestTranslateWord:
@@ -408,3 +472,16 @@ class TestSentenceResponseModel:
 
         with pytest.raises(ValueError):
             Model(sentences=["a", "b", "c", "d"])  # 4, max is 3
+
+    def test_no_notes_field_by_default(self):
+        """The default model has no notes field, so remarking stays unchanged."""
+        assert "notes" not in create_sentence_response(3).model_fields
+
+    def test_with_notes_adds_optional_notes_field(self):
+        Model = create_sentence_response(3, with_notes=True)
+
+        assert Model(sentences=["a", "b", "c"]).notes == ""
+        assert Model(sentences=["a", "b", "c"], notes="x").notes == "x"
+        # instructor/diagnostics dispatch on the class name, so both variants
+        # must present the same one.
+        assert Model.__name__ == "SentenceResponse"
