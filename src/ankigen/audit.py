@@ -10,7 +10,7 @@ weak fields.
 Default card shapes (see :func:`ankigen.cli.generate_csv` for the source
 of truth):
 
-* Korean: ``Korean | Hanja | English | Comments``
+* Korean: ``Korean | Hanja | English | Comment``
 * Chinese: ``Hanzi | Jyutping | English | Sentence``
 
 Language detection still uses field presence (``Korean`` vs ``Hanzi``)
@@ -23,11 +23,11 @@ keyed by Anki model name:
 .. code-block:: json
 
     {
-      "Korean (advanced)": {
+      "Korean (legacy)": {
         "headword_field": "Korean",
         "hanja_field": "Hanja",
         "english_field": "English",
-        "sentence_field": "Comment"
+        "sentence_field": "Comments"
       }
     }
 
@@ -48,7 +48,7 @@ from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
 from ankigen.anki_db import AnkiNote
-from ankigen.formatter import BR_SPLIT_RE, has_keyword_highlight
+from ankigen.formatter import BR_SPLIT_RE, has_keyword_highlight, split_field
 from ankigen.hanja_lookup import extract_hanja_chars
 from ankigen.llm import Language
 
@@ -64,7 +64,7 @@ _DEFAULT_FIELDS: dict[Language, dict[str, str]] = {
         "headword_field": "Korean",
         "hanja_field": "Hanja",
         "english_field": "English",
-        "sentence_field": "Comments",
+        "sentence_field": "Comment",
     },
     "zh": {
         "headword_field": "Hanzi",
@@ -102,8 +102,8 @@ _FIELD_CANDIDATES: dict[str, tuple[str, ...]] = {
     "jyutping_field": ("jyutping", "pinyin", "romanization", "reading"),
     "english_field": ("english", "translation", "meaning", "def", "definition"),
     "sentence_field": (
-        "comments",
         "comment",
+        "comments",
         "sentence",
         "sentences",
         "examples",
@@ -404,16 +404,23 @@ def count_sentence_blocks(html: str) -> int:
     multiple alternating blue/red spans because the keyword interrupts the
     outer blue span (see :func:`ankigen.formatter.format_sentences`).
     Empty or whitespace-only pieces are ignored, so a trailing ``<br>``
-    doesn't inflate the count.
+    doesn't inflate the count. Any context-notes block is dropped first so
+    it never counts as a sentence.
     """
-    if not html.strip():
+    sentences_html, _ = split_field(html)
+    if not sentences_html.strip():
         return 0
-    return sum(1 for piece in BR_SPLIT_RE.split(html) if piece.strip())
+    return sum(1 for piece in BR_SPLIT_RE.split(sentences_html) if piece.strip())
 
 
 def is_plain_text(html: str) -> bool:
-    """True if ``html`` is non-empty but carries no ``<span`` tags at all."""
-    return bool(html.strip()) and "<span" not in html
+    """True if the sentence portion is non-empty but carries no ``<span`` tags.
+
+    The context-notes block is stripped first — it always carries a span, so
+    leaving it in would hide legacy un-formatted sentences from the rule.
+    """
+    sentences_html, _ = split_field(html)
+    return bool(sentences_html.strip()) and "<span" not in sentences_html
 
 
 # ---------------------------------------------------------------------------
@@ -541,10 +548,11 @@ def _rule_keyword_not_highlighted(
     fires instead — both are about the same field, but each rule asks for
     a distinct backfill action so we keep them separate).
     """
-    html = note.fields.get(resolved.sentence, "")
+    field_html = note.fields.get(resolved.sentence, "")
+    html, _ = split_field(field_html)
     if not html.strip():
         return None
-    if is_plain_text(html):
+    if is_plain_text(field_html):
         return None
     headword = note.fields.get(resolved.headword, "")
     if has_keyword_highlight(html, headword, lang):

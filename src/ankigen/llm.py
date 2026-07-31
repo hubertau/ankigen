@@ -39,6 +39,18 @@ class TranslationResult:
     hanja: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class SentenceResult:
+    """Return shape for :func:`generate_sentences`.
+
+    ``notes`` carries free-form learner context (confusable words, register,
+    collocation quirks) and is ``""`` when the LLM had nothing to add.
+    """
+
+    sentences: list[str]
+    notes: str = ""
+
+
 logger = logging.getLogger("ankigen.llm")
 
 # Load environment variables
@@ -79,7 +91,16 @@ LANGUAGE_CONFIG = {
             "the word '{word}'. The sentences should demonstrate different usages and "
             "contexts of the word. Wrap the word exactly as it appears in each sentence "
             "in double asterisks, e.g. **{word}**. "
-            "Return only the sentences, no translations or explanations."
+            "Return the sentences in the `sentences` field, with no translations or "
+            "explanations inside them.\n\n"
+            "Also return a short `notes` field with the practical context a learner "
+            "needs for '{word}': the closest similar or easily-confused Chinese words "
+            "and how they differ; the register the word belongs to (written/formal "
+            "書面語 vs spoken/colloquial 口語); and any measure-word or collocation "
+            "quirk worth remembering. Write the notes in English, keep them under "
+            "about 40 words, separate points with semicolons, and cite Chinese terms "
+            "in characters. Do NOT include pinyin. Return an empty string if there is "
+            "genuinely nothing useful to add."
         ),
         "remark_prompt": (
             "You are given exactly {num_sentences} existing Chinese example sentences. "
@@ -122,7 +143,16 @@ LANGUAGE_CONFIG = {
             "contexts of the word. Wrap the word's form as it naturally appears in the "
             "sentence (conjugated or with particles) in double asterisks, "
             "e.g. **먹었어요** for 먹다 or **음식을** for 음식. "
-            "Return only the sentences, no translations or explanations."
+            "Return the sentences in the `sentences` field, with no translations or "
+            "explanations inside them.\n\n"
+            "Also return a short `notes` field with the practical context a learner "
+            "needs for '{word}': the closest similar or easily-confused Korean words "
+            "and how they differ; the register the word belongs to (written vs spoken, "
+            "formal vs casual, honorific); and any particle, conjugation, or "
+            "collocation quirk worth remembering. Write the notes in English, keep "
+            "them under about 40 words, separate points with semicolons, and cite "
+            "Korean terms in Hangul. Do NOT include romanization. Return an empty "
+            "string if there is genuinely nothing useful to add."
         ),
         "remark_prompt": (
             "You are given exactly {num_sentences} existing Korean example sentences. "
@@ -305,6 +335,17 @@ def structured_json_format_block(
             example: dict[str, object] = {"sentences": ["먹었어요.", "음식을 주문했어요."]}
         else:
             example = {"sentences": ["我会说中文。", "他在吃饭。"]}
+        if "notes" in response_model.model_fields:
+            if lang == "ko":
+                example["notes"] = (
+                    "Compare 음식 (food in general) with 요리 (a cooked dish); "
+                    "neutral register, fine in both speech and writing."
+                )
+            else:
+                example["notes"] = (
+                    "Compare 吃饭 (to eat a meal) with 用餐 (formal, 書面語); "
+                    "口語 register, usually takes no object."
+                )
     elif name == "TranslationResponse":
         example = {"translation": "to eat; verb"}
     elif name == "KoreanTranslationResponse":
@@ -1082,9 +1123,9 @@ def generate_structured_response[ResponseModelT: BaseModel](
         _request_bucket.record()
 
 
-def generate_sentences(word: str, lang: Language = "zh", num_sentences: int = 3) -> list[str]:
+def generate_sentences(word: str, lang: Language = "zh", num_sentences: int = 3) -> SentenceResult:
     """
-    Generate example sentences for a word using the LLM.
+    Generate example sentences plus context notes for a word using the LLM.
 
     Args:
         word: The vocabulary word to generate sentences for
@@ -1092,11 +1133,12 @@ def generate_sentences(word: str, lang: Language = "zh", num_sentences: int = 3)
         num_sentences: Number of sentences to generate (default: 3)
 
     Returns:
-        List of example sentences
+        :class:`SentenceResult` with the example sentences and free-form
+        learner context notes (``""`` when the LLM had nothing to add).
     """
     model = get_model()
     config = LANGUAGE_CONFIG[lang]
-    SentenceResponse = create_sentence_response(num_sentences)
+    SentenceResponse = create_sentence_response(num_sentences, with_notes=True)
 
     logger.debug("Generating %d sentences for '%s' using %s", num_sentences, word, model)
     start_time = time.time()
@@ -1105,7 +1147,7 @@ def generate_sentences(word: str, lang: Language = "zh", num_sentences: int = 3)
         response_model=SentenceResponse,
         system_prompt=_system_prompt_with_json(
             f"You are a helpful {config['name']} language tutor. "
-            "Generate natural, useful example sentences.",
+            "Generate natural, useful example sentences and concise usage notes.",
             SentenceResponse,
             lang=lang,
         ),
@@ -1116,8 +1158,9 @@ def generate_sentences(word: str, lang: Language = "zh", num_sentences: int = 3)
     # instructor dynamically patches the return type based on response_model,
     # but mypy can't infer this at static analysis time
     sentences = response.sentences  # type: ignore[attr-defined]
+    notes = getattr(response, "notes", "") or ""
     logger.debug("Generated %d sentences in %.2fs", len(sentences), elapsed)
-    return sentences  # type: ignore[no-any-return]
+    return SentenceResult(sentences=sentences, notes=notes.strip())
 
 
 def remark_sentences(word: str, sentences: list[str], lang: Language = "zh") -> list[str]:
@@ -1130,7 +1173,7 @@ def remark_sentences(word: str, sentences: list[str], lang: Language = "zh") -> 
     model = get_model()
     config = LANGUAGE_CONFIG[lang]
     num = len(sentences)
-    SentenceResponse = create_sentence_response(num)
+    SentenceResponse = create_sentence_response(num, with_notes=False)
     numbered = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(sentences))
 
     logger.debug("Remarking %d sentence(s) for '%s' using %s", num, word, model)

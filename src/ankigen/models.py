@@ -6,11 +6,32 @@ from pydantic import BaseModel, Field
 
 
 @cache
-def create_sentence_response(num_sentences: int = 3) -> type[BaseModel]:
-    """Factory to create a SentenceResponse model with dynamic sentence count."""
+def create_sentence_response(
+    num_sentences: int = 3,
+    with_notes: bool = False,
+) -> type[BaseModel]:
+    """Factory to create a SentenceResponse model with dynamic sentence count.
 
-    class SentenceResponse(BaseModel):
-        """Response model for sentence generation."""
+    ``with_notes`` adds a free-form ``notes`` field for learner context
+    (confusable words, register, collocation quirks). Left off for
+    :func:`ankigen.llm.remark_sentences`, which only re-marks existing text.
+    """
+    if not with_notes:
+
+        class SentenceResponse(BaseModel):
+            """Response model for sentence generation."""
+
+            sentences: list[str] = Field(
+                ...,
+                min_length=num_sentences,
+                max_length=num_sentences,
+                description=f"Exactly {num_sentences} example sentences using the target word",
+            )
+
+        return SentenceResponse
+
+    class SentenceResponseWithNotes(BaseModel):
+        """Response model for sentence generation plus learner context notes."""
 
         sentences: list[str] = Field(
             ...,
@@ -18,8 +39,20 @@ def create_sentence_response(num_sentences: int = 3) -> type[BaseModel]:
             max_length=num_sentences,
             description=f"Exactly {num_sentences} example sentences using the target word",
         )
+        notes: str = Field(
+            default="",
+            description=(
+                "Short English usage notes for the target word: closest "
+                "similar or easily-confused words and how they differ, the "
+                "register the word belongs to (written vs spoken, formal vs "
+                "casual), and any collocation quirk worth remembering. "
+                "Return an empty string when there is nothing useful to add."
+            ),
+        )
 
-    return SentenceResponse
+    SentenceResponseWithNotes.__name__ = "SentenceResponse"
+    SentenceResponseWithNotes.__qualname__ = "SentenceResponse"
+    return SentenceResponseWithNotes
 
 
 class TranslationResponse(BaseModel):

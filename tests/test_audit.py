@@ -21,17 +21,17 @@ from ankigen.audit import (
     summarize_audit,
     write_audit_jsonl,
 )
-from ankigen.formatter import format_sentences
+from ankigen.formatter import format_context_notes, format_sentences
 
 # ---------------------------------------------------------------------------
 # Builders
 # ---------------------------------------------------------------------------
 
 
-_KO_FIELD_ORDER = ["Korean", "Hanja", "English", "Comments"]
+_KO_FIELD_ORDER = ["Korean", "Hanja", "English", "Comment"]
 _ZH_FIELD_ORDER = ["Hanzi", "Jyutping", "English", "Sentence"]
 _KO_DEFAULT_RESOLVED = ResolvedFields(
-    headword="Korean", secondary="Hanja", english="English", sentence="Comments"
+    headword="Korean", secondary="Hanja", english="English", sentence="Comment"
 )
 _ZH_DEFAULT_RESOLVED = ResolvedFields(
     headword="Hanzi", secondary="Jyutping", english="English", sentence="Sentence"
@@ -53,7 +53,7 @@ def _ko_note(
         mid=100,
         model_name="Korean Vocab",
         deck_id=1,
-        fields={"Korean": korean, "Hanja": hanja, "English": english, "Comments": comments},
+        fields={"Korean": korean, "Hanja": hanja, "English": english, "Comment": comments},
         field_order=list(_KO_FIELD_ORDER),
     )
 
@@ -151,6 +151,13 @@ class TestCountSentenceBlocks:
         # No <br>, no <span> — single chunk.
         assert count_sentence_blocks("just plain text here") == 1
 
+    def test_context_notes_block_is_not_a_sentence(self):
+        html = format_context_notes("Compare 음식 with 요리.") + _three_ko_sentences()
+        assert count_sentence_blocks(html) == 3
+
+    def test_notes_only_field_counts_zero(self):
+        assert count_sentence_blocks(format_context_notes("Register: written only.")) == 0
+
 
 class TestHasKeywordHighlight:
     def test_returns_true_when_red_span_matches(self):
@@ -188,6 +195,13 @@ class TestIsPlainText:
     def test_empty_false(self):
         assert is_plain_text("") is False
         assert is_plain_text("   ") is False
+
+    def test_notes_block_does_not_mask_plain_sentences(self):
+        html = format_context_notes("Register: casual.") + "just a sentence."
+        assert is_plain_text(html) is True
+
+    def test_notes_only_field_is_not_plain_text(self):
+        assert is_plain_text(format_context_notes("Register: casual.")) is False
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +306,42 @@ class TestKoreanRules:
         # `keyword_not_highlighted` is suppressed when `plain_text_sentences` fires
         # because both target the same field and trigger different backfill actions.
         assert "keyword_not_highlighted" not in codes
+
+
+class TestKoreanRulesWithContextNotes:
+    """The context-notes block must be invisible to every sentence rule."""
+
+    def test_well_formed_card_with_notes_not_flagged(self):
+        html = format_context_notes("Compare 음식 with 요리.") + _three_ko_sentences()
+        note = _ko_note(comments=html)
+        assert audit_notes([note], target_sentences=3, jyutping_resolver=_fake_jyutping) == []
+
+    def test_notes_do_not_hide_too_few_sentences(self):
+        html = format_context_notes("Compare 음식 with 요리.") + format_sentences(
+            "1. 저는 음식을 좋아해요.", "음식"
+        )
+        note = _ko_note(comments=html)
+        results = audit_notes([note], target_sentences=3, jyutping_resolver=_fake_jyutping)
+        codes = {r.code for r in results[0].reasons}
+        assert "too_few_sentences" in codes
+
+    def test_notes_do_not_hide_plain_text_sentences(self):
+        note = _ko_note(
+            comments=format_context_notes("Compare 음식 with 요리.")
+            + "저는 음식을 좋아해요. 한국 음식이 맛있어요. 매일 음식을 먹어요."
+        )
+        results = audit_notes([note], target_sentences=3, jyutping_resolver=_fake_jyutping)
+        codes = {r.code for r in results[0].reasons}
+        assert "plain_text_sentences" in codes
+        assert "keyword_not_highlighted" not in codes
+
+    def test_notes_do_not_satisfy_keyword_highlight(self):
+        # Notes mention the headword, but only red spans in the sentences count.
+        html = format_context_notes("음료 is the drinkable kind.") + _three_ko_sentences("음식")
+        note = _ko_note(korean="음료", hanja="飮料", comments=html)
+        results = audit_notes([note], target_sentences=3, jyutping_resolver=_fake_jyutping)
+        codes = {r.code for r in results[0].reasons}
+        assert "keyword_not_highlighted" in codes
 
 
 # ---------------------------------------------------------------------------
@@ -552,7 +602,7 @@ def _custom_ko_note(
             "Korean": "음식",
             "Hanja": "",
             "English": "food",
-            "Comments": "",
+            "Comment": "",
         }
     )
     field_order = field_order if field_order is not None else list(fields.keys())
@@ -587,21 +637,21 @@ class TestResolveFieldsForNote:
         assert result == _ZH_DEFAULT_RESOLVED
 
     def test_override_replaces_sentence_field(self):
-        # Korean (advanced)-style schema: singular "Comment".
+        # Legacy schema: plural "Comments" instead of the default "Comment".
         note = _custom_ko_note(
-            model_name="Korean (advanced)",
+            model_name="Korean (legacy)",
             fields={
                 "Korean": "음식",
                 "Hanja": "",
                 "English": "food",
-                "Comment": "",
+                "Comments": "",
             },
-            field_order=["Korean", "Hanja", "English", "Comment"],
+            field_order=["Korean", "Hanja", "English", "Comments"],
         )
-        overrides = {"Korean (advanced)": {"sentence_field": "Comment"}}
+        overrides = {"Korean (legacy)": {"sentence_field": "Comments"}}
         result = resolve_fields_for_note(note, "ko", overrides=overrides)
         assert result is not None
-        assert result.sentence == "Comment"
+        assert result.sentence == "Comments"
         # Other roles still come from defaults.
         assert result.headword == "Korean"
         assert result.secondary == "Hanja"
@@ -609,33 +659,33 @@ class TestResolveFieldsForNote:
 
     def test_override_log_emitted_once_per_model(self, caplog):
         note = _custom_ko_note(
-            model_name="Korean (advanced)",
-            fields={"Korean": "X", "Hanja": "", "English": "x", "Comment": ""},
-            field_order=["Korean", "Hanja", "English", "Comment"],
+            model_name="Korean (legacy)",
+            fields={"Korean": "X", "Hanja": "", "English": "x", "Comments": ""},
+            field_order=["Korean", "Hanja", "English", "Comments"],
         )
-        overrides = {"Korean (advanced)": {"sentence_field": "Comment"}}
+        overrides = {"Korean (legacy)": {"sentence_field": "Comments"}}
         warned: set[tuple[str, str]] = set()
         with caplog.at_level("INFO"):
             for _ in range(5):
                 resolve_fields_for_note(note, "ko", overrides=overrides, warned=warned)
         # Exactly one "Note-type override active" log line, even with 5 calls.
         assert caplog.text.count("Note-type override active") == 1
-        assert "sentence_field='Comment'" in caplog.text
+        assert "sentence_field='Comments'" in caplog.text
 
     def test_missing_field_returns_none_with_warning_and_suggestion(self, caplog):
-        # `Korean (advanced)` carries a singular "Comment" field but no
+        # `Korean (legacy)` carries a plural "Comments" field but no
         # override is configured.
         note = _custom_ko_note(
-            model_name="Korean (advanced)",
-            fields={"Korean": "X", "Hanja": "", "English": "x", "Comment": ""},
-            field_order=["Korean", "Hanja", "English", "Comment"],
+            model_name="Korean (legacy)",
+            fields={"Korean": "X", "Hanja": "", "English": "x", "Comments": ""},
+            field_order=["Korean", "Hanja", "English", "Comments"],
         )
         with caplog.at_level("WARNING"):
             result = resolve_fields_for_note(note, "ko", overrides={})
         assert result is None
-        assert "Skipping note type 'Korean (advanced)'" in caplog.text
-        assert "sentence_field='Comments'" in caplog.text  # the expected default
-        assert "'Comment'" in caplog.text  # the suggested candidate
+        assert "Skipping note type 'Korean (legacy)'" in caplog.text
+        assert "sentence_field='Comment'" in caplog.text  # the expected default
+        assert "'Comments'" in caplog.text  # the suggested candidate
         # Suggestion snippet should be copy-pasteable.
         assert "ANKIGEN_NOTE_TYPE_OVERRIDES=" in caplog.text
 
@@ -653,21 +703,21 @@ class TestResolveFieldsForNote:
 
     def test_warning_deduped_per_model_and_role(self, caplog):
         note_a = _custom_ko_note(
-            model_name="Korean (advanced)",
-            fields={"Korean": "A", "Hanja": "", "English": "x", "Comment": ""},
-            field_order=["Korean", "Hanja", "English", "Comment"],
+            model_name="Korean (legacy)",
+            fields={"Korean": "A", "Hanja": "", "English": "x", "Comments": ""},
+            field_order=["Korean", "Hanja", "English", "Comments"],
         )
         note_b = _custom_ko_note(
-            model_name="Korean (advanced)",
-            fields={"Korean": "B", "Hanja": "", "English": "y", "Comment": ""},
-            field_order=["Korean", "Hanja", "English", "Comment"],
+            model_name="Korean (legacy)",
+            fields={"Korean": "B", "Hanja": "", "English": "y", "Comments": ""},
+            field_order=["Korean", "Hanja", "English", "Comments"],
         )
         warned: set[tuple[str, str]] = set()
         with caplog.at_level("WARNING"):
             resolve_fields_for_note(note_a, "ko", overrides={}, warned=warned)
             resolve_fields_for_note(note_b, "ko", overrides={}, warned=warned)
         # One warning total — both notes share the same (model, role) key.
-        assert caplog.text.count("Skipping note type 'Korean (advanced)'") == 1
+        assert caplog.text.count("Skipping note type 'Korean (legacy)'") == 1
 
 
 # ---------------------------------------------------------------------------
@@ -678,38 +728,38 @@ class TestResolveFieldsForNote:
 class TestAuditNotesWithOverrides:
     def test_audits_alternative_schema_when_override_configured(self):
         note = _custom_ko_note(
-            model_name="Korean (advanced)",
+            model_name="Korean (legacy)",
             fields={
                 "Korean": "음식",
                 "Hanja": "",
                 "English": "food",
-                "Comment": "",  # singular, would be missed without override
+                "Comments": "",  # plural, would be missed without override
             },
-            field_order=["Korean", "Hanja", "English", "Comment"],
+            field_order=["Korean", "Hanja", "English", "Comments"],
         )
-        overrides = {"Korean (advanced)": {"sentence_field": "Comment"}}
+        overrides = {"Korean (legacy)": {"sentence_field": "Comments"}}
         results = audit_notes(
             [note],
             target_sentences=3,
             overrides=overrides,
             jyutping_resolver=lambda _: "",
         )
-        # Sentence rule fires against the resolved "Comment" field (empty → 0<3).
+        # Sentence rule fires against the resolved "Comments" field (empty → 0<3).
         codes = {r.code for r in results[0].reasons}
         assert "too_few_sentences" in codes
         # And the persisted resolved.sentence matches the override.
-        assert results[0].resolved.sentence == "Comment"
+        assert results[0].resolved.sentence == "Comments"
 
     def test_skips_note_type_when_no_override_and_field_missing(self, caplog):
         note = _custom_ko_note(
-            model_name="Korean (advanced)",
+            model_name="Korean (legacy)",
             fields={
                 "Korean": "음식",
                 "Hanja": "",
                 "English": "food",
-                "Comment": "",
+                "Comments": "",
             },
-            field_order=["Korean", "Hanja", "English", "Comment"],
+            field_order=["Korean", "Hanja", "English", "Comments"],
         )
         with caplog.at_level("WARNING"):
             results = audit_notes(
@@ -720,23 +770,23 @@ class TestAuditNotesWithOverrides:
             )
         # Note is skipped — no audited entry returned, no LLM call queued.
         assert results == []
-        assert "Skipping note type 'Korean (advanced)'" in caplog.text
+        assert "Skipping note type 'Korean (legacy)'" in caplog.text
 
     def test_skipped_note_summary_logged(self, caplog):
         notes = [
             _custom_ko_note(
-                model_name="Korean (advanced)",
+                model_name="Korean (legacy)",
                 fields={
                     "Korean": f"word{i}",
                     "Hanja": "",
                     "English": "x",
-                    "Comment": "",
+                    "Comments": "",
                 },
-                field_order=["Korean", "Hanja", "English", "Comment"],
+                field_order=["Korean", "Hanja", "English", "Comments"],
             )
             for i in range(3)
         ]
         with caplog.at_level("INFO"):
             audit_notes(notes, target_sentences=3, overrides={}, jyutping_resolver=lambda _: "")
         # Aggregated count: 3 notes skipped under one note type.
-        assert "Skipped 3 note(s) from unrecognised note type 'Korean (advanced)'" in caplog.text
+        assert "Skipped 3 note(s) from unrecognised note type 'Korean (legacy)'" in caplog.text
