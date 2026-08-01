@@ -72,6 +72,7 @@ from ankigen.grammar import (
 from ankigen.hanja_lookup import resolve_hanja
 from ankigen.llm import Language, generate_sentences, translate_word
 from ankigen.logging_config import get_log_dir, get_log_level, get_log_retention, setup_logging
+from ankigen.pattern_format import pattern_dedupe_key
 from ankigen.resume import completed_csv_keys, durable_write, write_anki_header
 from ankigen.similarity import SimilarPair, cluster_pairs, find_similar_pairs
 
@@ -584,7 +585,12 @@ def _extract_single_file_grammar(args: argparse.Namespace, output_file: Path | N
     exclude_patterns = _resolve_anki_words(args, args.lang)
     if exclude_patterns:
         before = len(items)
-        items = [it for it in items if normalize_anki_term(it.pattern) not in exclude_patterns]
+        # Canonical key on both sides, so a deck holding one notational
+        # variant suppresses the others (see ankigen.pattern_format).
+        exclude_keys = {pattern_dedupe_key(p, args.lang) for p in exclude_patterns}
+        items = [
+            it for it in items if pattern_dedupe_key(it.pattern, args.lang) not in exclude_keys
+        ]
         skipped = before - len(items)
         if skipped:
             logger.info("Skipped %d grammar pattern(s) already present in Anki", skipped)

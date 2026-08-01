@@ -858,7 +858,7 @@ def process_folder(
                         and file_entry is not None
                         and file_entry.status == "grammar_done"
                     ):
-                        items = _grammar_from_checkpoint(run_checkpoint, file_entry)
+                        items = _grammar_from_checkpoint(run_checkpoint, file_entry, lang)
                         if items is not None:
                             logger.info(
                                 "Reusing %d cached grammar item(s) for %s",
@@ -929,11 +929,14 @@ def process_folder(
     if mode in ("grammar", "all"):
         if all_grammar_items:
             if exclude_patterns:
+                from ankigen.pattern_format import pattern_dedupe_key
+
                 before = len(all_grammar_items)
+                exclude_keys = {pattern_dedupe_key(p, lang) for p in exclude_patterns}
                 all_grammar_items = [
                     it
                     for it in all_grammar_items
-                    if normalize_anki_term(it.pattern) not in exclude_patterns
+                    if pattern_dedupe_key(it.pattern, lang) not in exclude_keys
                 ]
                 skipped = before - len(all_grammar_items)
                 if skipped:

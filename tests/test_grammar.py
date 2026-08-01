@@ -1,5 +1,6 @@
 """Tests for the grammar module."""
 
+import csv
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -877,3 +878,76 @@ class TestSingleFileDatedDefaults:
         assert custom.exists()
         today = datetime.now().strftime("%Y%m%d")
         assert not (isolated_dirs["out"] / "ko" / f"{today}.txt").exists()
+
+
+class TestCanonicalPatternOutput:
+    """Patterns are emitted canonically, and compared canonically on both sides."""
+
+    def _jsonl(self, tmp_path: Path, patterns: list[str]) -> Path:
+        items = [GrammarItem(pattern=p, meaning="m", explanation="", examples=[]) for p in patterns]
+        path = tmp_path / "g.jsonl"
+        write_grammar_jsonl(items, path)
+        return path
+
+    def _patterns_in(self, csv_path: Path) -> list[str]:
+        rows = []
+        for line in csv_path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("#") or not line.strip():
+                continue
+            rows.append(next(csv.reader([line]))[0])
+        return rows
+
+    def test_csv_emits_canonical_pattern(self, tmp_path: Path, mocker):
+        mocker.patch("ankigen.grammar.generate_grammar_examples", return_value=[])
+        src = self._jsonl(tmp_path, ["~ㄹ까 하다"])
+        out = tmp_path / "out.csv"
+        generate_grammar_csv(src, out, "ko", 0)
+        assert self._patterns_in(out) == ["~(으)ㄹ까 하다"]
+
+    def test_anki_dedupe_matches_across_notations(self, tmp_path: Path, mocker):
+        """A deck holding one spelling suppresses generating another."""
+        mocker.patch("ankigen.grammar.generate_grammar_examples", return_value=[])
+        src = self._jsonl(tmp_path, ["~(으)ㄹ까 하다"])
+        out = tmp_path / "out.csv"
+        generate_grammar_csv(src, out, "ko", 0, exclude_patterns={"~ㄹ/을까 하다"})
+        assert self._patterns_in(out) == []
+
+    def test_resume_matches_across_notations(self, tmp_path: Path, mocker):
+        """A row already written under one spelling isn't re-emitted under another."""
+        mocker.patch("ankigen.grammar.generate_grammar_examples", return_value=[])
+        out = tmp_path / "out.csv"
+        generate_grammar_csv(self._jsonl(tmp_path, ["~ㄹ/을까 하다"]), out, "ko", 0)
+        assert self._patterns_in(out) == ["~(으)ㄹ까 하다"]
+        # Second pass, same point spelled differently — must not duplicate.
+        generate_grammar_csv(self._jsonl(tmp_path, ["~을까 하다"]), out, "ko", 0)
+        assert self._patterns_in(out) == ["~(으)ㄹ까 하다"]
+
+    def test_extraction_merges_notational_variants(self):
+        """Two chunks naming the same point differently become one item."""
+        from ankigen.grammar import _merge_grammar_items
+
+        chunks = [
+            [GrammarItem(pattern="~ㄹ/을까 하다", meaning="intend", examples=[])],
+            [GrammarItem(pattern="~(으)ㄹ까 하다", meaning="intend", examples=[])],
+        ]
+        merged = _merge_grammar_items(chunks, "ko")
+        assert len(merged) == 1
+        assert merged[0].pattern == "~(으)ㄹ까 하다"
+
+    def test_jsonl_append_dedupes_across_notations(self, tmp_path: Path):
+        path = tmp_path / "g.jsonl"
+        write_grammar_jsonl([GrammarItem(pattern="~(으)ㄹ까 하다", meaning="m", examples=[])], path)
+        added = write_grammar_jsonl(
+            [GrammarItem(pattern="~ㄹ까 하다", meaning="m", examples=[])],
+            path,
+            append=True,
+        )
+        assert added == 0
+        assert len(read_grammar_jsonl(path)) == 1
+
+    def test_chinese_patterns_pass_through(self, tmp_path: Path, mocker):
+        mocker.patch("ankigen.grammar.generate_grammar_examples", return_value=[])
+        src = self._jsonl(tmp_path, ["会", "(是)…的"])
+        out = tmp_path / "out.csv"
+        generate_grammar_csv(src, out, "zh", 0)
+        assert self._patterns_in(out) == ["会", "(是)…的"]

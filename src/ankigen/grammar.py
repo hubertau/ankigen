@@ -21,7 +21,6 @@ import time
 import unicodedata
 from pathlib import Path
 
-from ankigen.anki_db import normalize_anki_term
 from ankigen.chunking import estimate_tokens, split_text_for_extraction
 from ankigen.extract_checkpoint import ExtractRunCheckpoint, FileCheckpoint
 from ankigen.extractor import extract_source_text
@@ -35,6 +34,7 @@ from ankigen.llm import (
     grammar_json_format_block,
 )
 from ankigen.models import GrammarExample, GrammarExtractionResponse, GrammarItem
+from ankigen.pattern_format import normalize_pattern, pattern_dedupe_key
 from ankigen.resume import completed_csv_keys, durable_write, write_anki_header
 
 logger = logging.getLogger("ankigen.grammar")
@@ -55,7 +55,10 @@ def _normalise_example_target(target: str) -> str:
     return unicodedata.normalize("NFC", strip_markers(target).strip())
 
 
-def _merge_grammar_items(chunks: list[list[GrammarItem]]) -> list[GrammarItem]:
+def _merge_grammar_items(
+    chunks: list[list[GrammarItem]],
+    lang: Language = "ko",
+) -> list[GrammarItem]:
     """Merge grammar items across chunks, deduping by NFC-normalised pattern.
 
     When the same pattern appears in multiple chunks, the first occurrence's
@@ -80,7 +83,14 @@ def _merge_grammar_items(chunks: list[list[GrammarItem]]) -> list[GrammarItem]:
                     if norm and norm not in target_seen:
                         target_seen.add(norm)
                         deduped_examples.append(ex)
-                by_key[key] = item.model_copy(update={"examples": deduped_examples})
+                by_key[key] = item.model_copy(
+                    update={
+                        "examples": deduped_examples,
+                        # Store the canonical spelling, so whichever variant the
+                        # LLM happened to emit first isn't what lands on the card.
+                        "pattern": normalize_pattern(item.pattern, lang),
+                    }
+                )
                 seen_examples[key] = target_seen
                 order.append(key)
                 continue
@@ -106,6 +116,7 @@ def _merge_grammar_items(chunks: list[list[GrammarItem]]) -> list[GrammarItem]:
 def _grammar_from_checkpoint(
     run_checkpoint: ExtractRunCheckpoint,
     file_entry: FileCheckpoint,
+    lang: Language = "ko",
 ) -> list[GrammarItem] | None:
     """Rebuild merged grammar items from chunk JSONL when grammar pass finished."""
     if file_entry.status != "grammar_done":
@@ -114,7 +125,7 @@ def _grammar_from_checkpoint(
     if not by_index:
         return None
     ordered = [by_index[i] for i in sorted(by_index)]
-    return _merge_grammar_items(ordered)
+    return _merge_grammar_items(ordered, lang)
 
 
 def extract_grammar_items(
@@ -202,7 +213,7 @@ def extract_grammar_items(
         if run_checkpoint is not None and file_entry is not None:
             run_checkpoint.save_grammar_chunk(file_entry, idx, items_chunk)
 
-    items = _merge_grammar_items(chunk_items)
+    items = _merge_grammar_items(chunk_items, lang)
 
     elapsed = time.time() - start_time
     logger.info(
@@ -236,8 +247,14 @@ def extract_grammar_from_file(path: Path, lang: Language = "ko") -> list[Grammar
 
 
 def _normalise_pattern(pattern: str) -> str:
-    """NFC-normalise + strip a pattern for stable equality checks."""
-    return unicodedata.normalize("NFC", pattern.strip())
+    """Identity key for a grammar pattern, used for merge/append dedupe.
+
+    Goes through :func:`~ankigen.pattern_format.pattern_dedupe_key`, so the
+    notational variants of one ending (``~ㄹ까 하다``, ``~ㄹ/을까 하다``,
+    ``~(으)ㄹ까 하다``) collapse into a single item at extraction time instead
+    of becoming separate cards.
+    """
+    return pattern_dedupe_key(pattern)
 
 
 def write_grammar_jsonl(
@@ -445,17 +462,25 @@ def generate_grammar_csv(
         lang: Language code (used for example top-up prompts).
         num_examples: Desired examples per card. Verbatim examples are kept and
             the LLM is only called for the missing ones.
-        exclude_patterns: Optional NFC-normalised patterns to skip (Anki dedupe).
+        exclude_patterns: Patterns already in Anki. Compared on the canonical
+            key, so a deck holding ``~ㄹ까 하다`` suppresses ``~(으)ㄹ까 하다``.
         overwrite: If True, wipe and rewrite. Otherwise an existing output
             file is resumed: rows already written are kept and skipped, and
             each new row is fsync'd so an interrupted run loses nothing.
+
+    The ``Pattern`` column is written in canonical notation. Every comparison —
+    against Anki and against rows already written — therefore runs on the
+    canonical key too. Normalising only the output would be worse than not
+    normalising at all: a deck holding ``~ㄹ까 하다`` would stop matching the
+    ``~(으)ㄹ까 하다`` we now emit, and gain a duplicate card.
     """
     items = read_grammar_jsonl(input_path)
     logger.info("Loaded %d grammar item(s) from %s", len(items), input_path)
 
     if exclude_patterns:
         before = len(items)
-        items = [it for it in items if normalize_anki_term(it.pattern) not in exclude_patterns]
+        exclude_keys = {pattern_dedupe_key(p, lang) for p in exclude_patterns}
+        items = [it for it in items if pattern_dedupe_key(it.pattern, lang) not in exclude_keys]
         skipped = before - len(items)
         if skipped:
             logger.info("Skipped %d grammar pattern(s) already present in Anki", skipped)
@@ -464,7 +489,12 @@ def generate_grammar_csv(
 
     key_column = GRAMMAR_CSV_FIELDNAMES[0]  # "Pattern"
     resuming = not overwrite and output_path.exists() and output_path.stat().st_size > 0
-    done = completed_csv_keys(output_path, key_column) if resuming else set()
+    # Rows already written are canonical, so keying them the same way is
+    # idempotent — and a CSV written before standardisation still lines up.
+    done = {
+        pattern_dedupe_key(value, lang)
+        for value in (completed_csv_keys(output_path, key_column) if resuming else set())
+    }
     if done:
         logger.info(
             "Resuming: %d grammar row(s) already in %s will be skipped",
@@ -478,14 +508,14 @@ def generate_grammar_csv(
         if not resuming:
             write_anki_header(f, GRAMMAR_CSV_FIELDNAMES)
         for item in items:
-            if normalize_anki_term(item.pattern) in done:
+            if pattern_dedupe_key(item.pattern, lang) in done:
                 continue
             logger.info("Processing grammar pattern: %s", item.pattern)
             merged = _merge_examples(item, lang, num_examples)
             examples_html = format_grammar_examples(merged, item.pattern)
             writer.writerow(
                 {
-                    "Pattern": item.pattern,
+                    "Pattern": normalize_pattern(item.pattern, lang),
                     "Hanja": _resolve_grammar_hanja(item, lang),
                     "Meaning": format_grammar_meaning(item.meaning, item.explanation),
                     "Examples": examples_html,

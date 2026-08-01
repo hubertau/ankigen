@@ -13,6 +13,7 @@ Generate Anki vocabulary **and grammar** CSVs with LLM-powered example sentences
 - **Input cleaning**: Automatically remove translations, romanization, and annotations from input files
 - **Similarity review**: Scan an Anki deck (or word list) for near-duplicate, variant, and contained terms
 - **Audit & backfill**: Sweep an existing Anki deck for cards missing the current format (e.g. blank Hanja column, too few example sentences) and regenerate only the weak fields into a GUID-keyed Anki-update TSV
+- **Standardised grammar notation**: One grammar point, one spelling — `~ㄹ까 하다`, `~을까 하다` and `~ㄹ/을까 하다` all become `~(으)ㄹ까 하다`, and dedupe against Anki matches across every variant
 - **Content review**: Opt into `--check-content` to also flag duplicated example sentences and have an LLM judge whether each sentence is correct, natural, and uses the word with the meaning on the card
 - **Flexible providers**: OpenAI, Anthropic, OpenRouter, DeepSeek, or local models (Ollama, vLLM)
 - **HTML formatting**: Keywords highlighted in red, sentences in blue
@@ -386,6 +387,33 @@ pre-seed the Hanja column.
 | `--overwrite` | Overwrite existing output file |
 | `--anki-db`, `--anki-deck`, `--anki-field` | Skip words already in Anki (see [Anki database filtering](#anki-database-filtering-optional)) |
 
+### Grammar pattern notation
+
+One grammar point gets written several ways in class notes. `extract` and `generate --mode grammar` reduce every spelling to one canonical form before a card is written:
+
+| Written | Emitted |
+|---|---|
+| `~ㄹ까 하다` | `~(으)ㄹ까 하다` |
+| `~을까 하다` | `~(으)ㄹ까 하다` |
+| `~ㄹ/을까 하다` | `~(으)ㄹ까 하다` |
+| `~ㅂ/습니다` | `~(스)ㅂ니다` |
+| `~어/아서` | `~아/어서` |
+
+The convention is the one used by *Korean Grammar in Use*, the 서울대/연세 series and TOPIK material. It is deliberately **not** "always parenthesise" — two different things get written two different ways:
+
+- **으-insertion** is epenthetic (it appears only after a consonant), so it is bracketed: `ㄹ/을` → `(으)ㄹ`. The `ㅂ니다`/`습니다` pair works the same way with 스 → `(스)ㅂ니다`.
+- **True allomorph alternations** — vowel harmony and particle pairs — have no epenthetic vowel to bracket, so the standard keeps a slash: `~아/어서`, `이/가`, `은/는`. Rewriting those as `(아)어` would be wrong.
+
+Patterns that aren't bound forms are left alone (`박사 과정 중` doesn't acquire a marker), a bare syllable inside another morpheme is never rewritten (`~라면` stays put), and Chinese patterns get whitespace tidying only.
+
+**Why this matters more than tidiness:** every dedupe comparison runs on the same canonical key — against patterns already in Anki, and against rows already written to the CSV. So a deck holding `~ㄹ까 하다` now suppresses generating `~(으)ㄹ까 하다`. Normalising only the *output* would have been worse than doing nothing: the old deck entry would stop matching the new spelling and you'd gain a duplicate.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ANKIGEN_PATTERN_MARKER` | `~` | Leading marker for bound forms. Set to `-` for the strict orthographic standard. Both are always accepted on input, and the dedupe key ignores the marker entirely, so switching never creates duplicates. |
+
+This applies to newly generated cards. Patterns already in your deck keep their current spelling — use `ankigen similar --anki-field Pattern` to find and merge those, then the standardisation keeps new ones from appearing.
+
 ### Similar: Find near-duplicates and variants
 
 Exact duplicates are removed automatically during `clean`/`extract`. The `similar` command instead surfaces terms that are *close but not identical* so you can review them. It is **non-destructive** — it only reports, never modifies your deck or word list.
@@ -413,6 +441,8 @@ It prints grouped clusters to the screen and writes a report file: `<deck>.simil
 | `containment` | One term is contained in the other | `学习` / `学习方法` |
 | `shared-stem` | Same Korean stem, or high Chinese character overlap | `가다` / `가요` / `갑니다` |
 | `fuzzy` | Generic closeness above `--threshold` | — |
+
+**Standardising the notation instead.** `similar` finds these pairs after the fact; `ankigen generate --mode grammar` stops them being created. See [Grammar pattern notation](#grammar-pattern-notation).
 
 **Grammar-pattern notation.** Teacher notes write the same grammar point several ways — `~ㄹ/을까 하다` and `~(으)ㄹ까 하다` are one pattern with the ㄹ/을 alternation spelled differently. Plain string similarity scores that pair at 0.77, *below* the default threshold, for two reasons: a standalone `ㄹ` is U+3139 while the `ㄹ` inside `을` decomposes to U+11AF (three Unicode codepoints exist for one letter, so they can never compare equal), and `~ ( ) /` are notation rather than content yet make up nearly half a short pattern.
 
