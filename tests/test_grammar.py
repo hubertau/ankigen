@@ -184,6 +184,18 @@ class TestFormatGrammarExamples:
         html = format_grammar_examples(examples, pattern="~게 되다")
         assert '<span style="color: red;">게 되다</span>' in html
 
+    def test_english_translation_is_escaped(self) -> None:
+        examples = [GrammarExample(target="테스트 문장", english="means A & B <here>")]
+        html = format_grammar_examples(examples, pattern="테스트")
+        assert "&amp;" in html and "&lt;here&gt;" in html
+        assert "<here>" not in html
+
+    def test_target_is_escaped(self) -> None:
+        examples = [GrammarExample(target="5 < 10 **하게 되었어요**.", english="")]
+        html = format_grammar_examples(examples, pattern="~게 되다")
+        assert "&lt;" in html
+        assert "5 < 10" not in html
+
     def test_markers_do_not_leak_into_english(self) -> None:
         examples = [GrammarExample(target="**하게 되었어요**.", english="I came to.")]
         html = format_grammar_examples(examples, pattern="~게 되다")
@@ -540,6 +552,12 @@ class TestFormatGrammarMeaning:
     def test_both_empty_returns_empty_string(self) -> None:
         assert format_grammar_meaning("", "") == ""
         assert format_grammar_meaning("   ", "\t") == ""
+
+    def test_escapes_metacharacters_from_teacher_notes(self) -> None:
+        html = format_grammar_meaning("A < B", "Use when x & y differ.")
+        assert html == "<b>A &lt; B</b><br>Use when x &amp; y differ."
+        # The <b> and <br> we emit ourselves stay real markup.
+        assert "&lt;b&gt;" not in html
 
     def test_used_in_generated_csv_when_explanation_empty(self, tmp_path: Path, mocker) -> None:
         items = [

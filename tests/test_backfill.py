@@ -252,6 +252,37 @@ class TestBackfillNoteKorean:
         )
         sentences_mock.assert_not_called()
 
+    def test_regenerated_english_is_escaped(self, mocker):
+        mocker.patch(
+            "ankigen.backfill.translate_word",
+            return_value=TranslationResult(translation="A & B; less than <", hanja=""),
+        )
+        note = _ko_note(korean="음식", hanja="飮食", english="", comments="x")
+        out, _ = backfill_note(
+            _entry(note, reasons=[("empty_english", "")]),
+            target_sentences=3,
+        )
+        assert out["English"] == "A &amp; B; less than &lt;"
+
+    def test_untouched_fields_are_not_escaped(self, mocker):
+        # Pass-through fields are already HTML as stored by Anki. Escaping them
+        # would double-escape and visibly corrupt the card.
+        mocker.patch("ankigen.backfill.generate_sentences")
+        existing_english = "means A &amp; B"
+        note = _ko_note(korean="음식", hanja="", english=existing_english, comments="x")
+        out, touched = backfill_note(
+            _entry(note, reasons=[("missing_hanja_for_sino", "")]),
+            target_sentences=0,
+        )
+        assert out["English"] == existing_english
+        assert "English" not in touched
+
+    def test_split_sentences_from_html_unescapes(self):
+        from ankigen.formatter import format_sentence_list
+
+        html = format_sentence_list(["5 < 10 & a 먹었어요."], "먹다")
+        assert split_sentences_from_html(html) == ["5 < 10 & a 먹었어요."]
+
     def test_topup_also_marks_existing_unmarked_sentences(self, mocker):
         # Regression: `too_few_sentences` and `keyword_not_highlighted` used to
         # be independent branches, so a card flagged for both got its NEW

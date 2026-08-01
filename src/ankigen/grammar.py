@@ -25,7 +25,7 @@ from ankigen.anki_db import normalize_anki_term
 from ankigen.chunking import estimate_tokens, split_text_for_extraction
 from ankigen.extract_checkpoint import ExtractRunCheckpoint, FileCheckpoint
 from ankigen.extractor import extract_source_text
-from ankigen.formatter import highlight_keyword, strip_markers
+from ankigen.formatter import escape_text, highlight_keyword, strip_markers
 from ankigen.hanja_lookup import resolve_hanja
 from ankigen.llm import (
     LANGUAGE_CONFIG,
@@ -353,8 +353,11 @@ def format_grammar_meaning(meaning: str, explanation: str) -> str:
     a single Anki cell. When both are present, the meaning is bolded and the
     explanation follows on the next line; otherwise the non-empty field is
     returned as plain text.
+
+    Both halves are HTML-escaped — teacher notes routinely contain ``<`` and
+    ``&``, and the cell is written into an ``#html:true`` file.
     """
-    m, e = meaning.strip(), explanation.strip()
+    m, e = escape_text(meaning.strip()), escape_text(explanation.strip())
     if m and e:
         return f"<b>{m}</b><br>{e}"
     return m or e
@@ -402,7 +405,8 @@ def format_grammar_examples(examples: list[GrammarExample], pattern: str) -> str
         line = f'<span style="color: blue;">{target_html}</span>'
         line = line.replace('<span style="color: blue;"></span>', "")
         if ex.english.strip():
-            line += f'<br><span style="color: gray; font-size: 90%;">{ex.english.strip()}</span>'
+            english = escape_text(ex.english.strip())
+            line += f'<br><span style="color: gray; font-size: 90%;">{english}</span>'
         blocks.append(line)
 
     return "<br><br>".join(blocks)

@@ -63,7 +63,7 @@ from ankigen.extractor import (
     get_watch_dir,
     process_folder,
 )
-from ankigen.formatter import format_sentence_list
+from ankigen.formatter import escape_text, format_sentence_list
 from ankigen.grammar import (
     extract_grammar_from_file,
     generate_grammar_csv,
@@ -155,7 +155,11 @@ def process_word(
     logger.info("Processing: %s...", word)
 
     result = translate_word(word, lang)
-    translation = result.translation
+    # Escaped because the CSV is written with `#html:true`; a gloss like
+    # "less than <" or "A & B" would otherwise be mangled by Anki's renderer.
+    # The headword itself is left raw — it is the dedupe/resume key and is
+    # compared against values read back out of Anki.
+    translation = escape_text(result.translation)
 
     if num_sentences > 0:
         sentences = generate_sentences(word, lang, num_sentences)

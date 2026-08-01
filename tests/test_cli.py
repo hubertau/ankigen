@@ -36,6 +36,41 @@ def _read_anki_csv(path: Path) -> tuple[list[str] | None, list[dict[str, str]]]:
     return fieldnames, rows
 
 
+class TestProcessWordEscaping:
+    """The CSV is written with #html:true, so LLM text must be escaped."""
+
+    def test_english_translation_is_escaped(self, monkeypatch):
+        monkeypatch.setattr(
+            "ankigen.cli.translate_word",
+            lambda w, lang: TranslationResult(translation="A & B; less than <", hanja=""),
+        )
+        row = process_word("음식", "ko", 0)
+        assert row["English"] == "A &amp; B; less than &lt;"
+
+    def test_headword_is_left_raw(self, monkeypatch):
+        # The headword is the dedupe/resume key and is compared against values
+        # read back out of Anki — escaping it would break both.
+        monkeypatch.setattr(
+            "ankigen.cli.translate_word",
+            lambda w, lang: TranslationResult(translation="x", hanja=""),
+        )
+        assert process_word("A & B", "ko", 0)["Korean"] == "A & B"
+        assert process_word("A & B", "zh", 0)["Hanzi"] == "A & B"
+
+    def test_sentences_are_escaped(self, monkeypatch):
+        monkeypatch.setattr(
+            "ankigen.cli.translate_word",
+            lambda w, lang: TranslationResult(translation="x", hanja=""),
+        )
+        monkeypatch.setattr(
+            "ankigen.cli.generate_sentences",
+            lambda w, lang, n: ["5 < 10 **먹었어요**."],
+        )
+        comments = process_word("먹다", "ko", 1)["Comments"]
+        assert "&lt;" in comments
+        assert '<span style="color: red;">먹었어요</span>' in comments
+
+
 def test_generate_csv_skips_exclude_words(monkeypatch, tmp_path):
     """Words in exclude_words should not call process_word."""
     called: list[str] = []

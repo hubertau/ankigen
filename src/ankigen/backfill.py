@@ -28,9 +28,11 @@ from ankigen.formatter import (
     _ANY_SPAN_RE,
     BR_SPLIT_RE,
     apply_markers,
+    escape_text,
     format_sentence_list,
     has_markers,
     split_sentences_with_highlights,
+    unescape_text,
 )
 from ankigen.hanja_lookup import resolve_hanja
 from ankigen.llm import generate_sentences, remark_sentences, translate_word
@@ -68,7 +70,7 @@ def split_sentences_from_html(html: str) -> list[str]:
         return []
     sentences: list[str] = []
     for piece in BR_SPLIT_RE.split(html):
-        body = _ANY_SPAN_RE.sub("", piece).strip()
+        body = unescape_text(_ANY_SPAN_RE.sub("", piece)).strip()
         if body:
             sentences.append(body)
     return sentences
@@ -184,7 +186,10 @@ def backfill_note(
 
     # ----- English ---------------------------------------------------------
     if needs_llm_translation and translation_result is not None:
-        _set(resolved.english, translation_result.translation)
+        # Escaped on the way in, like `generate` does. Fields we do NOT
+        # regenerate are passed through untouched — they are already HTML as
+        # stored by Anki, so escaping them would double-escape the card.
+        _set(resolved.english, escape_text(translation_result.translation))
 
     # ----- Sentences -------------------------------------------------------
     # All three sentence rules operate on the same field, so they run as one

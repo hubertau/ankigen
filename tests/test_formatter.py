@@ -253,6 +253,68 @@ class TestHasKeywordHighlightRequiresEverySentence:
         assert headword_matches_highlight("음료", "음식", "ko") is False
 
 
+class TestHtmlEscaping:
+    """Card fields are written with #html:true, so LLM text must be escaped."""
+
+    def test_metacharacters_are_escaped(self):
+        result = format_sentence_list(["5 < 10 이고 a & b 예요."], "예요")
+        assert "&lt;" in result and "&amp;" in result
+        # The raw metacharacters must not survive into the card.
+        assert "5 < 10" not in result
+
+    def test_llm_emitted_tags_are_neutralised(self):
+        result = format_sentence_list(["<b>밥</b>을 먹어요."], "먹어요")
+        assert "&lt;b&gt;" in result
+        assert "<b>" not in result
+
+    def test_markers_survive_escaping(self):
+        # Escaping must not disturb the ** markers or the spans we insert.
+        result = format_sentence_list(["a & b **먹었어요**."], "먹다")
+        assert '<span style="color: red;">먹었어요</span>' in result
+        assert "&amp;" in result
+
+    def test_keyword_containing_metacharacter_still_matches(self):
+        result = format_sentence_list(["A & B 입니다."], "A & B")
+        assert '<span style="color: red;">A &amp; B</span>' in result
+
+    def test_our_own_markup_is_not_escaped(self):
+        result = format_sentence_list(["첫째.", "둘째."], "x")
+        assert "<br>" in result
+        assert "&lt;br&gt;" not in result
+
+    def test_read_path_unescapes(self):
+        from ankigen.formatter import extract_red_spans, split_sentences_with_highlights
+
+        html = format_sentence_list(["a & b **A & B**."], "x")
+        assert extract_red_spans(html) == ["A & B"]
+        assert split_sentences_with_highlights(html) == [("a & b A & B.", ["A & B"])]
+
+    def test_round_trip_is_idempotent(self):
+        from ankigen.formatter import apply_markers, split_sentences_with_highlights
+
+        # Reformatting a card repeatedly must not accumulate &amp;amp;.
+        html = format_sentence_list(["5 < 10 & a **먹었어요**."], "먹다")
+        for _ in range(3):
+            pairs = split_sentences_with_highlights(html)
+            html = format_sentence_list([apply_markers(s, r) for s, r in pairs], "먹다")
+        assert html.count("&amp;") == 1
+        assert html.count("&lt;") == 1
+        assert '<span style="color: red;">먹었어요</span>' in html
+
+    def test_legacy_raw_metacharacter_is_repaired(self):
+        from ankigen.formatter import split_sentences_with_highlights
+
+        # A card written before escaping existed still holds a raw "<".
+        legacy = '<span style="color: blue;">5 < 10 입니다.</span>'
+        plain = [s for s, _ in split_sentences_with_highlights(legacy)]
+        assert format_sentence_list(plain, "입니다").count("&lt;") == 1
+
+    def test_escape_leaves_quotes_alone(self):
+        from ankigen.formatter import escape_text
+
+        assert escape_text('it\'s a "test"') == 'it\'s a "test"'
+
+
 class TestHighlightHelpers:
     def test_split_sentences_with_highlights(self):
         from ankigen.formatter import split_sentences_with_highlights

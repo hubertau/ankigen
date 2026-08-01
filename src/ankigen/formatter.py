@@ -1,5 +1,6 @@
 """HTML formatting for vocabulary sentences."""
 
+import html
 import re
 from collections.abc import Sequence
 from typing import Literal
@@ -27,23 +28,49 @@ _BLUE = '<span style="color: blue;">'
 _END = "</span>"
 
 
-def extract_red_spans(html: str) -> list[str]:
-    """Return the text content of every red ``<span>`` in ``html``."""
-    return RED_SPAN_RE.findall(html)
+def escape_text(text: str) -> str:
+    """Escape ``&``, ``<`` and ``>`` for embedding in an Anki HTML field.
+
+    Card fields are written with the ``#html:true`` directive, so Anki parses
+    them as HTML. Any ``<`` or ``&`` coming from the LLM (or from teacher notes
+    in grammar mode) would otherwise be swallowed or mangled by the renderer.
+
+    Quotes are deliberately left alone: everything we build puts this text in
+    an element body, never in an attribute, and escaping apostrophes would make
+    English glosses noisy in Anki's field editor.
+    """
+    return html.escape(text, quote=False)
 
 
-def split_sentences_with_highlights(html: str) -> list[tuple[str, list[str]]]:
+def unescape_text(text: str) -> str:
+    """Inverse of :func:`escape_text` — recover plain text from a card field.
+
+    Used on every read path so that reformatting an existing card is
+    idempotent: without it a field would gain a layer of ``&amp;`` on each
+    audit/backfill round-trip.
+    """
+    return html.unescape(text)
+
+
+def extract_red_spans(markup: str) -> list[str]:
+    """Return the (unescaped) text content of every red ``<span>`` in ``markup``."""
+    return [unescape_text(t) for t in RED_SPAN_RE.findall(markup)]
+
+
+def split_sentences_with_highlights(markup: str) -> list[tuple[str, list[str]]]:
     """Split formatted HTML into plain sentences and per-sentence red substrings.
 
     For each ``<br>``-delimited piece, red span texts are collected in document
-    order, then all span tags are stripped to recover the plain sentence.
+    order, then all span tags are stripped to recover the plain sentence. Both
+    the sentence and the red texts are unescaped, so what comes back is plain
+    text ready to be re-formatted.
     """
-    if not html.strip():
+    if not markup.strip():
         return []
     pairs: list[tuple[str, list[str]]] = []
-    for piece in BR_SPLIT_RE.split(html):
-        reds = RED_SPAN_RE.findall(piece)
-        body = _ANY_SPAN_RE.sub("", piece).strip()
+    for piece in BR_SPLIT_RE.split(markup):
+        reds = [unescape_text(t) for t in RED_SPAN_RE.findall(piece)]
+        body = unescape_text(_ANY_SPAN_RE.sub("", piece)).strip()
         if body:
             pairs.append((body, reds))
     return pairs
@@ -72,11 +99,11 @@ def headword_matches_highlight(
 
 
 def has_keyword_highlight(
-    html: str,
+    markup: str,
     keyword: str,
     lang: Language = "ko",
 ) -> bool:
-    """True if **every** sentence in ``html`` has a red span related to ``keyword``.
+    """True if **every** sentence in ``markup`` has a red span related to ``keyword``.
 
     Checked per sentence rather than over the whole field: a card where only
     one of three sentences is highlighted is still a card that needs fixing,
@@ -86,7 +113,7 @@ def has_keyword_highlight(
     """
     if not keyword.strip():
         return False
-    pairs = split_sentences_with_highlights(html)
+    pairs = split_sentences_with_highlights(markup)
     if not pairs:
         return False
     return all(
@@ -107,6 +134,10 @@ def strip_markers(text: str) -> str:
 def highlight_keyword(text: str, *keywords: str) -> str:
     """Wrap the keyword's surface form in ``text`` with red spans.
 
+    Takes **plain text** and returns HTML: ``text`` and ``keywords`` are
+    escaped before any tag is inserted, so a sentence containing ``<`` or ``&``
+    survives into the card instead of being eaten by Anki's HTML renderer.
+
     The result is meant to sit *inside* an outer blue span, so each red run
     closes the blue span, opens a red one, then reopens blue (the caller
     strips any empty blue span left at the edges).
@@ -115,20 +146,23 @@ def highlight_keyword(text: str, *keywords: str) -> str:
 
     1. ``**...**`` markers placed by the LLM. These carry the form as it
        actually appears in the sentence, so they survive conjugation and
-       attached particles (``돕다`` → ``**도와요**``).
+       attached particles (``돕다`` → ``**도와요**``). Escaping leaves the
+       asterisks untouched, so markers still match afterwards.
     2. Exact substring match against each of ``keywords`` in turn, using the
        first one that occurs in ``text``. This covers cards written before
        markers existed, Chinese (where the word is usually unchanged), and
        grammar patterns whose canonical form appears verbatim.
 
-    Returns ``text`` unchanged when neither strategy finds anything.
+    Returns the escaped ``text`` when neither strategy finds anything.
     """
-    if _MARKER_RE.search(text):
-        return _MARKER_RE.sub(lambda m: f"{_END}{_RED}{m.group(1)}{_END}{_BLUE}", text)
+    escaped = escape_text(text)
+    if _MARKER_RE.search(escaped):
+        return _MARKER_RE.sub(lambda m: f"{_END}{_RED}{m.group(1)}{_END}{_BLUE}", escaped)
     for keyword in keywords:
-        if keyword and keyword in text:
-            return text.replace(keyword, f"{_END}{_RED}{keyword}{_END}{_BLUE}")
-    return text
+        escaped_keyword = escape_text(keyword)
+        if escaped_keyword and escaped_keyword in escaped:
+            return escaped.replace(escaped_keyword, f"{_END}{_RED}{escaped_keyword}{_END}{_BLUE}")
+    return escaped
 
 
 def format_sentence_list(sentences: Sequence[str], keyword: str) -> str:
