@@ -3,6 +3,25 @@
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _no_llm_retry_backoff(monkeypatch):
+    """Make any LLM call that escapes mocking fail fast instead of sleeping.
+
+    The suite is fully mocked, but it is easy to add a code path that reaches a
+    *different* LLM helper than the one a test patched. When that happens the
+    call hits the network, fails, and the production retry policy backs off for
+    5 + 15 + 45 + 90 seconds — turning a leak into a three-minute test rather
+    than an obvious one. (This is exactly how four backfill tests quietly grew
+    to ~190s each.)
+
+    Disabling retries and shortening the timeout does not hide the leak — the
+    call still fails and the assertion still tells you why — it just keeps the
+    cost proportionate.
+    """
+    monkeypatch.setenv("ANKIGEN_LLM_MAX_RETRIES", "0")
+    monkeypatch.setenv("ANKIGEN_LLM_TIMEOUT_SEC", "5")
+
+
 @pytest.fixture
 def sample_chinese_words():
     """Sample Chinese vocabulary words for testing."""

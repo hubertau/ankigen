@@ -5,6 +5,8 @@ are *close* but not identical, and groups them into clusters for review.
 """
 
 import logging
+import re
+import unicodedata
 from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -188,8 +190,155 @@ class SimilarPair:
     a: str
     b: str
     score: float
-    reason: str  # near-identical | containment | shared-stem | fuzzy
+    reason: str  # notation-variant | near-identical | containment | shared-stem | fuzzy
     source: str  # "input" (both in the list) | "anki" (b is an existing card)
+
+
+# ---------------------------------------------------------------------------
+# Grammar-pattern notation
+#
+# Teacher notes write the same grammar point several ways: `~ㄹ/을까 하다` and
+# `~(으)ㄹ까 하다` are one pattern with the ㄹ/을 alternation spelled out
+# differently. Plain string similarity can't see that, for two reasons:
+#
+# 1. A standalone `ㄹ` is U+3139 (compatibility jamo), while the `ㄹ` inside 을
+#    decomposes to U+11AF (jongseong) and the one inside 라 to U+1105
+#    (choseong). Three codepoints for one letter — they never compare equal.
+# 2. `~`, `(`, `)` and `/` are notation, not content, yet they make up nearly
+#    half the characters in a short pattern.
+#
+# So patterns get a second representation: expand the notation into the concrete
+# forms it stands for, then reduce each form to letter identities. Two terms are
+# notational variants when those sets intersect.
+# ---------------------------------------------------------------------------
+
+# Characters that mark a string as *notation* rather than plain vocabulary.
+# Whitespace and hyphens are deliberately excluded: an ordinary multi-word entry
+# has spaces without being a pattern, and treating that as notation would widen
+# the rule to text it was not designed for.
+_NOTATION_MARKERS = frozenset("~()[]{}/…")
+
+# Stripped before building a canonical key — notation plus any spacing, since
+# `~(으)ㄹ까 하다` and `~(으)ㄹ까하다` are the same pattern.
+_KEY_STRIPPED = _NOTATION_MARKERS | frozenset(" \t -–—.·")
+
+# Compatibility jamo block (modern letters only).
+_COMPAT_JAMO_START = 0x3131
+_COMPAT_JAMO_END = 0x3163
+
+_MAX_EXPANSION_ROUNDS = 4
+_MAX_VARIANTS = 12
+
+_OPTIONAL_RE = re.compile(r"\(([^()]*)\)")
+_ALTERNATION_RE = re.compile(r"(\S)/(\S+?)(?=\s|$)")
+
+
+def _build_jamo_letter_map() -> dict[str, str]:
+    """Map every jamo form to a single letter identity.
+
+    Choseong ``ᄅ``, jongseong ``ᆯ`` and compatibility ``ㄹ`` all reduce to
+    ``RIEUL``, which is what lets a pattern written with a bare jamo line up
+    with one that spells the same sound inside a syllable.
+    """
+    letters: dict[str, str] = {}
+    for start, end in ((0x1100, 0x11FF), (_COMPAT_JAMO_START, _COMPAT_JAMO_END)):
+        for code in range(start, end + 1):
+            char = chr(code)
+            try:
+                name = unicodedata.name(char)
+            except ValueError:
+                continue  # unassigned
+            if (
+                " CHOSEONG " in name
+                or " JUNGSEONG " in name
+                or " JONGSEONG " in name
+                or name.startswith("HANGUL LETTER ")
+            ):
+                letters[char] = name.rsplit(" ", 1)[-1]
+    return letters
+
+
+_JAMO_LETTERS = _build_jamo_letter_map()
+
+
+def _has_pattern_notation(text: str) -> bool:
+    """True when ``text`` looks like grammar-pattern notation.
+
+    Either an explicit marker (``~``, ``/``, brackets) or a bare compatibility
+    jamo, which is how a pattern writes an ending like ``ㄹ까`` that could never
+    appear as a standalone syllable in ordinary vocabulary.
+    """
+    for char in text:
+        if char in _NOTATION_MARKERS:
+            return True
+        if _COMPAT_JAMO_START <= ord(char) <= _COMPAT_JAMO_END:
+            return True
+    return False
+
+
+def _canonical_letters(text: str) -> str:
+    """Reduce ``text`` to space-joined letter identities, notation removed.
+
+    Letters are joined with spaces so multi-character names can't run together
+    and collide (``KIYEOK`` + ``A`` must not read as some other letter).
+    """
+    parts = [
+        _JAMO_LETTERS.get(char, char)
+        for char in _decompose_hangul(text)
+        if char not in _KEY_STRIPPED
+    ]
+    return " ".join(parts)
+
+
+def _expand_notation(text: str) -> set[str]:
+    """Expand ``(X)`` optionals and ``A/B`` alternations into concrete forms.
+
+    ``~(으)ㄹ까 하다`` yields the with-으 and without-으 readings;
+    ``~ㄹ/을까 하다`` yields both sides of the slash plus the shared-suffix
+    reading (``ㄹ`` borrowing ``을``'s trailing ``까``), because the notation
+    does not say where the alternation ends. Over-generating is safe: matching
+    is by set intersection, so one correct reading on each side is enough, and
+    a spurious extra form only matches another spurious identical one.
+    """
+    forms = {text}
+    for _ in range(_MAX_EXPANSION_ROUNDS):
+        grown: set[str] = set()
+        changed = False
+        for form in forms:
+            optional = _OPTIONAL_RE.search(form)
+            if optional is not None:
+                changed = True
+                head, tail = form[: optional.start()], form[optional.end() :]
+                grown.add(head + optional.group(1) + tail)
+                grown.add(head + tail)
+                continue
+            alternation = _ALTERNATION_RE.search(form)
+            if alternation is not None:
+                changed = True
+                left, right = alternation.group(1), alternation.group(2)
+                head, tail = form[: alternation.start()], form[alternation.end() :]
+                grown.add(head + left + tail)
+                grown.add(head + right + tail)
+                if len(right) > 1:
+                    grown.add(head + left + right[1:] + tail)
+                continue
+            grown.add(form)
+        if not changed:
+            break
+        forms = grown
+        if len(forms) > _MAX_VARIANTS:
+            # Pathological nesting. Stop expanding; the keys built from these
+            # partly-expanded forms still have their notation stripped, so the
+            # rule degrades to a plain canonical comparison rather than failing.
+            break
+    return forms
+
+
+def _variant_keys(text: str) -> frozenset[str]:
+    """Canonical keys for every reading of ``text``."""
+    keys = {_canonical_letters(form) for form in _expand_notation(text)}
+    keys.discard("")
+    return frozenset(keys)
 
 
 def _is_edit_distance_one(a: str, b: str) -> bool:
@@ -242,6 +391,8 @@ class _Term:
     unit_set: frozenset[str]
     unit_counts: dict[str, int]  # multiset of `units`, for the ratio bound
     stem: str  # jamo-level stem (ko only; "" for zh)
+    has_notation: bool  # looks like grammar-pattern notation
+    variant_keys: frozenset[str]  # canonical key per expanded reading
 
 
 def _prepare(word: str, lang: Language) -> _Term:
@@ -254,6 +405,8 @@ def _prepare(word: str, lang: Language) -> _Term:
         unit_set=frozenset(units),
         unit_counts=Counter(units),
         stem=_ko_stem(norm) if lang == "ko" else "",
+        has_notation=_has_pattern_notation(norm),
+        variant_keys=_variant_keys(norm),
     )
 
 
@@ -302,6 +455,20 @@ def _classify_terms(
     """
     if not a.norm or not b.norm or a.norm == b.norm:
         return None
+
+    # notation-variant: the same grammar point written two ways. Checked first
+    # because it is the most specific answer available, and deliberately before
+    # the shared-unit filter below: that filter's soundness argument covers the
+    # four rules after it, not this one. Two spellings of the same letters can
+    # share no codepoint at all (`ㄱㅏ` uses compatibility jamo, `가` decomposes
+    # to conjoining jamo), so the filter would wrongly discard them.
+    # Requiring notation on at least one side keeps the rule off ordinary
+    # vocabulary entirely, which is what lets the equivalence oracle still hold.
+    if (a.has_notation or b.has_notation) and (a.variant_keys & b.variant_keys):
+        # Scored 1.0: the readings are literally the same string once notation
+        # is resolved, so these sort above the graded similarity reasons — which
+        # is the order you want when triaging what to merge.
+        return "notation-variant", 1.0
 
     # Necessary condition for every rule below: any match — a one-unit edit, a
     # containment, a shared stem, or a non-zero ratio — implies the two words

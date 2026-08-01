@@ -224,6 +224,12 @@ class TestBackfillNoteKorean:
             "ankigen.backfill.generate_sentences",
             return_value=SentenceResult(sentences=["새로운 첫번째 문장.", "또 다른 문장 입니다."]),
         )
+        # The generated sentences carry no marker and don't contain 음식
+        # verbatim, so the marking pass would otherwise reach the real LLM.
+        mocker.patch(
+            "ankigen.backfill.remark_sentences",
+            side_effect=lambda word, sentences, lang: sentences,
+        )
         note = _ko_note(comments=existing)
         out, _ = backfill_note(
             _entry(note, reasons=[("too_few_sentences", "1<3")]),
@@ -246,6 +252,10 @@ class TestBackfillNoteKorean:
         mocker.patch(
             "ankigen.backfill.generate_sentences",
             return_value=SentenceResult(sentences=["새로운 첫번째 문장.", "또 다른 문장 입니다."]),
+        )
+        mocker.patch(
+            "ankigen.backfill.remark_sentences",
+            side_effect=lambda word, sentences, lang: sentences,
         )
         note = _ko_note(comments=existing)
         out, _ = backfill_note(
@@ -307,6 +317,12 @@ class TestBackfillNoteKorean:
         # Pass-through fields are already HTML as stored by Anki. Escaping them
         # would double-escape and visibly corrupt the card.
         mocker.patch("ankigen.backfill.generate_sentences")
+        # 음식 has no embedded Hanja, so the local resolver comes back empty and
+        # backfill falls through to the LLM — mock it rather than dial out.
+        mocker.patch(
+            "ankigen.backfill.translate_word",
+            return_value=TranslationResult(translation="food", hanja="食"),
+        )
         existing_english = "means A &amp; B"
         note = _ko_note(korean="음식", hanja="", english=existing_english, comments="x")
         out, touched = backfill_note(
@@ -648,6 +664,16 @@ class TestBackfillJsonl:
         mocker.patch(
             "ankigen.backfill.translate_word",
             side_effect=RuntimeError("boom"),
+        )
+        # The `good` note is flagged too_few_sentences, so it exercises the
+        # sentence path; both of its LLM helpers need stubbing.
+        mocker.patch(
+            "ankigen.backfill.generate_sentences",
+            return_value=SentenceResult(sentences=["문장 하나.", "문장 둘.", "문장 셋."]),
+        )
+        mocker.patch(
+            "ankigen.backfill.remark_sentences",
+            side_effect=lambda word, sentences, lang: sentences,
         )
         good = _ko_note(korean="음식", hanja="飮食", english="ok", comments="")
         bad = _ko_note(korean="other", hanja="", english="", comments="", guid="g-bad", nid=99)

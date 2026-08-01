@@ -408,10 +408,23 @@ It prints grouped clusters to the screen and writes a report file: `<deck>.simil
 
 | Reason | Meaning | Example |
 |--------|---------|---------|
+| `notation-variant` | The same grammar pattern written with different notation | `~ㄹ/을까 하다` / `~(으)ㄹ까 하다` |
 | `near-identical` | One unit different — likely an OCR/transcription typo | `测试` / `测式` |
 | `containment` | One term is contained in the other | `学习` / `学习方法` |
 | `shared-stem` | Same Korean stem, or high Chinese character overlap | `가다` / `가요` / `갑니다` |
 | `fuzzy` | Generic closeness above `--threshold` | — |
+
+**Grammar-pattern notation.** Teacher notes write the same grammar point several ways — `~ㄹ/을까 하다` and `~(으)ㄹ까 하다` are one pattern with the ㄹ/을 alternation spelled differently. Plain string similarity scores that pair at 0.77, *below* the default threshold, for two reasons: a standalone `ㄹ` is U+3139 while the `ㄹ` inside `을` decomposes to U+11AF (three Unicode codepoints exist for one letter, so they can never compare equal), and `~ ( ) /` are notation rather than content yet make up nearly half a short pattern.
+
+So patterns get a second representation: the notation is expanded into the concrete forms it stands for, and each form is reduced to letter identities. Two terms are `notation-variant` when those sets intersect — reported at score `1.0`, since the readings are literally the same string once notation is resolved, which sorts the highest-confidence merges to the top of the report. `--threshold` does not apply to this rule.
+
+The rule only fires when at least one side carries notation (`~`, `/`, brackets, or a bare compatibility jamo), so it never touches ordinary vocabulary — verified against every pair of a realistic word list and 719,400 random Hangul pairs, with zero matches.
+
+To scan a grammar deck rather than a vocab deck, point `similar` at the pattern field:
+
+```bash
+ankigen similar --lang ko --anki-deck "Korean::Grammar" --anki-field Pattern
+```
 
 The comparison is inherently quadratic (every term against every other, plus every term against every Anki card), so the per-pair work is kept small: each term's normalised form, jamo decomposition, stem, and character multiset are computed **once**, pairs sharing no character at all are skipped outright, and the expensive similarity ratio is only computed for pairs that clear a cheap upper bound on it. A 1,500-term Korean deck scans in ~2s rather than ~40s; 5,000 terms stay in the tens of seconds.
 

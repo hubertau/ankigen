@@ -468,3 +468,142 @@ class TestClassifierMatchesReference:
                     for p in find_similar_pairs(words, "ko", threshold=threshold, anki_words=anki)
                 ]
                 assert sorted(got) == sorted(expected), (threshold, anki is not None)
+
+
+# ---------------------------------------------------------------------------
+# Grammar-pattern notation (notation-variant)
+# ---------------------------------------------------------------------------
+
+
+class TestNotationHelpers:
+    def test_jamo_letter_map_collapses_all_three_forms(self):
+        from ankigen.similarity import _JAMO_LETTERS
+
+        # compatibility ㄹ, choseong ᄅ, jongseong ᆯ — one letter, three codepoints.
+        assert _JAMO_LETTERS["ㄹ"] == "RIEUL"
+        assert _JAMO_LETTERS["ᄅ"] == "RIEUL"
+        assert _JAMO_LETTERS["ᆯ"] == "RIEUL"
+
+    def test_canonical_letters_ignores_notation_and_spacing(self):
+        from ankigen.similarity import _canonical_letters
+
+        assert _canonical_letters("~(으)ㄹ까 하다") == _canonical_letters("(으)ㄹ까하다")
+
+    def test_canonical_letters_equates_jamo_and_syllable_spelling(self):
+        from ankigen.similarity import _canonical_letters
+
+        assert _canonical_letters("ㄱㅏ") == _canonical_letters("가")
+
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            ("~(으)ㄹ까", True),
+            ("ㄹ까", True),  # bare compatibility jamo
+            ("아/어서", True),
+            ("음식", False),
+            ("한국 음식", False),  # a space alone is not notation
+            ("공부하다", False),
+        ],
+    )
+    def test_has_pattern_notation(self, text, expected):
+        from ankigen.similarity import _has_pattern_notation
+
+        assert _has_pattern_notation(text) is expected
+
+    def test_expand_optional(self):
+        from ankigen.similarity import _expand_notation
+
+        assert _expand_notation("(으)로") == {"으로", "로"}
+
+    def test_expand_alternation_includes_shared_suffix_reading(self):
+        from ankigen.similarity import _expand_notation
+
+        # The notation does not say where the alternation ends, so both the
+        # "ㄹ" and "ㄹ까" readings are generated.
+        forms = _expand_notation("ㄹ/을까")
+        assert "을까" in forms
+        assert "ㄹ까" in forms
+
+    def test_expansion_is_bounded(self):
+        from ankigen.similarity import _MAX_VARIANTS, _expand_notation
+
+        pathological = "(가)(나)(다)(라)(마)(바)(사)"
+        assert len(_expand_notation(pathological)) <= _MAX_VARIANTS * 2
+
+
+class TestNotationVariantRule:
+    @pytest.mark.parametrize(
+        "a,b",
+        [
+            ("~ㄹ/을까 하다", "~(으)ㄹ까 하다"),
+            ("~ㄴ/은 적이 있다", "~(으)ㄴ 적이 있다"),
+            ("~ㄹ/을 수 있다", "~(으)ㄹ 수 있다"),
+            ("~아/어서", "~아서"),
+            ("~(으)로", "~으로"),
+            ("~(으)ㄹ까 하다", "~ㄹ까 하다"),
+            ("~(으)ㄹ까 하다", "~(으)ㄹ까하다"),  # spacing only
+        ],
+    )
+    def test_matches_at_default_threshold(self, a, b):
+        assert _classify(a, b, "ko", 0.80) == ("notation-variant", 1.0)
+
+    def test_symmetric(self):
+        assert _classify("~(으)ㄹ까 하다", "~ㄹ/을까 하다", "ko", 0.80) == (
+            "notation-variant",
+            1.0,
+        )
+
+    @pytest.mark.parametrize(
+        "a,b",
+        [
+            ("~게 되다", "~게 하다"),
+            ("~(으)ㄹ 수 있다", "~(으)ㄹ 수 없다"),
+            ("~기 때문에", "~기 위해서"),
+            ("~(으)ㄹ까 하다", "~(으)ㄴ 적이 있다"),
+        ],
+    )
+    def test_different_patterns_are_not_notation_variants(self, a, b):
+        result = _classify(a, b, "ko", 0.80)
+        assert result is None or result[0] != "notation-variant"
+
+    def test_fires_before_the_shared_unit_filter(self):
+        # `ㄱㅏ` and `가` are the same letters with no codepoint in common, so
+        # the shared-unit prefilter would discard them if this rule ran later.
+        from ankigen.similarity import _prepare
+
+        assert not (_prepare("ㄱㅏ", "ko").unit_set & _prepare("가", "ko").unit_set)
+        assert _classify("ㄱㅏ", "가", "ko", 0.80) == ("notation-variant", 1.0)
+
+    def test_requires_notation_on_at_least_one_side(self):
+        # Ordinary vocabulary never reaches this rule, which is what keeps the
+        # equivalence oracle above valid.
+        from ankigen.similarity import _prepare
+
+        for word in ("음식", "공부하다", "한국 음식"):
+            assert _prepare(word, "ko").has_notation is False
+
+    def test_no_false_positives_on_ordinary_vocabulary(self):
+        import itertools
+
+        vocab = """음식 음료 요리 식당 학생 선생님 학교 공부 시간 사람 친구 가족 나라
+        말하다 듣다 보다 먹다 마시다 자다 가다 오다 하다 되다 주다 받다 알다 모르다
+        옷이 오시 국적 국적이 정치 정지 감사 감자 시장 시작 사장 사전 사건 조건""".split()
+        for a, b in itertools.combinations(sorted(set(vocab)), 2):
+            result = _classify(a, b, "ko", 0.80)
+            assert result is None or result[0] != "notation-variant", (a, b)
+
+    def test_reported_end_to_end(self):
+        patterns = ["~ㄹ/을까 하다", "~(으)ㄹ까 하다", "~게 되다"]
+        pairs = find_similar_pairs(patterns, "ko", threshold=0.80)
+        variants = [p for p in pairs if p.reason == "notation-variant"]
+        assert len(variants) == 1
+        assert {variants[0].a, variants[0].b} == {"~ㄹ/을까 하다", "~(으)ㄹ까 하다"}
+
+    def test_sorts_above_graded_reasons(self):
+        # score 1.0 puts the highest-confidence merges at the top of the report.
+        patterns = ["~ㄹ/을까 하다", "~(으)ㄹ까 하다", "~게 되다", "~게 하다"]
+        pairs = find_similar_pairs(patterns, "ko", threshold=0.80)
+        assert pairs[0].reason == "notation-variant"
+
+    def test_works_for_chinese_notation(self):
+        assert _classify("(是)…的", "是…的", "zh", 0.80) == ("notation-variant", 1.0)
