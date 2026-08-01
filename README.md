@@ -450,11 +450,33 @@ So patterns get a second representation: the notation is expanded into the concr
 
 The rule only fires when at least one side carries notation (`~`, `/`, brackets, or a bare compatibility jamo), so it never touches ordinary vocabulary — verified against every pair of a realistic word list and 719,400 random Hangul pairs, with zero matches.
 
-To scan a grammar deck rather than a vocab deck, point `similar` at the pattern field:
+**Scanning grammar patterns instead of vocabulary.** Point `similar` at the pattern field:
 
 ```bash
 ankigen similar --lang ko --anki-deck "Korean::Grammar" --anki-field Pattern
 ```
+
+Worth knowing how the scan is scoped, because `--lang` does *not* filter by card type:
+
+| Setting | What it controls |
+|---|---|
+| `--lang` | Which deck is read (`ANKIGEN_ANKI_DECK_{LANG}`), which field is read by default (`ANKIGEN_ANKI_FIELD_{LANG}`), and the comparison mode — jamo for `ko`, whole characters for `zh` |
+| `--anki-deck` | Overrides the deck. Sub-decks are always included |
+| `--anki-field` | Overrides the field |
+
+A field **name** also scopes the scan by note type: only note types that actually carry a field of that name are read, so `--anki-field Pattern` skips vocabulary notes even when they share a deck with grammar notes. A field **index** does not — `--anki-field 0` returns field 0 of every note, mixing headwords in with grammar patterns.
+
+Both cases are reported at `INFO` so you can tell "read 40 grammar cards" apart from "matched nothing because the deck was wrong":
+
+```
+INFO Skipped 128 note(s) from 1 note type(s) with no 'Pattern' field (Korean Vocab)
+INFO Loaded 40 words from Anki deck 'Korean' (field: 'Pattern')
+
+INFO Field index 0 spans 2 note type(s) in this deck (Korean Grammar, Korean Vocab);
+     pass a field NAME instead to read just one of them
+```
+
+If `ANKIGEN_ANKI_DECK_KO` points at a vocab-only deck while your grammar cards live elsewhere, the scan finds nothing and exits with "No words to scan" — pass `--anki-deck` explicitly, or point it at a parent deck containing both.
 
 The comparison is inherently quadratic (every term against every other, plus every term against every Anki card), so the per-pair work is kept small: each term's normalised form, jamo decomposition, stem, and character multiset are computed **once**, pairs sharing no character at all are skipped outright, and the expensive similarity ratio is only computed for pairs that clear a cheap upper bound on it. A 1,500-term Korean deck scans in ~2s rather than ~40s; 5,000 terms stay in the tens of seconds.
 

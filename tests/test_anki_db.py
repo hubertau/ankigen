@@ -904,3 +904,105 @@ class TestLoadAnkiNotes:
         conn.close()
         notes = load_anki_notes(db_path, "Korean")
         assert len(notes) == 1
+
+
+# ---------------------------------------------------------------------------
+# Scope reporting: which notes a field selection actually read
+# ---------------------------------------------------------------------------
+
+
+def _make_mixed_notetype_db(path: Path, *, with_notetype_names: bool = True) -> Path:
+    """One deck holding both a vocab note type and a grammar note type."""
+    db = path / "collection.anki2"
+    conn = sqlite3.connect(str(db))
+    conn.executescript("""
+    CREATE TABLE decks (id INTEGER PRIMARY KEY, name TEXT, mtime_secs INT, usn INT,
+                        common BLOB, kind BLOB);
+    CREATE TABLE fields (ntid INT, ord INT, name TEXT, config BLOB);
+    CREATE TABLE notes (id INTEGER PRIMARY KEY, guid TEXT, mid INT, mod INT, usn INT,
+                        tags TEXT, flds TEXT, sfld INT, csum INT, flags INT, data TEXT);
+    CREATE TABLE cards (id INTEGER PRIMARY KEY, nid INT, did INT, ord INT, mod INT,
+                        usn INT, type INT, queue INT, due INT, ivl INT, factor INT,
+                        reps INT, lapses INT, left INT, odue INT, odid INT, flags INT,
+                        data TEXT);
+    """)
+    if with_notetype_names:
+        conn.executescript(
+            "CREATE TABLE notetypes (id INTEGER PRIMARY KEY, name TEXT,"
+            " mtime_secs INT, usn INT, config BLOB);"
+        )
+        conn.execute("INSERT INTO notetypes VALUES (100,'Korean Vocab',0,0,'')")
+        conn.execute("INSERT INTO notetypes VALUES (200,'Korean Grammar',0,0,'')")
+    conn.execute("INSERT INTO decks VALUES (1,'Korean',0,0,'','')")
+    for ord_, name in enumerate(["Korean", "Hanja", "English", "Comment"]):
+        conn.execute("INSERT INTO fields VALUES (100,?,?,'')", (ord_, name))
+    for ord_, name in enumerate(["Pattern", "Meaning"]):
+        conn.execute("INSERT INTO fields VALUES (200,?,?,'')", (ord_, name))
+    rows = [
+        (1, 100, ["음식", "飮食", "food", ""]),
+        (2, 100, ["공부", "工夫", "study", ""]),
+        (3, 200, ["~(으)ㄹ까 하다", "intend to"]),
+    ]
+    for nid, mid, flds in rows:
+        conn.execute(
+            "INSERT INTO notes VALUES (?,?,?,0,0,'',?,0,0,0,'')",
+            (nid, f"g{nid}", mid, chr(31).join(flds)),
+        )
+        conn.execute(
+            "INSERT INTO cards VALUES (?,?,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,'')",
+            (nid, nid),
+        )
+    conn.commit()
+    conn.close()
+    return db
+
+
+class TestFieldScopeReporting:
+    """A field *name* scopes the scan to one note type; say so at INFO.
+
+    Without this the caller cannot tell "read 40 grammar cards" apart from
+    "matched nothing because the deck was wrong" — both just print a count.
+    """
+
+    def test_field_name_reads_only_matching_note_type(self, tmp_path: Path):
+        db = _make_mixed_notetype_db(tmp_path)
+        assert load_anki_words(db, "Korean", field="Pattern") == {"~(으)ㄹ까 하다"}
+        assert load_anki_words(db, "Korean", field="Korean") == {"음식", "공부"}
+
+    def test_skipped_note_types_reported_at_info(self, tmp_path: Path, caplog):
+        db = _make_mixed_notetype_db(tmp_path)
+        with caplog.at_level(logging.INFO, logger="ankigen.anki_db"):
+            load_anki_words(db, "Korean", field="Pattern")
+        assert "Skipped 2 note(s) from 1 note type(s)" in caplog.text
+        assert "'Pattern'" in caplog.text
+        assert "Korean Vocab" in caplog.text
+
+    def test_skip_message_falls_back_to_model_id(self, tmp_path: Path, caplog):
+        db = _make_mixed_notetype_db(tmp_path, with_notetype_names=False)
+        with caplog.at_level(logging.INFO, logger="ankigen.anki_db"):
+            load_anki_words(db, "Korean", field="Pattern")
+        assert "model 100" in caplog.text
+
+    def test_no_skip_message_when_all_notes_match(self, tmp_path: Path, caplog):
+        db = tmp_path / "single.anki2"
+        _make_new_schema_db(db, "Korean", ["음식", "공부"], field_names=["Korean", "b", "c"])
+        with caplog.at_level(logging.INFO, logger="ankigen.anki_db"):
+            load_anki_words(db, "Korean", field="Korean")
+        assert "Skipped" not in caplog.text
+
+    def test_positional_index_warns_that_it_spans_note_types(self, tmp_path: Path, caplog):
+        # An index means "field N of whatever this note is", so a mixed deck
+        # yields headwords and grammar patterns together.
+        db = _make_mixed_notetype_db(tmp_path)
+        with caplog.at_level(logging.INFO, logger="ankigen.anki_db"):
+            words = load_anki_words(db, "Korean", field=0)
+        assert words == {"음식", "공부", "~(으)ㄹ까 하다"}
+        assert "spans 2 note type(s)" in caplog.text
+        assert "Korean Vocab" in caplog.text and "Korean Grammar" in caplog.text
+
+    def test_positional_index_quiet_for_a_single_note_type(self, tmp_path: Path, caplog):
+        db = tmp_path / "single.anki2"
+        _make_new_schema_db(db, "Korean", ["음식", "공부"])
+        with caplog.at_level(logging.INFO, logger="ankigen.anki_db"):
+            load_anki_words(db, "Korean", field=0)
+        assert "spans" not in caplog.text

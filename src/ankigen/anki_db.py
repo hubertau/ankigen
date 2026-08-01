@@ -409,7 +409,7 @@ def _get_words_from_deck(
         try:
             cursor = conn.execute(
                 f"""
-                SELECT DISTINCT n.flds
+                SELECT DISTINCT n.mid, n.flds
                 FROM notes n
                 JOIN cards c ON c.nid = n.id
                 WHERE c.did IN ({placeholders})
@@ -421,7 +421,9 @@ def _get_words_from_deck(
             return set()
 
         words: set[str] = set()
-        for (flds,) in cursor:
+        seen_models: set[int] = set()
+        for mid, flds in cursor:
+            seen_models.add(int(mid))
             fields_list = flds.split(_FIELD_SEP)
             if field < len(fields_list):
                 raw = fields_list[field].strip()
@@ -429,6 +431,19 @@ def _get_words_from_deck(
                     norm = normalize_anki_term(raw)
                     if norm:
                         words.add(norm)
+        if len(seen_models) > 1:
+            # A positional index means "field N of whatever note type this is",
+            # so a deck holding both vocab and grammar cards yields a mix of the
+            # two. Say so — comparing headwords against grammar patterns
+            # produces nonsense, and a field *name* would scope it properly.
+            names = _model_names_for(conn, seen_models)
+            logger.info(
+                "Field index %d spans %d note type(s) in this deck (%s); "
+                "pass a field NAME instead to read just one of them",
+                field,
+                len(seen_models),
+                ", ".join(names),
+            )
         return words
 
     # Field name path
@@ -453,10 +468,12 @@ def _get_words_from_deck(
 
     words = set()
     skipped_models: set[int] = set()
+    skipped_notes = 0
     for mid, flds in cursor:
         field_idx = model_field_map.get(mid)
         if field_idx is None:
-            skipped_models.add(mid)
+            skipped_models.add(int(mid))
+            skipped_notes += 1
             continue
         fields_list = flds.split(_FIELD_SEP)
         if field_idx < len(fields_list):
@@ -467,12 +484,27 @@ def _get_words_from_deck(
                     words.add(norm)
 
     if skipped_models:
-        logger.debug(
-            "%d note type(s) in this deck don't have field %r — those notes skipped",
+        # Reported at INFO, not DEBUG: naming a field is also how you scope a
+        # scan to one note type (only note types carrying that field are read),
+        # so this line is the only way to tell "40 grammar cards" apart from
+        # "nothing matched and the deck was the wrong one".
+        names = _model_names_for(conn, skipped_models)
+        logger.info(
+            "Skipped %d note(s) from %d note type(s) with no %r field (%s)",
+            skipped_notes,
             len(skipped_models),
             field,
+            ", ".join(names),
         )
     return words
+
+
+def _model_names_for(conn: sqlite3.Connection, mids: set[int]) -> list[str]:
+    """Human-readable note-type names for ``mids``, sorted; falls back to the id."""
+    schemas = _get_model_schemas(conn)
+    return sorted(
+        (schemas[mid][0] if mid in schemas and schemas[mid][0] else f"model {mid}") for mid in mids
+    )
 
 
 def _get_model_schemas(conn: sqlite3.Connection) -> dict[int, tuple[str, list[str]]]:
