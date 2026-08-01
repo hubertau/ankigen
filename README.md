@@ -39,6 +39,9 @@ Create a `.env` file with your settings:
 
 ```bash
 # LLM Provider: openai, anthropic, openrouter, deepseek, or local
+# A misspelled provider is rejected outright (it used to fall back to openai,
+# which quietly sent your key to the wrong vendor). `ankigen llm-check` reports
+# the bad value instead of failing.
 LLM_PROVIDER=openrouter
 
 # API key
@@ -409,6 +412,8 @@ It prints grouped clusters to the screen and writes a report file: `<deck>.simil
 | `containment` | One term is contained in the other | `学习` / `学习方法` |
 | `shared-stem` | Same Korean stem, or high Chinese character overlap | `가다` / `가요` / `갑니다` |
 | `fuzzy` | Generic closeness above `--threshold` | — |
+
+The comparison is inherently quadratic (every term against every other, plus every term against every Anki card), so the per-pair work is kept small: each term's normalised form, jamo decomposition, stem, and character multiset are computed **once**, pairs sharing no character at all are skipped outright, and the expensive similarity ratio is only computed for pairs that clear a cheap upper bound on it. A 1,500-term Korean deck scans in ~2s rather than ~40s; 5,000 terms stay in the tens of seconds.
 
 **Options**:
 

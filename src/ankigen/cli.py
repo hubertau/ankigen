@@ -1062,7 +1062,7 @@ def cmd_llm_check(args: argparse.Namespace) -> None:
     probes = run_llm_diagnostics()
     for line in format_diagnostics_report(probes):
         print(line)
-    critical = {"dns", "api_reachable", "api_key"}
+    critical = {"provider", "dns", "api_reachable", "api_key"}
     failed = [p for p in probes if p.name in critical and not p.ok]
     if failed:
         print("\nSome checks failed — fix the items above before running extract/generate.")

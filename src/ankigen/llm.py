@@ -283,11 +283,33 @@ LANGUAGE_CONFIG = {
 Language = Literal["zh", "ko"]
 
 
+# Values already warned about, so a warning fires once per run rather than once
+# per LLM call. Cleared by :func:`_reset_config_warnings` between tests.
+_warned_config: set[str] = set()
+
+
+def _reset_config_warnings() -> None:
+    """Test-only helper to clear the warn-once cache."""
+    _warned_config.clear()
+
+
 def get_provider() -> Provider:
-    """Get the provider from environment."""
-    provider = os.getenv("LLM_PROVIDER", "openai").lower()
+    """Get the provider from environment.
+
+    Raises:
+        ValueError: when ``LLM_PROVIDER`` names a provider we don't know.
+            This used to fall back to ``openai``, which is never what the user
+            meant by a typo and quietly sent their API key — issued by whichever
+            vendor they *did* mean — to OpenAI instead.
+    """
+    raw = os.getenv("LLM_PROVIDER", "openai")
+    provider = raw.strip().lower()
     if provider not in PROVIDER_CONFIG:
-        provider = "openai"
+        raise ValueError(
+            f"Unknown LLM_PROVIDER={raw!r}. "
+            f"Valid providers: {', '.join(sorted(PROVIDER_CONFIG))}. "
+            "Fix it in your .env file, or unset it to use the default (openai)."
+        )
     return provider  # type: ignore
 
 
@@ -299,7 +321,23 @@ def create_openai_client() -> OpenAI:
 
     config = PROVIDER_CONFIG[provider]
     base_url = os.getenv("LLM_BASE_URL") or config["base_url"]
-    api_key = os.getenv("LLM_API_KEY", "") or "not-needed"
+    api_key = os.getenv("LLM_API_KEY", "")
+    if not api_key:
+        # `local` (Ollama/vLLM) genuinely needs no key, and a custom base_url may
+        # be a gateway that authenticates some other way — so warn rather than
+        # raise. Without this the placeholder key produces a bare 401 from the
+        # provider with nothing pointing at the actual cause.
+        if provider != "local" and "LLM_BASE_URL" not in os.environ:
+            warn_key = f"missing_api_key:{provider}"
+            if warn_key not in _warned_config:
+                _warned_config.add(warn_key)
+                logger.warning(
+                    "LLM_API_KEY is not set but LLM_PROVIDER=%s needs one — "
+                    "expect 401/authentication errors. Set it in your .env file, "
+                    "or run `ankigen llm-check` to verify your configuration.",
+                    provider,
+                )
+        api_key = "not-needed"
 
     default_headers: dict[str, str] = {}
     if provider == "openrouter" or "openrouter.ai" in base_url:

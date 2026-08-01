@@ -5,6 +5,7 @@ are *close* but not identical, and groups them into clusters for review.
 """
 
 import logging
+from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass
 from difflib import SequenceMatcher
@@ -191,40 +192,173 @@ class SimilarPair:
     source: str  # "input" (both in the list) | "anki" (b is an existing card)
 
 
-def _classify(a: str, b: str, lang: Language, threshold: float) -> tuple[str, float] | None:
-    """Return (reason, score) for the strongest match, or None if not similar."""
-    na, nb = normalize_anki_term(a), normalize_anki_term(b)
-    if na == nb or not na or not nb:
+def _is_edit_distance_one(a: str, b: str) -> bool:
+    """True when ``a`` and ``b`` are exactly one edit apart.
+
+    Linear replacement for ``_edit_distance(a, b) == 1``, which built a full
+    O(len(a)*len(b)) DP table for every candidate pair. Callers must already
+    have checked that the lengths differ by at most one.
+    """
+    la, lb = len(a), len(b)
+    if la == lb:
+        diffs = 0
+        for ca, cb in zip(a, b, strict=True):
+            if ca != cb:
+                diffs += 1
+                if diffs > 1:
+                    return False
+        return diffs == 1
+    # One insertion: walk both, allowing a single skip in the longer string.
+    if la > lb:
+        a, b = b, a
+        la, lb = lb, la
+    i = j = 0
+    skipped = False
+    while i < la and j < lb:
+        if a[i] == b[j]:
+            i += 1
+            j += 1
+        elif skipped:
+            return False
+        else:
+            skipped = True
+            j += 1
+    return True
+
+
+@dataclass(frozen=True, slots=True)
+class _Term:
+    """A word with its comparison forms computed once.
+
+    ``find_similar_pairs`` is quadratic, so anything derived from a single word
+    has to be computed per word rather than per pair. Previously ``_classify``
+    re-normalised, re-decomposed, and re-stemmed both of its arguments on every
+    call, i.e. roughly ``n`` times per word.
+    """
+
+    original: str
+    norm: str  # NFC + stripped; the form used for containment
+    units: str  # jamo for ko, characters for zh
+    unit_set: frozenset[str]
+    unit_counts: dict[str, int]  # multiset of `units`, for the ratio bound
+    stem: str  # jamo-level stem (ko only; "" for zh)
+
+
+def _prepare(word: str, lang: Language) -> _Term:
+    norm = normalize_anki_term(word)
+    units = _comparison_units(norm, lang)
+    return _Term(
+        original=word,
+        norm=norm,
+        units=units,
+        unit_set=frozenset(units),
+        unit_counts=Counter(units),
+        stem=_ko_stem(norm) if lang == "ko" else "",
+    )
+
+
+# SequenceMatcher.ratio() is 2*M/T, so an upper bound on M gives one on the
+# ratio. Comparisons use a small tolerance so float error can never discard a
+# pair that would actually have cleared the threshold.
+_RATIO_BOUND_EPS = 1e-9
+
+
+def _ratio_upper_bound(a: _Term, b: _Term) -> float:
+    """Cheap ceiling on ``SequenceMatcher(a.units, b.units).ratio()``.
+
+    Matching blocks are a common subsequence, so the number of matched units
+    cannot exceed the multiset intersection of the two unit strings. Counting
+    that is a handful of dict lookups against the precomputed counts, versus
+    building a whole match table — and it rules out the large majority of pairs
+    before the expensive call, which the profile showed running for ~99% of them.
+    """
+    total = len(a.units) + len(b.units)
+    if not total:
+        return 0.0
+    small, large = (
+        (a.unit_counts, b.unit_counts)
+        if len(a.unit_counts) <= len(b.unit_counts)
+        else (b.unit_counts, a.unit_counts)
+    )
+    overlap = 0
+    for unit, count in small.items():
+        other = large.get(unit)
+        if other is not None:
+            overlap += count if count < other else other
+    return 2.0 * overlap / total
+
+
+def _classify_terms(
+    a: _Term,
+    b: _Term,
+    lang: Language,
+    threshold: float,
+) -> tuple[str, float] | None:
+    """Return (reason, score) for the strongest match, or None if not similar.
+
+    Same rules and scores as before; the work is just ordered so the expensive
+    parts run last. ``ratio`` in particular is only needed by two of the four
+    rules, and used to be computed up front for every pair.
+    """
+    if not a.norm or not b.norm or a.norm == b.norm:
         return None
 
-    ua, ub = _comparison_units(na, lang), _comparison_units(nb, lang)
-    ratio = SequenceMatcher(None, ua, ub).ratio()
+    # Necessary condition for every rule below: any match — a one-unit edit, a
+    # containment, a shared stem, or a non-zero ratio — implies the two words
+    # share at least one unit. Skipping here avoids the costly rules entirely.
+    # (Only sound for a positive threshold; at 0 every pair is "fuzzy".)
+    if threshold > 0 and not (a.unit_set & b.unit_set):
+        return None
+
+    ua, ub = a.units, b.units
+    cached_ratio: float | None = None
+
+    def ratio() -> float:
+        nonlocal cached_ratio
+        if cached_ratio is None:
+            cached_ratio = SequenceMatcher(None, ua, ub).ratio()
+        return cached_ratio
 
     # near-identical: a single-unit difference (likely an OCR/transcription typo).
     min_units = 2 if lang == "zh" else 3
-    if min(len(ua), len(ub)) >= min_units and _edit_distance(ua, ub) == 1:
-        return "near-identical", round(ratio, 3)
+    if (
+        min(len(ua), len(ub)) >= min_units
+        and abs(len(ua) - len(ub)) <= 1
+        and _is_edit_distance_one(ua, ub)
+    ):
+        return "near-identical", round(ratio(), 3)
 
     # containment: one term is a substring of the other.
-    shorter, longer = (na, nb) if len(na) <= len(nb) else (nb, na)
+    shorter, longer = (a.norm, b.norm) if len(a.norm) <= len(b.norm) else (b.norm, a.norm)
     if len(shorter) >= 2 and shorter in longer:
         return "containment", round(len(shorter) / len(longer), 3)
 
     # shared-stem: same Korean stem, or high Chinese character overlap.
     if lang == "ko":
-        sa, sb = _ko_stem(na), _ko_stem(nb)
-        if len(sa) >= 2 and sa == sb:
-            return "shared-stem", round(ratio, 3)
+        if len(a.stem) >= 2 and a.stem == b.stem:
+            return "shared-stem", round(ratio(), 3)
     else:
-        if len(na) >= 2 and len(nb) >= 2:
-            jac = _shared_char_ratio(na, nb)
+        if len(a.norm) >= 2 and len(b.norm) >= 2:
+            # For zh the units are the characters, so the prepared sets are
+            # exactly what the Jaccard overlap needs.
+            union = len(a.unit_set | b.unit_set)
+            jac = len(a.unit_set & b.unit_set) / union if union else 0.0
             if jac >= 0.6:
                 return "shared-stem", round(jac, 3)
 
-    # fuzzy: generic closeness above the requested threshold.
-    if ratio >= threshold:
-        return "fuzzy", round(ratio, 3)
+    # fuzzy: generic closeness above the requested threshold. This is the only
+    # rule every surviving pair reaches, so screen it with the cheap bound
+    # before paying for the real ratio.
+    if threshold > 0 and _ratio_upper_bound(a, b) < threshold - _RATIO_BOUND_EPS:
+        return None
+    if ratio() >= threshold:
+        return "fuzzy", round(ratio(), 3)
     return None
+
+
+def _classify(a: str, b: str, lang: Language, threshold: float) -> tuple[str, float] | None:
+    """Single-pair wrapper around :func:`_classify_terms` (no shared precompute)."""
+    return _classify_terms(_prepare(a, lang), _prepare(b, lang), lang, threshold)
 
 
 def find_similar_pairs(
@@ -262,25 +396,30 @@ def find_similar_pairs(
         threshold,
     )
 
+    # Prepare each word's comparison forms once rather than once per pair.
+    terms = [_prepare(w, lang) for w in unique]
+
     pairs: list[SimilarPair] = []
-    for i in range(len(unique)):
-        for j in range(i + 1, len(unique)):
-            result = _classify(unique[i], unique[j], lang, threshold)
+    for i in range(len(terms)):
+        ti = terms[i]
+        for j in range(i + 1, len(terms)):
+            result = _classify_terms(ti, terms[j], lang, threshold)
             if result:
                 reason, score = result
-                pairs.append(SimilarPair(unique[i], unique[j], score, reason, "input"))
+                pairs.append(SimilarPair(ti.original, terms[j].original, score, reason, "input"))
 
     if anki_words:
-        existing = sorted(anki_words)
-        for w in unique:
-            wn = normalize_anki_term(w)
-            for card in existing:
-                if wn == card:
+        # Same reasoning, and it matters more here: every card used to be
+        # re-normalised and re-decomposed once per input word.
+        card_terms = [_prepare(card, lang) for card in sorted(anki_words)]
+        for ti in terms:
+            for tc in card_terms:
+                if ti.norm == tc.norm:
                     continue  # exact match is "already known", handled elsewhere
-                result = _classify(w, card, lang, threshold)
+                result = _classify_terms(ti, tc, lang, threshold)
                 if result:
                     reason, score = result
-                    pairs.append(SimilarPair(w, card, score, reason, "anki"))
+                    pairs.append(SimilarPair(ti.original, tc.original, score, reason, "anki"))
 
     pairs.sort(key=lambda p: p.score, reverse=True)
     logger.info("Found %d similar pair(s)", len(pairs))

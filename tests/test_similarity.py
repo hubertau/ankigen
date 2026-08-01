@@ -6,7 +6,10 @@ import pytest
 
 from ankigen.similarity import (
     SimilarPair,
+    _classify,
     _decompose_hangul,
+    _edit_distance,
+    _is_edit_distance_one,
     _ko_stem,
     cluster_pairs,
     find_similar_pairs,
@@ -275,3 +278,193 @@ class TestCmdSimilarAnkiScan:
         cli.cmd_similar(self._args(output=out))
 
         assert out.exists()
+
+
+# ---------------------------------------------------------------------------
+# Performance rework: results must be identical to the pre-optimisation rules
+# ---------------------------------------------------------------------------
+
+
+def _reference_classify(a, b, lang, threshold):
+    """The original O(n*m)-per-pair classifier, kept as an oracle.
+
+    Deliberately a verbatim transcription of the pre-optimisation logic: the
+    fast path precomputes per-word data, skips pairs sharing no units, and
+    screens the fuzzy rule with an upper bound on the ratio. All of that is only
+    safe if it never changes an answer, so it is checked against this.
+    """
+    from difflib import SequenceMatcher
+
+    from ankigen.anki_db import normalize_anki_term
+    from ankigen.similarity import (
+        _comparison_units,
+        _edit_distance,
+        _ko_stem,
+        _shared_char_ratio,
+    )
+
+    na, nb = normalize_anki_term(a), normalize_anki_term(b)
+    if na == nb or not na or not nb:
+        return None
+    ua, ub = _comparison_units(na, lang), _comparison_units(nb, lang)
+    ratio = SequenceMatcher(None, ua, ub).ratio()
+    min_units = 2 if lang == "zh" else 3
+    if min(len(ua), len(ub)) >= min_units and _edit_distance(ua, ub) == 1:
+        return "near-identical", round(ratio, 3)
+    shorter, longer = (na, nb) if len(na) <= len(nb) else (nb, na)
+    if len(shorter) >= 2 and shorter in longer:
+        return "containment", round(len(shorter) / len(longer), 3)
+    if lang == "ko":
+        sa, sb = _ko_stem(na), _ko_stem(nb)
+        if len(sa) >= 2 and sa == sb:
+            return "shared-stem", round(ratio, 3)
+    else:
+        if len(na) >= 2 and len(nb) >= 2:
+            jac = _shared_char_ratio(na, nb)
+            if jac >= 0.6:
+                return "shared-stem", round(jac, 3)
+    if ratio >= threshold:
+        return "fuzzy", round(ratio, 3)
+    return None
+
+
+class TestIsEditDistanceOne:
+    def test_substitution(self):
+        assert _is_edit_distance_one("abc", "abd") is True
+
+    def test_insertion(self):
+        assert _is_edit_distance_one("abc", "abxc") is True
+        assert _is_edit_distance_one("abxc", "abc") is True
+
+    def test_identical_is_not_one(self):
+        assert _is_edit_distance_one("abc", "abc") is False
+
+    def test_two_edits(self):
+        assert _is_edit_distance_one("abc", "axd") is False
+        assert _is_edit_distance_one("abc", "abxyc") is False
+
+    def test_empty_cases(self):
+        assert _is_edit_distance_one("", "a") is True
+        assert _is_edit_distance_one("", "") is False
+
+    def test_matches_reference_edit_distance(self):
+        import random
+
+        random.seed(11)
+        alphabet = "abcde"
+        for _ in range(3000):
+            a = "".join(random.choice(alphabet) for _ in range(random.randint(0, 6)))
+            b = "".join(random.choice(alphabet) for _ in range(random.randint(0, 6)))
+            if abs(len(a) - len(b)) > 1:
+                continue
+            assert _is_edit_distance_one(a, b) is (_edit_distance(a, b) == 1), (a, b)
+
+
+class TestRatioUpperBound:
+    def test_never_below_the_true_ratio(self):
+        """The bound must never prune a pair that would have matched."""
+        import random
+        from difflib import SequenceMatcher
+
+        from ankigen.similarity import _prepare, _ratio_upper_bound
+
+        random.seed(12)
+        pool = "가나다라마바사아자차"
+        for _ in range(2000):
+            a = "".join(random.choice(pool) for _ in range(random.randint(1, 4)))
+            b = "".join(random.choice(pool) for _ in range(random.randint(1, 4)))
+            ta, tb = _prepare(a, "ko"), _prepare(b, "ko")
+            actual = SequenceMatcher(None, ta.units, tb.units).ratio()
+            assert _ratio_upper_bound(ta, tb) >= actual - 1e-9, (a, b)
+
+
+class TestClassifierMatchesReference:
+    """The optimised classifier must return exactly what the old one did."""
+
+    def test_random_and_realistic_pairs(self):
+        import random
+
+        random.seed(13)
+        cases = [
+            (
+                "ko",
+                "가나다라마바사아자차카타파하각간갈감갑강개거건걸검겨결경음식료듣들어요",
+                [
+                    "듣다",
+                    "들어요",
+                    "들었어요",
+                    "음식",
+                    "음식점",
+                    "한국음식",
+                    "가다",
+                    "가요",
+                    "갑니다",
+                    "돕다",
+                    "도와요",
+                    "음료",
+                    "공부하다",
+                    "공부해요",
+                ],
+            ),
+            (
+                "zh",
+                "促使发展政策经济学习工作时间问题方法结果影响社会国家人民",
+                ["促使", "促进", "发展", "发达", "政策", "政治", "经济", "经验"],
+            ),
+        ]
+        for lang, pool, real in cases:
+            words = list(real) + ["", "  "]
+            for _ in range(150):
+                words.append("".join(random.choice(pool) for _ in range(random.randint(1, 4))))
+            for threshold in (0.0, 0.5, 0.8, 0.95, 1.0):
+                for _ in range(1500):
+                    a, b = random.choice(words), random.choice(words)
+                    assert _classify(a, b, lang, threshold) == _reference_classify(
+                        a, b, lang, threshold
+                    ), (lang, threshold, a, b)
+
+    def test_full_run_matches_reference(self):
+        """End-to-end, including the Anki cross-check path."""
+        import random
+
+        from ankigen.anki_db import normalize_anki_term
+
+        random.seed(14)
+        pool = "가나다라마바사아자차카타파하각간갈감갑강음식료듣들어요"
+        words = ["듣다", "들어요", "음식", "음식점", "음료", "가다", "가요", ""]
+        words += [
+            "".join(random.choice(pool) for _ in range(random.randint(1, 4))) for _ in range(60)
+        ]
+        cards = {
+            normalize_anki_term("".join(random.choice(pool) for _ in range(random.randint(1, 4))))
+            for _ in range(30)
+        }
+        for threshold in (0.0, 0.7, 0.8, 1.0):
+            for anki in (None, cards):
+                expected = []
+                seen: set[str] = set()
+                unique: list[str] = []
+                for w in words:
+                    k = normalize_anki_term(w)
+                    if k and k not in seen:
+                        seen.add(k)
+                        unique.append(w)
+                for i in range(len(unique)):
+                    for j in range(i + 1, len(unique)):
+                        r = _reference_classify(unique[i], unique[j], "ko", threshold)
+                        if r:
+                            expected.append((unique[i], unique[j], r[1], r[0], "input"))
+                if anki:
+                    for w in unique:
+                        wn = normalize_anki_term(w)
+                        for card in sorted(anki):
+                            if wn == card:
+                                continue
+                            r = _reference_classify(w, card, "ko", threshold)
+                            if r:
+                                expected.append((w, card, r[1], r[0], "anki"))
+                got = [
+                    (p.a, p.b, p.score, p.reason, p.source)
+                    for p in find_similar_pairs(words, "ko", threshold=threshold, anki_words=anki)
+                ]
+                assert sorted(got) == sorted(expected), (threshold, anki is not None)

@@ -1,7 +1,10 @@
 """Tests for the LLM module (with mocking)."""
 
+import logging
+
 import pytest
 
+from ankigen import llm
 from ankigen.llm import (
     SentenceResult,
     TranslationResult,
@@ -571,3 +574,71 @@ class TestReviewSentences:
         lowered = mock.call_args.kwargs["user_prompt"].lower()
         assert "when in doubt" in lowered
         assert "only" in lowered
+
+
+class TestProviderValidation:
+    """A typo'd LLM_PROVIDER must not silently ship the key to another vendor."""
+
+    def test_unknown_provider_raises(self, monkeypatch):
+        monkeypatch.setenv("LLM_PROVIDER", "deepsek")
+        with pytest.raises(ValueError, match="Unknown LLM_PROVIDER"):
+            llm.get_provider()
+
+    def test_error_lists_valid_providers(self, monkeypatch):
+        monkeypatch.setenv("LLM_PROVIDER", "nope")
+        with pytest.raises(ValueError) as exc:
+            llm.get_provider()
+        for name in ("openai", "anthropic", "deepseek", "openrouter", "local"):
+            assert name in str(exc.value)
+
+    def test_unset_still_defaults_to_openai(self, monkeypatch):
+        monkeypatch.delenv("LLM_PROVIDER", raising=False)
+        assert llm.get_provider() == "openai"
+
+    @pytest.mark.parametrize("raw", ["DeepSeek", "  deepseek  ", "DEEPSEEK"])
+    def test_case_and_whitespace_tolerated(self, monkeypatch, raw):
+        monkeypatch.setenv("LLM_PROVIDER", raw)
+        assert llm.get_provider() == "deepseek"
+
+
+class TestMissingApiKeyWarning:
+    def _client(self, monkeypatch, provider, **env):
+        monkeypatch.setenv("LLM_PROVIDER", provider)
+        monkeypatch.delenv("LLM_API_KEY", raising=False)
+        monkeypatch.delenv("LLM_BASE_URL", raising=False)
+        for k, v in env.items():
+            monkeypatch.setenv(k, v)
+        llm._reset_config_warnings()
+        return llm.create_openai_client()
+
+    def test_warns_when_remote_provider_has_no_key(self, monkeypatch, caplog):
+        with caplog.at_level(logging.WARNING, logger="ankigen.llm"):
+            self._client(monkeypatch, "deepseek")
+        assert "LLM_API_KEY is not set" in caplog.text
+
+    def test_warns_only_once(self, monkeypatch, caplog):
+        with caplog.at_level(logging.WARNING, logger="ankigen.llm"):
+            self._client(monkeypatch, "deepseek")
+            llm.create_openai_client()
+            llm.create_openai_client()
+        assert caplog.text.count("LLM_API_KEY is not set") == 1
+
+    def test_no_warning_for_local(self, monkeypatch, caplog):
+        with caplog.at_level(logging.WARNING, logger="ankigen.llm"):
+            self._client(monkeypatch, "local")
+        assert "LLM_API_KEY is not set" not in caplog.text
+
+    def test_no_warning_with_custom_base_url(self, monkeypatch, caplog):
+        # A self-hosted gateway may authenticate some other way.
+        with caplog.at_level(logging.WARNING, logger="ankigen.llm"):
+            self._client(monkeypatch, "openai", LLM_BASE_URL="http://gateway.internal/v1")
+        assert "LLM_API_KEY is not set" not in caplog.text
+
+    def test_no_warning_when_key_present(self, monkeypatch, caplog):
+        monkeypatch.setenv("LLM_PROVIDER", "deepseek")
+        monkeypatch.setenv("LLM_API_KEY", "sk-real")
+        monkeypatch.delenv("LLM_BASE_URL", raising=False)
+        llm._reset_config_warnings()
+        with caplog.at_level(logging.WARNING, logger="ankigen.llm"):
+            llm.create_openai_client()
+        assert "LLM_API_KEY is not set" not in caplog.text

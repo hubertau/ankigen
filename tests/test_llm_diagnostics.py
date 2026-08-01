@@ -242,3 +242,29 @@ class TestDiagnostics:
         probes = run_llm_diagnostics()
         api = next(p for p in probes if p.name == "api_reachable")
         assert api.ok is True
+
+
+class TestProviderProbe:
+    """`llm-check` must explain a bad LLM_PROVIDER rather than crash on it."""
+
+    def test_valid_provider_passes(self, monkeypatch):
+        monkeypatch.setenv("LLM_PROVIDER", "deepseek")
+        monkeypatch.setenv("LLM_API_KEY", "sk-x")
+        probe = next(p for p in run_llm_diagnostics() if p.name == "provider")
+        assert probe.ok is True
+        assert probe.detail == "deepseek"
+
+    def test_unknown_provider_reported_not_raised(self, monkeypatch):
+        monkeypatch.setenv("LLM_PROVIDER", "deepsek")
+        monkeypatch.setenv("LLM_API_KEY", "sk-x")
+        probes = run_llm_diagnostics()  # must not raise
+        probe = next(p for p in probes if p.name == "provider")
+        assert probe.ok is False
+        assert "deepsek" in probe.detail
+        assert "deepseek" in probe.detail  # suggests the valid names
+
+    def test_remaining_probes_still_run(self, monkeypatch):
+        monkeypatch.setenv("LLM_PROVIDER", "bogus")
+        monkeypatch.setenv("LLM_API_KEY", "sk-x")
+        names = {p.name for p in run_llm_diagnostics()}
+        assert {"provider", "api_key", "dns"} <= names

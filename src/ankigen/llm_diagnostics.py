@@ -37,11 +37,23 @@ class DiagnosticProbe:
     latency_ms: float | None = None
 
 
-def _get_provider() -> str:
-    provider = os.getenv("LLM_PROVIDER", "openai").lower()
+def _configured_provider() -> tuple[str, str | None]:
+    """Return ``(provider, invalid_raw_value)`` for the configured provider.
+
+    Unlike :func:`ankigen.llm.get_provider` this never raises — ``llm-check`` is
+    the tool you reach for *because* something is misconfigured, so a bad value
+    is reported as a failed probe and the remaining probes still run against the
+    default so the output stays useful.
+    """
+    raw = os.getenv("LLM_PROVIDER", "openai")
+    provider = raw.strip().lower()
     if provider not in _PROVIDER_BASE_URLS:
-        return "openai"
-    return provider
+        return "openai", raw
+    return provider, None
+
+
+def _get_provider() -> str:
+    return _configured_provider()[0]
 
 
 def _provider_base_url(provider: str) -> str:
@@ -129,12 +141,27 @@ def _probe_models_endpoint(base_url: str, api_key: str) -> DiagnosticProbe:
 
 def run_llm_diagnostics(*, provider: str | None = None) -> list[DiagnosticProbe]:
     """Run probes against the configured (or given) LLM provider."""
-    provider = provider or _get_provider()
+    invalid_raw: str | None = None
+    if provider is None:
+        provider, invalid_raw = _configured_provider()
     base_url = _provider_base_url(provider)
     api_key = _api_key_for_probe(provider)
     host = urlparse(base_url).hostname or ""
 
     probes: list[DiagnosticProbe] = []
+
+    if invalid_raw is not None:
+        probes.append(
+            DiagnosticProbe(
+                "provider",
+                False,
+                f"Unknown LLM_PROVIDER={invalid_raw!r} — valid: "
+                f"{', '.join(sorted(_PROVIDER_BASE_URLS))}. "
+                "Probing openai below; generate/extract will refuse to run.",
+            )
+        )
+    else:
+        probes.append(DiagnosticProbe("provider", True, provider))
 
     if provider != "local" and not api_key:
         probes.append(DiagnosticProbe("api_key", False, "LLM_API_KEY is not set"))
