@@ -945,6 +945,14 @@ class TestCanonicalPatternOutput:
         assert added == 0
         assert len(read_grammar_jsonl(path)) == 1
 
+    def test_two_spellings_in_one_jsonl_produce_one_row(self, tmp_path: Path, mocker):
+        """A JSONL naming the same point twice must not yield two cards."""
+        mocker.patch("ankigen.grammar.generate_grammar_examples", return_value=[])
+        src = self._jsonl(tmp_path, ["~ㄹ/을까 하다", "~(으)ㄹ까 하다", "~게 되다"])
+        out = tmp_path / "out.csv"
+        generate_grammar_csv(src, out, "ko", 0)
+        assert self._patterns_in(out) == ["~(으)ㄹ까 하다", "~게 되다"]
+
     def test_chinese_patterns_pass_through(self, tmp_path: Path, mocker):
         mocker.patch("ankigen.grammar.generate_grammar_examples", return_value=[])
         src = self._jsonl(tmp_path, ["会", "(是)…的"])

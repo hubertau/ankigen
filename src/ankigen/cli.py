@@ -72,7 +72,12 @@ from ankigen.grammar import (
 from ankigen.hanja_lookup import resolve_hanja
 from ankigen.llm import Language, generate_sentences, translate_word
 from ankigen.logging_config import get_log_dir, get_log_level, get_log_retention, setup_logging
-from ankigen.pattern_format import pattern_dedupe_key
+from ankigen.pattern_format import (
+    has_pattern_notation,
+    normalize_pattern,
+    pattern_dedupe_key,
+    vocab_dedupe_key,
+)
 from ankigen.resume import completed_csv_keys, durable_write, write_anki_header
 from ankigen.similarity import SimilarPair, cluster_pairs, find_similar_pairs
 
@@ -257,10 +262,11 @@ def generate_csv(
         if exclude_words:
             before = len(words)
             # Compare against Anki using the bare word, not the ``한글(漢字)`` form.
+            exclude_keys = {vocab_dedupe_key(w, lang) for w in exclude_words}
             words = [
                 w
                 for w in words
-                if normalize_anki_term(parse_hanja_token(w)[0]) not in exclude_words
+                if vocab_dedupe_key(parse_hanja_token(w)[0], lang) not in exclude_keys
             ]
             skipped = before - len(words)
             if skipped:
@@ -279,7 +285,10 @@ def generate_csv(
     key_column = fieldnames[0]
 
     resuming = not overwrite and output_file.exists() and output_file.stat().st_size > 0
-    done = completed_csv_keys(output_file, key_column) if resuming else set()
+    done = {
+        vocab_dedupe_key(value, lang)
+        for value in (completed_csv_keys(output_file, key_column) if resuming else set())
+    }
     if done:
         logger.info(
             "Resuming: %d row(s) already in %s will be skipped",
@@ -295,7 +304,13 @@ def generate_csv(
 
         for raw in words:
             bare, inline_hanja = parse_hanja_token(raw) if lang == "ko" else (raw, "")
-            if normalize_anki_term(bare) in done:
+            # A word list may hold grammar-pattern entries alongside vocabulary
+            # (e.g. "ㄹ/을 맛(이) 나다"). Those get the same canonical spelling as
+            # grammar cards; anything without notation is left exactly as typed.
+            if has_pattern_notation(bare):
+                bare = normalize_pattern(bare, lang)
+            key = vocab_dedupe_key(bare, lang)
+            if key in done:
                 continue
             row = process_word(
                 bare,
@@ -306,6 +321,9 @@ def generate_csv(
             )
             writer.writerow(row)
             durable_write(f)
+            # Track what we just wrote, so two spellings of one entry in the
+            # same input file don't both become cards.
+            done.add(key)
             written += 1
 
     logger.info("Output written to %s (%d new row(s))", output_file, written)

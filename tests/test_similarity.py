@@ -506,9 +506,9 @@ class TestNotationHelpers:
         ],
     )
     def test_has_pattern_notation(self, text, expected):
-        from ankigen.similarity import _has_pattern_notation
+        from ankigen.pattern_format import has_pattern_notation
 
-        assert _has_pattern_notation(text) is expected
+        assert has_pattern_notation(text) is expected
 
     def test_expand_optional(self):
         from ankigen.similarity import _expand_notation

@@ -404,7 +404,11 @@ The convention is the one used by *Korean Grammar in Use*, the 서울대/연세 
 - **으-insertion** is epenthetic (it appears only after a consonant), so it is bracketed: `ㄹ/을` → `(으)ㄹ`. The `ㅂ니다`/`습니다` pair works the same way with 스 → `(스)ㅂ니다`.
 - **True allomorph alternations** — vowel harmony and particle pairs — have no epenthetic vowel to bracket, so the standard keeps a slash: `~아/어서`, `이/가`, `은/는`. Rewriting those as `(아)어` would be wrong.
 
-Patterns that aren't bound forms are left alone (`박사 과정 중` doesn't acquire a marker), a bare syllable inside another morpheme is never rewritten (`~라면` stays put), and Chinese patterns get whitespace tidying only.
+**The rewrite only applies to strings written as pattern notation** — carrying a `~`, a `/`, brackets, or a bare compatibility jamo like `ㄹ`. That gate is load-bearing, not cosmetic: the table cannot tell the ending `-(으)나` from the pronoun `나`, or `-(으)ㅁ` from the first syllable of `음식`, so without it `나이에 따라` becomes `(으)나이에 따라` and `은행에 가다` becomes `(으)ㄴ행에 가다`. Anything that doesn't announce itself as a pattern is returned untouched.
+
+Beyond that: a bare syllable inside another morpheme is never rewritten (`~라면` stays put), patterns that aren't bound forms don't acquire a marker (`박사 과정 중`), and Chinese patterns get whitespace tidying only.
+
+**Pattern entries in a vocabulary list.** A word list often holds a few grammar patterns among the vocabulary. Those get the same treatment during `ankigen generate`, so `ㄹ/을 맛(이) 나다` becomes `(으)ㄹ 맛(이) 나다`, while `음식`, `나이` and `로마자` pass through untouched. Dedupe and resume use the canonical key for pattern entries and the plain form for words, so two spellings of one pattern in the same file produce a single card.
 
 **Why this matters more than tidiness:** every dedupe comparison runs on the same canonical key — against patterns already in Anki, and against rows already written to the CSV. So a deck holding `~ㄹ까 하다` now suppresses generating `~(으)ㄹ까 하다`. Normalising only the *output* would have been worse than doing nothing: the old deck entry would stop matching the new spelling and you'd gain a duplicate.
 

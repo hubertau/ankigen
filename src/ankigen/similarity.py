@@ -14,6 +14,7 @@ from difflib import SequenceMatcher
 
 from ankigen.anki_db import normalize_anki_term
 from ankigen.llm import Language
+from ankigen.pattern_format import _NOTATION_MARKERS, has_pattern_notation
 
 logger = logging.getLogger("ankigen.similarity")
 
@@ -212,14 +213,9 @@ class SimilarPair:
 # notational variants when those sets intersect.
 # ---------------------------------------------------------------------------
 
-# Characters that mark a string as *notation* rather than plain vocabulary.
-# Whitespace and hyphens are deliberately excluded: an ordinary multi-word entry
-# has spaces without being a pattern, and treating that as notation would widen
-# the rule to text it was not designed for.
-_NOTATION_MARKERS = frozenset("~()[]{}/…")
-
-# Stripped before building a canonical key — notation plus any spacing, since
-# `~(으)ㄹ까 하다` and `~(으)ㄹ까하다` are the same pattern.
+# Stripped before building a canonical key — the notation markers shared with
+# `pattern_format`, plus any spacing, since `~(으)ㄹ까 하다` and `~(으)ㄹ까하다`
+# are the same pattern.
 _KEY_STRIPPED = _NOTATION_MARKERS | frozenset(" \t -–—.·")
 
 # Compatibility jamo block (modern letters only).
@@ -259,21 +255,6 @@ def _build_jamo_letter_map() -> dict[str, str]:
 
 
 _JAMO_LETTERS = _build_jamo_letter_map()
-
-
-def _has_pattern_notation(text: str) -> bool:
-    """True when ``text`` looks like grammar-pattern notation.
-
-    Either an explicit marker (``~``, ``/``, brackets) or a bare compatibility
-    jamo, which is how a pattern writes an ending like ``ㄹ까`` that could never
-    appear as a standalone syllable in ordinary vocabulary.
-    """
-    for char in text:
-        if char in _NOTATION_MARKERS:
-            return True
-        if _COMPAT_JAMO_START <= ord(char) <= _COMPAT_JAMO_END:
-            return True
-    return False
 
 
 def _canonical_letters(text: str) -> str:
@@ -405,7 +386,7 @@ def _prepare(word: str, lang: Language) -> _Term:
         unit_set=frozenset(units),
         unit_counts=Counter(units),
         stem=_ko_stem(norm) if lang == "ko" else "",
-        has_notation=_has_pattern_notation(norm),
+        has_notation=has_pattern_notation(norm),
         variant_keys=_variant_keys(norm),
     )
 

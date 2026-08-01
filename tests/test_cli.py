@@ -374,3 +374,68 @@ class TestDefaultBackfillOutputStem:
         jsonl.write_text("", encoding="utf-8")
         stem = _default_backfill_output_stem(jsonl, None)
         assert stem == tmp_path / "update_audit"
+
+
+class TestGenerateCsvPatternEntries:
+    """A vocab word list may hold grammar-pattern entries; those get standardised."""
+
+    def _stub_llm(self, monkeypatch):
+        monkeypatch.setattr(
+            "ankigen.cli.translate_word",
+            lambda w, lang: TranslationResult(translation=f"gloss {w}", hanja=""),
+        )
+        monkeypatch.setattr(
+            "ankigen.cli.generate_sentences",
+            lambda w, lang, n: SentenceResult(sentences=[f"**{w}** 예문."]),
+        )
+
+    def _run(self, tmp_path, monkeypatch, lines, **kwargs):
+        self._stub_llm(monkeypatch)
+        src = tmp_path / "w.txt"
+        src.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        out = tmp_path / "out.csv"
+        generate_csv(src, out, "ko", 1, **kwargs)
+        _, rows = _read_anki_csv(out)
+        return [r["Korean"] for r in rows]
+
+    def test_pattern_entry_is_standardised(self, tmp_path, monkeypatch):
+        # The reported case: a pattern in a vocab list came out untouched.
+        assert self._run(tmp_path, monkeypatch, ["ㄹ/을 맛(이) 나다"]) == ["(으)ㄹ 맛(이) 나다"]
+
+    def test_ordinary_vocabulary_is_untouched(self, tmp_path, monkeypatch):
+        words = ["음식", "나", "나이", "로마자", "면접", "은행"]
+        assert self._run(tmp_path, monkeypatch, words) == words
+
+    def test_two_spellings_in_one_file_produce_one_card(self, tmp_path, monkeypatch):
+        rows = self._run(tmp_path, monkeypatch, ["~ㄹ까 하다", "(으)ㄹ까 하다", "음식"])
+        assert rows == ["~(으)ㄹ까 하다", "음식"]
+
+    def test_anki_exclusion_matches_across_spellings(self, tmp_path, monkeypatch):
+        rows = self._run(
+            tmp_path,
+            monkeypatch,
+            ["ㄹ/을까 하다", "음식"],
+            exclude_words={"~(으)ㄹ까 하다"},
+        )
+        assert rows == ["음식"]
+
+    def test_anki_exclusion_still_works_for_plain_words(self, tmp_path, monkeypatch):
+        rows = self._run(tmp_path, monkeypatch, ["음식", "공부"], exclude_words={"음식"})
+        assert rows == ["공부"]
+
+    def test_resume_matches_across_spellings(self, tmp_path, monkeypatch):
+        self._stub_llm(monkeypatch)
+        out = tmp_path / "out.csv"
+        first = tmp_path / "a.txt"
+        first.write_text("ㄹ/을까 하다\n", encoding="utf-8")
+        generate_csv(first, out, "ko", 1, overwrite=True)
+
+        second = tmp_path / "b.txt"
+        second.write_text("~(으)ㄹ까 하다\n음식\n", encoding="utf-8")
+        generate_csv(second, out, "ko", 1)
+
+        # One row for the pattern, not two: the second spelling was recognised
+        # as already written. It keeps the first run's form — marker presence
+        # follows the input, and that input carried none.
+        _, rows = _read_anki_csv(out)
+        assert [r["Korean"] for r in rows] == ["(으)ㄹ까 하다", "음식"]

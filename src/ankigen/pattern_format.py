@@ -48,6 +48,35 @@ def get_pattern_marker() -> str:
     return raw or _DEFAULT_MARKER
 
 
+# Characters that mark a string as grammar-pattern *notation* rather than a word.
+# Whitespace and hyphens are excluded: an ordinary multi-word entry has spaces
+# without being a pattern.
+_NOTATION_MARKERS = frozenset("~()[]{}/…")
+
+# Compatibility jamo block (modern letters). A bare ``ㄹ`` is how a pattern
+# writes an ending like ``ㄹ까``; it can never be a syllable in real vocabulary.
+_COMPAT_JAMO_START = 0x3131
+_COMPAT_JAMO_END = 0x3163
+
+
+def has_pattern_notation(text: str) -> bool:
+    """True when ``text`` is written as grammar-pattern notation.
+
+    This is the gate on every rewrite below, and it is load-bearing rather than
+    a nicety. The alternation table cannot tell the ending ``-(으)나`` from the
+    pronoun ``나``, or ``-(으)ㅁ`` from the first syllable of ``음식`` — applied
+    unguarded it turns ``나이에 따라`` into ``(으)나이에 따라`` and ``음식`` into
+    ``(으)ㅁ식``. Requiring an explicit notation marker means only strings that
+    announce themselves as patterns are ever rewritten.
+    """
+    for char in text:
+        if char in _NOTATION_MARKERS:
+            return True
+        if _COMPAT_JAMO_START <= ord(char) <= _COMPAT_JAMO_END:
+            return True
+    return False
+
+
 # (form after a vowel, form after a consonant, bracketed letter).
 # Ordered longest-first at import so `ㄹ까` is matched before `ㄹ`.
 _EU_ALTERNATIONS: tuple[tuple[str, str, str], ...] = (
@@ -170,17 +199,20 @@ def normalize_pattern(pattern: str, lang: str = "ko") -> str:
     written ``~게 되다`` keeps its marker, while a phrase like ``박사 과정 중``
     does not acquire one. Only the marker *character* is normalised.
 
-    Non-Korean patterns get whitespace tidying only — the alternation table is
-    Korean morphology and means nothing for Chinese.
+    Strings that carry no pattern notation are returned with whitespace tidied
+    and nothing else — see :func:`has_pattern_notation` for why that guard
+    matters. Non-Korean patterns likewise get tidying only; the alternation
+    table is Korean morphology and means nothing for Chinese.
     """
     text = unicodedata.normalize("NFC", pattern.strip())
     if not text:
         return ""
 
     had_marker = bool(_MARKER_PREFIX_RE.match(text))
+    is_notation = has_pattern_notation(text)
     text = _MARKER_PREFIX_RE.sub("", text)
 
-    if lang == "ko":
+    if lang == "ko" and is_notation:
         text = _rewrite_alternations(text)
         text = _complete_bare_allomorph(text)
 
@@ -206,8 +238,27 @@ def pattern_dedupe_key(pattern: str, lang: str = "ko") -> str:
     return unicodedata.normalize("NFC", stripped.replace(" ", ""))
 
 
+def vocab_dedupe_key(term: str, lang: str = "ko") -> str:
+    """Comparison key for a vocabulary entry.
+
+    A word list can hold grammar-pattern entries alongside ordinary vocabulary
+    (``ㄹ/을 맛(이) 나다`` next to ``음식``). Pattern entries get the notation-
+    insensitive key so their spellings collapse; everything else keeps the
+    plain NFC form, because canonicalising a real word would corrupt it.
+
+    Like :func:`pattern_dedupe_key`, this must be applied to *both* sides of a
+    comparison — the terms read out of Anki as well as the ones being generated
+    — or normalising the output just creates duplicates.
+    """
+    if has_pattern_notation(term):
+        return pattern_dedupe_key(term, lang)
+    return unicodedata.normalize("NFC", term.strip())
+
+
 __all__ = [
     "get_pattern_marker",
+    "has_pattern_notation",
+    "vocab_dedupe_key",
     "normalize_pattern",
     "pattern_dedupe_key",
 ]

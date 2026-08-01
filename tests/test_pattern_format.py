@@ -6,8 +6,10 @@ import pytest
 
 from ankigen.pattern_format import (
     get_pattern_marker,
+    has_pattern_notation,
     normalize_pattern,
     pattern_dedupe_key,
+    vocab_dedupe_key,
 )
 
 
@@ -142,3 +144,76 @@ class TestDedupeKey:
         tilde = pattern_dedupe_key("~ㄹ까 하다", "ko")
         monkeypatch.setenv("ANKIGEN_PATTERN_MARKER", "-")
         assert pattern_dedupe_key("~ㄹ까 하다", "ko") == tilde
+
+
+class TestNotationGate:
+    """Rewriting only ever applies to strings that announce themselves as patterns."""
+
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            ("~게 되다", True),
+            ("ㄹ까 하다", True),  # bare compatibility jamo
+            ("ㄹ/을 맛(이) 나다", True),
+            ("(으)ㄹ까", True),
+            ("음식", False),
+            ("나이에 따라", False),
+            ("한국 음식", False),  # a space alone is not notation
+            ("", False),
+        ],
+    )
+    def test_has_pattern_notation(self, text, expected):
+        assert has_pattern_notation(text) is expected
+
+    @pytest.mark.parametrize(
+        "phrase",
+        [
+            # Regression: every one of these was mangled by the ungated rewrite —
+            # 나이 -> (으)나이, 은행 -> (으)ㄴ행, 음식 -> (으)ㅁ식, and so on.
+            "나이에 따라",
+            "은행에 가다",
+            "음식을 시키다",
+            "시간이 지나다",
+            "로마자 표기",
+            "면접을 보다",
+            "며칠 전에",
+            "기회가 있다",
+            "박사 과정 중",
+        ],
+    )
+    def test_noun_phrases_are_untouched(self, phrase):
+        assert normalize_pattern(phrase, "ko") == phrase
+
+    @pytest.mark.parametrize("word", ["나", "로", "시", "면", "며", "은", "을", "음식", "나라"])
+    def test_plain_vocabulary_is_untouched(self, word):
+        assert normalize_pattern(word, "ko") == word
+
+    def test_notation_entries_are_still_standardised(self):
+        assert normalize_pattern("ㄹ/을 맛(이) 나다", "ko") == "(으)ㄹ 맛(이) 나다"
+        assert normalize_pattern("~ㄹ까 하다", "ko") == "~(으)ㄹ까 하다"
+
+    def test_optional_particle_is_left_alone(self):
+        # (이) here is the optional subject particle, not an 으-insertion.
+        assert "(이)" in normalize_pattern("ㄹ/을 맛(이) 나다", "ko")
+
+
+class TestVocabDedupeKey:
+    def test_pattern_entries_collapse_across_spellings(self):
+        keys = {
+            vocab_dedupe_key(t, "ko")
+            for t in ["ㄹ/을 맛(이) 나다", "(으)ㄹ 맛(이) 나다", "~(으)ㄹ 맛(이) 나다"]
+        }
+        assert len(keys) == 1
+
+    def test_plain_words_keep_their_own_key(self):
+        assert vocab_dedupe_key("음식", "ko") == "음식"
+        assert vocab_dedupe_key("  음식  ", "ko") == "음식"
+
+    def test_plain_words_are_not_conflated(self):
+        assert vocab_dedupe_key("나", "ko") != vocab_dedupe_key("나이", "ko")
+        assert vocab_dedupe_key("음식", "ko") != vocab_dedupe_key("음료", "ko")
+
+    def test_idempotent(self):
+        for term in ["ㄹ/을 맛(이) 나다", "음식", "~ㄹ까 하다"]:
+            once = vocab_dedupe_key(term, "ko")
+            assert vocab_dedupe_key(once, "ko") == once

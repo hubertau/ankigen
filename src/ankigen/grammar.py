@@ -508,8 +508,12 @@ def generate_grammar_csv(
         if not resuming:
             write_anki_header(f, GRAMMAR_CSV_FIELDNAMES)
         for item in items:
-            if pattern_dedupe_key(item.pattern, lang) in done:
+            key = pattern_dedupe_key(item.pattern, lang)
+            if key in done:
                 continue
+            # Track it before the expensive top-up: two spellings of one point
+            # in the same JSONL must not each become a card.
+            done.add(key)
             logger.info("Processing grammar pattern: %s", item.pattern)
             merged = _merge_examples(item, lang, num_examples)
             examples_html = format_grammar_examples(merged, item.pattern)
