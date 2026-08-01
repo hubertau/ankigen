@@ -642,3 +642,173 @@ class TestMissingApiKeyWarning:
         with caplog.at_level(logging.WARNING, logger="ankigen.llm"):
             llm.create_openai_client()
         assert "LLM_API_KEY is not set" not in caplog.text
+
+
+class TestPromptSpecsMatchWhatIsSent:
+    """The estimator measures PromptSpec, so it must be what the callers send."""
+
+    def _sent(self, mock):
+        kw = mock.call_args.kwargs
+        return kw["system_prompt"], kw["user_prompt"]
+
+    def test_generate_sentences_sends_the_spec(self, mocker, mock_sentences_zh):
+        SentenceResponse = create_sentence_response(3, with_notes=True)
+        mock = mocker.patch(
+            "ankigen.llm.generate_structured_response",
+            return_value=SentenceResponse(sentences=mock_sentences_zh),
+        )
+        llm.generate_sentences("음식", lang="ko", num_sentences=3)
+        spec = llm.sentence_prompts("음식", "ko", 3)
+        assert self._sent(mock) == (spec.system, spec.user)
+
+    def test_remark_sentences_sends_the_spec(self, mocker):
+        sents = ["첫째 문장.", "둘째 문장."]
+        SentenceResponse = create_sentence_response(2, with_notes=False)
+        mock = mocker.patch(
+            "ankigen.llm.generate_structured_response",
+            return_value=SentenceResponse(sentences=sents),
+        )
+        llm.remark_sentences("음식", sents, lang="ko")
+        spec = llm.remark_prompts("음식", sents, "ko")
+        assert self._sent(mock) == (spec.system, spec.user)
+
+    @pytest.mark.parametrize("lang,word", [("ko", "음식"), ("zh", "促使")])
+    def test_translate_word_sends_the_spec(self, mocker, lang, word):
+        model = KoreanTranslationResponse if lang == "ko" else TranslationResponse
+        mock = mocker.patch(
+            "ankigen.llm.generate_structured_response",
+            return_value=model(translation="x"),
+        )
+        llm.translate_word(word, lang=lang)
+        spec = llm.translation_prompts(word, lang)
+        assert self._sent(mock) == (spec.system, spec.user)
+
+    def test_estimated_input_tokens_is_positive_and_scales(self):
+        short = llm.translation_prompts("음식", "ko").estimated_input_tokens()
+        long = llm.sentence_prompts("음식", "ko", 3).estimated_input_tokens()
+        assert 0 < short < long  # the sentence prompt carries the notes spec
+
+
+class TestUsageAccounting:
+    def setup_method(self):
+        llm.reset_usage_totals()
+
+    def _openai_response(self, prompt, completion):
+        class Usage:
+            prompt_tokens = prompt
+            completion_tokens = completion
+
+        class Response:
+            usage = Usage()
+
+        return Response()
+
+    def _anthropic_response(self, prompt, completion):
+        class Usage:
+            input_tokens = prompt
+            output_tokens = completion
+
+        class Response:
+            usage = Usage()
+
+        return Response()
+
+    def test_records_openai_shape(self):
+        llm._record_call_usage(self._openai_response(100, 40), "s", "u")
+        totals = llm.get_usage_totals()
+        assert (totals.calls, totals.input_tokens, totals.output_tokens) == (1, 100, 40)
+        assert totals.measured_calls == 1
+
+    def test_records_anthropic_shape(self):
+        llm._record_call_usage(self._anthropic_response(80, 20), "s", "u")
+        totals = llm.get_usage_totals()
+        assert (totals.input_tokens, totals.output_tokens) == (80, 20)
+        assert totals.measured_calls == 1
+
+    def test_reads_instructor_raw_response(self):
+        class Model:
+            _raw_response = None
+
+        model = Model()
+        model._raw_response = self._openai_response(55, 15)
+        llm._record_call_usage(model, "s", "u")
+        totals = llm.get_usage_totals()
+        assert (totals.input_tokens, totals.output_tokens) == (55, 15)
+        assert totals.measured_calls == 1
+
+    def test_falls_back_to_estimate_without_usage(self):
+        llm._record_call_usage(object(), "a system prompt", "a user prompt")
+        totals = llm.get_usage_totals()
+        assert totals.calls == 1
+        assert totals.measured_calls == 0
+        assert totals.estimated_calls == 1
+        assert totals.input_tokens > 0
+
+    def test_totals_accumulate(self):
+        for _ in range(3):
+            llm._record_call_usage(self._openai_response(10, 5), "s", "u")
+        totals = llm.get_usage_totals()
+        assert (totals.calls, totals.input_tokens, totals.output_tokens) == (3, 30, 15)
+
+    def test_get_usage_totals_returns_a_snapshot(self):
+        llm._record_call_usage(self._openai_response(10, 5), "s", "u")
+        snapshot = llm.get_usage_totals()
+        llm._record_call_usage(self._openai_response(10, 5), "s", "u")
+        assert snapshot.calls == 1  # not mutated by the later call
+
+    def test_reset(self):
+        llm._record_call_usage(self._openai_response(10, 5), "s", "u")
+        llm.reset_usage_totals()
+        assert llm.get_usage_totals().calls == 0
+
+
+class TestPricing:
+    def setup_method(self):
+        llm.reset_usage_totals()
+
+    def test_unset_returns_none(self, monkeypatch):
+        monkeypatch.delenv("ANKIGEN_LLM_PRICE_INPUT_PER_MTOK", raising=False)
+        monkeypatch.delenv("ANKIGEN_LLM_PRICE_OUTPUT_PER_MTOK", raising=False)
+        assert llm.get_token_prices() is None
+        assert llm.estimate_cost(1_000_000, 1_000_000) is None
+
+    def test_cost_from_configured_rates(self, monkeypatch):
+        monkeypatch.setenv("ANKIGEN_LLM_PRICE_INPUT_PER_MTOK", "2.0")
+        monkeypatch.setenv("ANKIGEN_LLM_PRICE_OUTPUT_PER_MTOK", "10.0")
+        assert llm.estimate_cost(1_000_000, 500_000) == pytest.approx(2.0 + 5.0)
+
+    def test_one_rate_is_enough(self, monkeypatch):
+        monkeypatch.setenv("ANKIGEN_LLM_PRICE_INPUT_PER_MTOK", "3.0")
+        monkeypatch.delenv("ANKIGEN_LLM_PRICE_OUTPUT_PER_MTOK", raising=False)
+        assert llm.estimate_cost(1_000_000, 1_000_000) == pytest.approx(3.0)
+
+    def test_invalid_rate_is_ignored_with_a_warning(self, monkeypatch, caplog):
+        monkeypatch.setenv("ANKIGEN_LLM_PRICE_INPUT_PER_MTOK", "free")
+        with caplog.at_level(logging.WARNING, logger="ankigen.llm"):
+            assert llm.get_token_prices() is None
+        assert "ANKIGEN_LLM_PRICE" in caplog.text
+
+    def test_format_usage_is_empty_without_calls(self):
+        assert llm.format_usage() == []
+
+    def test_format_usage_mentions_pricing_when_unconfigured(self, monkeypatch):
+        monkeypatch.delenv("ANKIGEN_LLM_PRICE_INPUT_PER_MTOK", raising=False)
+        monkeypatch.delenv("ANKIGEN_LLM_PRICE_OUTPUT_PER_MTOK", raising=False)
+        llm._record_usage(input_tokens=10, output_tokens=5, measured=True)
+        text = "\n".join(llm.format_usage())
+        assert "ANKIGEN_LLM_PRICE_INPUT_PER_MTOK" in text
+
+    def test_format_usage_shows_cost_when_configured(self, monkeypatch):
+        monkeypatch.setenv("ANKIGEN_LLM_PRICE_INPUT_PER_MTOK", "2.0")
+        monkeypatch.setenv("ANKIGEN_LLM_PRICE_OUTPUT_PER_MTOK", "10.0")
+        llm._record_usage(input_tokens=1_000_000, output_tokens=0, measured=True)
+        text = "\n".join(llm.format_usage())
+        assert "2.0000" in text
+        assert "ANKIGEN_LLM_PRICE_INPUT_PER_MTOK" not in text
+
+    def test_format_usage_flags_estimated_calls(self, monkeypatch):
+        monkeypatch.delenv("ANKIGEN_LLM_PRICE_INPUT_PER_MTOK", raising=False)
+        llm._record_usage(input_tokens=10, output_tokens=5, measured=True)
+        llm._record_usage(input_tokens=10, output_tokens=0, measured=False)
+        text = "\n".join(llm.format_usage())
+        assert "1 call(s) reported by the provider, 1 estimated" in text

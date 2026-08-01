@@ -76,6 +76,7 @@ from ankigen.grammar import (
 from ankigen.hanja_lookup import resolve_hanja
 from ankigen.llm import (
     Language,
+    format_usage,
     generate_sentences,
     get_rate_limit_rpm,
     translate_word,
@@ -1616,25 +1617,28 @@ def main() -> None:
     setup_logging(verbose=args.verbose)
 
     # Dispatch to subcommand handler
-    if args.command == "generate":
-        cmd_generate(args)
-    elif args.command == "extract":
-        cmd_extract(args)
-    elif args.command == "clean":
-        cmd_clean(args)
-    elif args.command == "similar":
-        cmd_similar(args)
-    elif args.command == "audit":
-        cmd_audit(args)
-    elif args.command == "backfill":
-        cmd_backfill(args)
-    elif args.command == "status":
-        cmd_status(args)
-    elif args.command == "llm-check":
-        cmd_llm_check(args)
-    else:
+    handlers = {
+        "generate": cmd_generate,
+        "extract": cmd_extract,
+        "clean": cmd_clean,
+        "similar": cmd_similar,
+        "audit": cmd_audit,
+        "backfill": cmd_backfill,
+        "status": cmd_status,
+        "llm-check": cmd_llm_check,
+    }
+    handler = handlers.get(args.command)
+    if handler is None:
         parser.print_help()
         sys.exit(1)
+    try:
+        handler(args)
+    finally:
+        # What the run actually consumed, from the providers' own numbers.
+        # Reported however the command ends, so an interrupted or failed run
+        # still tells you what it spent. Silent when nothing was called.
+        for line in format_usage():
+            print(line)
 
 
 if __name__ == "__main__":

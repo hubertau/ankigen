@@ -39,7 +39,16 @@ from ankigen.formatter import (
     unescape_text,
 )
 from ankigen.hanja_lookup import resolve_hanja
-from ankigen.llm import generate_sentences, remark_sentences, translate_word
+from ankigen.llm import (
+    estimate_cost,
+    generate_sentences,
+    get_llm_max_output_tokens,
+    remark_prompts,
+    remark_sentences,
+    sentence_prompts,
+    translate_word,
+    translation_prompts,
+)
 from ankigen.resume import durable_write
 
 logger = logging.getLogger("ankigen.backfill")
@@ -148,6 +157,8 @@ class BackfillEstimate(NamedTuple):
     translate_calls: int
     sentence_calls: int
     remark_calls: int
+    input_tokens: int = 0
+    output_ceiling: int = 0
 
     @property
     def total(self) -> int:
@@ -158,6 +169,40 @@ class BackfillEstimate(NamedTuple):
         if rpm <= 0:
             return 0.0
         return self.total / rpm
+
+
+def estimate_note_input_tokens(entry: AuditedNote, target_sentences: int) -> int:
+    """Input tokens the note's calls will send.
+
+    Built from :mod:`ankigen.llm`'s prompt specs — the very objects the real
+    calls use — so this measures what will actually be transmitted rather than
+    a second, drifting copy of the prompts.
+    """
+    lang = entry.lang
+    resolved = entry.resolved
+    fields = entry.note.fields
+    headword = fields.get(resolved.headword, "")
+
+    translate, sentence, remark = estimate_note_calls(entry, target_sentences)
+    tokens = 0
+    if translate:
+        tokens += translation_prompts(headword, lang).estimated_input_tokens()
+
+    if sentence or remark:
+        existing_html, _ = split_field(fields.get(resolved.sentence, ""))
+        pairs = split_sentences_with_highlights(existing_html)
+        sentences = [apply_markers(s, reds) for s, reds in pairs]
+        rejected = _rejected_positions(entry.reasons, len(sentences))
+        sentences = [s for i, s in enumerate(sentences) if i not in rejected]
+        if sentence:
+            needed = max(target_sentences - len(sentences), 0)
+            tokens += sentence_prompts(headword, lang, needed).estimated_input_tokens()
+        if remark:
+            unmarked = [
+                s for s in sentences if not has_markers(s) and headword and headword not in s
+            ]
+            tokens += remark_prompts(headword, unmarked, lang).estimated_input_tokens()
+    return tokens
 
 
 def estimate_note_calls(entry: AuditedNote, target_sentences: int) -> tuple[int, int, int]:
@@ -218,16 +263,22 @@ def estimate_backfill(
 ) -> BackfillEstimate:
     """Project the LLM spend for backfilling ``entries``."""
     translate = sentence = remark = 0
+    input_tokens = 0
     for entry in entries:
         t, s, r = estimate_note_calls(entry, target_sentences)
         translate += t
         sentence += s
         remark += r
+        if t or s or r:
+            input_tokens += estimate_note_input_tokens(entry, target_sentences)
+    calls = translate + sentence + remark
     return BackfillEstimate(
         notes=len(entries),
         translate_calls=translate,
         sentence_calls=sentence,
         remark_calls=remark,
+        input_tokens=input_tokens,
+        output_ceiling=calls * get_llm_max_output_tokens(),
     )
 
 
@@ -240,6 +291,18 @@ def format_estimate(estimate: BackfillEstimate, rpm: int) -> list[str]:
         f"   sentence top-ups: {estimate.sentence_calls}",
         f"   keyword marking:  {estimate.remark_calls}",
     ]
+    if estimate.total:
+        lines.append(
+            f"Input tokens: ~{estimate.input_tokens:,} (output up to {estimate.output_ceiling:,})"
+        )
+        low = estimate_cost(estimate.input_tokens, 0)
+        high = estimate_cost(estimate.input_tokens, estimate.output_ceiling)
+        if low is not None and high is not None:
+            # A range, not a point: input is computed from the real prompts, but
+            # output length is the model's choice and only bounded above by
+            # ANKIGEN_LLM_MAX_OUTPUT_TOKENS. The run's own usage report is the
+            # figure to trust afterwards.
+            lines.append(f"Estimated cost: {low:.4f} - {high:.4f} at your configured rates")
     if estimate.total and rpm > 0:
         minutes = estimate.minutes_at_rpm(rpm)
         shown = f"{minutes:.1f}"

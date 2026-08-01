@@ -1253,3 +1253,53 @@ class TestBackfillDryRun:
         stem = tmp_path / "update"
         cmd_backfill(self._args(jsonl, stem, dry_run=False))
         assert list(tmp_path.glob("update__*.tsv"))
+
+
+class TestEstimateTokens:
+    """Token figures come from the same PromptSpec objects the real calls send."""
+
+    def test_input_tokens_are_positive_when_calls_are_projected(self):
+        est = estimate_backfill(_estimate_corpus(), 3)
+        assert est.total > 0
+        assert est.input_tokens > 0
+
+    def test_no_calls_means_no_tokens(self):
+        # A note whose Hanja resolves locally makes no call at all.
+        entry = _entry(_ko_note(korean="飮食", hanja=""), reasons=[("missing_hanja_for_sino", "")])
+        est = estimate_backfill([entry], 3)
+        assert est.total == 0
+        assert est.input_tokens == 0
+
+    def test_output_ceiling_tracks_call_count(self):
+        from ankigen.llm import get_llm_max_output_tokens
+
+        est = estimate_backfill(_estimate_corpus(), 3)
+        assert est.output_ceiling == est.total * get_llm_max_output_tokens()
+
+    def test_input_estimate_matches_the_prompt_specs(self):
+        """A translate-only note should measure exactly its translation prompt."""
+        from ankigen.llm import translation_prompts
+
+        entry = _entry(
+            _ko_note(korean="사랑", hanja="", english=""), reasons=[("empty_english", "")]
+        )
+        expected = translation_prompts("사랑", "ko").estimated_input_tokens()
+        assert estimate_backfill([entry], 3).input_tokens == expected
+
+    def test_cost_range_shown_only_when_priced(self, monkeypatch):
+        est = estimate_backfill(_estimate_corpus(), 3)
+
+        monkeypatch.delenv("ANKIGEN_LLM_PRICE_INPUT_PER_MTOK", raising=False)
+        monkeypatch.delenv("ANKIGEN_LLM_PRICE_OUTPUT_PER_MTOK", raising=False)
+        assert not any("Estimated cost" in line for line in format_estimate(est, 50))
+
+        monkeypatch.setenv("ANKIGEN_LLM_PRICE_INPUT_PER_MTOK", "0.27")
+        monkeypatch.setenv("ANKIGEN_LLM_PRICE_OUTPUT_PER_MTOK", "1.10")
+        cost_line = [line for line in format_estimate(est, 50) if "Estimated cost" in line]
+        assert len(cost_line) == 1
+        assert " - " in cost_line[0]  # a range, not a point estimate
+
+    def test_token_line_omitted_when_nothing_to_do(self):
+        assert not any(
+            "Input tokens" in line for line in format_estimate(estimate_backfill([], 3), 50)
+        )

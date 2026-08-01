@@ -184,7 +184,7 @@ class TestStreamOpenAIChat:
         mock_client = mocker.Mock()
         mock_client.chat.completions.create.return_value = fake_stream()
 
-        text = _stream_openai_chat_json(
+        text, usage = _stream_openai_chat_json(
             mock_client,
             model="deepseek-v4-flash",
             system_prompt="Extract json",
@@ -193,11 +193,16 @@ class TestStreamOpenAIChat:
             max_tokens=4096,
         )
         assert text == '{"words":["a"]}'
+        # These chunks carry no usage block, so the caller falls back to an
+        # estimate rather than reporting nothing.
+        assert usage is None
         assert any("first bytes" in r.message for r in caplog.records)
         assert any("complete" in r.message for r in caplog.records)
         call_kwargs = mock_client.chat.completions.create.call_args.kwargs
         assert call_kwargs["max_tokens"] == 4096
         assert call_kwargs["stream"] is True
+        # Ask for the trailing usage chunk so real token counts come back.
+        assert call_kwargs["stream_options"] == {"include_usage": True}
 
 
 class TestDiagnostics:

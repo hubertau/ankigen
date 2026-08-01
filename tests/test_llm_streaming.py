@@ -32,7 +32,9 @@ class TestStreamOpenaiChatJson:
                 max_tokens=1024,
             )
 
-        assert result == ""
+        text, usage = result
+        assert text == ""
+        assert usage is None
         assert captured["response_format"] == {"type": "json_object"}
         assert captured["extra_body"] == {"thinking": {"type": "disabled"}}
 

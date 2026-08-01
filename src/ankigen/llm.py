@@ -8,7 +8,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, NamedTuple
 
 import instructor
 from anthropic import Anthropic
@@ -514,8 +514,12 @@ def _stream_openai_chat_json(
     user_prompt: str,
     provider: Provider,
     max_tokens: int,
-) -> str:
-    """Stream an OpenAI-compatible chat completion; log progress; return full text."""
+) -> tuple[str, tuple[int, int] | None]:
+    """Stream an OpenAI-compatible chat completion; log progress.
+
+    Returns ``(text, usage)`` where ``usage`` is ``(input, output)`` tokens when
+    the provider sent a usage chunk, else ``None``.
+    """
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
@@ -525,6 +529,8 @@ def _stream_openai_chat_json(
         "messages": messages,
         "stream": True,
         "max_tokens": max_tokens,
+        # Ask for the trailing usage chunk so the run can report real tokens.
+        "stream_options": {"include_usage": True},
     }
     if provider == "deepseek":
         kwargs["response_format"] = {"type": "json_object"}
@@ -539,8 +545,13 @@ def _stream_openai_chat_json(
     first_logged = False
     byte_count = 0
 
+    usage: tuple[int, int] | None = None
     stream = client.chat.completions.create(**kwargs)  # type: ignore[arg-type,call-overload]
     for chunk in stream:
+        # The usage chunk carries no choices, so read it before skipping.
+        reported = _usage_from_response(chunk)
+        if reported is not None:
+            usage = reported
         if not chunk.choices:
             continue
         delta = chunk.choices[0].delta.content
@@ -569,7 +580,7 @@ def _stream_openai_chat_json(
             byte_count,
             time.monotonic() - start,
         )
-    return text
+    return text, usage
 
 
 def get_anthropic_client() -> Anthropic:
@@ -1139,6 +1150,165 @@ def _with_429_retry[T](fn: Callable[[], T]) -> T:
     return _with_transient_retry(fn)
 
 
+# ---------------------------------------------------------------------------
+# Token usage and cost
+#
+# Providers report what a call actually consumed; that is the only figure that
+# is true rather than projected. We accumulate it per run and report it at the
+# end, falling back to the pre-call estimate for the calls where a provider
+# gives us nothing, and saying how many of each we had.
+#
+# Prices are configuration, not a bundled table. Rates change often and the
+# model is a free-form string, so a stale hardcoded price would quote a
+# confidently wrong number — worse than quoting none.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class UsageTotals:
+    """Token usage accumulated over a run."""
+
+    calls: int = 0
+    measured_calls: int = 0  # calls where the provider reported real usage
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+    @property
+    def estimated_calls(self) -> int:
+        return self.calls - self.measured_calls
+
+
+_usage = UsageTotals()
+
+
+def get_usage_totals() -> UsageTotals:
+    """Token usage so far this run."""
+    return UsageTotals(
+        calls=_usage.calls,
+        measured_calls=_usage.measured_calls,
+        input_tokens=_usage.input_tokens,
+        output_tokens=_usage.output_tokens,
+    )
+
+
+def reset_usage_totals() -> None:
+    """Clear accumulated usage (used by tests)."""
+    _usage.calls = 0
+    _usage.measured_calls = 0
+    _usage.input_tokens = 0
+    _usage.output_tokens = 0
+
+
+def _record_usage(*, input_tokens: int, output_tokens: int, measured: bool) -> None:
+    _usage.calls += 1
+    if measured:
+        _usage.measured_calls += 1
+    _usage.input_tokens += max(0, input_tokens)
+    _usage.output_tokens += max(0, output_tokens)
+
+
+def _usage_from_response(response: object) -> tuple[int, int] | None:
+    """Pull ``(input, output)`` token counts off a provider response, if present.
+
+    Handles the OpenAI shape (``prompt_tokens``/``completion_tokens``) and the
+    Anthropic one (``input_tokens``/``output_tokens``), including the raw
+    response Instructor attaches to the model it returns.
+    """
+    for candidate in (response, getattr(response, "_raw_response", None)):
+        usage = getattr(candidate, "usage", None)
+        if usage is None:
+            continue
+        prompt = getattr(usage, "prompt_tokens", None)
+        completion = getattr(usage, "completion_tokens", None)
+        if prompt is None and completion is None:
+            prompt = getattr(usage, "input_tokens", None)
+            completion = getattr(usage, "output_tokens", None)
+        if prompt is not None or completion is not None:
+            return int(prompt or 0), int(completion or 0)
+    return None
+
+
+def get_token_prices() -> tuple[float, float] | None:
+    """``(input, output)`` price per million tokens, or ``None`` if unconfigured.
+
+    Read from ``ANKIGEN_LLM_PRICE_INPUT_PER_MTOK`` and
+    ``ANKIGEN_LLM_PRICE_OUTPUT_PER_MTOK``. Deliberately not defaulted: only you
+    know which model and contract you are on.
+    """
+    raw_in = os.getenv("ANKIGEN_LLM_PRICE_INPUT_PER_MTOK", "").strip()
+    raw_out = os.getenv("ANKIGEN_LLM_PRICE_OUTPUT_PER_MTOK", "").strip()
+    if not raw_in and not raw_out:
+        return None
+    try:
+        return float(raw_in or 0.0), float(raw_out or 0.0)
+    except ValueError:
+        logger.warning(
+            "Invalid ANKIGEN_LLM_PRICE_*_PER_MTOK (%r / %r); skipping cost figures",
+            raw_in,
+            raw_out,
+        )
+        return None
+
+
+def estimate_cost(input_tokens: int, output_tokens: int) -> float | None:
+    """Cost in the currency of the configured rates, or ``None`` if unconfigured."""
+    prices = get_token_prices()
+    if prices is None:
+        return None
+    price_in, price_out = prices
+    return (input_tokens / 1_000_000) * price_in + (output_tokens / 1_000_000) * price_out
+
+
+def _record_estimated_usage(system_prompt: str, user_prompt: str, output_text: str) -> None:
+    """Fall back to estimated tokens when a provider reports no usage."""
+    _record_usage(
+        input_tokens=estimate_tokens(system_prompt) + estimate_tokens(user_prompt),
+        output_tokens=estimate_tokens(output_text),
+        measured=False,
+    )
+
+
+def _record_call_usage(response: object, system_prompt: str, user_prompt: str) -> None:
+    """Record a call's usage, preferring the provider's own numbers."""
+    reported = _usage_from_response(response)
+    if reported is not None:
+        _record_usage(input_tokens=reported[0], output_tokens=reported[1], measured=True)
+        return
+    # No usage block: count the input we know and leave output unattributed
+    # rather than inventing a figure for it.
+    _record_usage(
+        input_tokens=estimate_tokens(system_prompt) + estimate_tokens(user_prompt),
+        output_tokens=0,
+        measured=False,
+    )
+
+
+def format_usage(totals: UsageTotals | None = None) -> list[str]:
+    """Human-readable end-of-run usage summary. Empty when nothing was called."""
+    totals = get_usage_totals() if totals is None else totals
+    if not totals.calls:
+        return []
+    line = (
+        f"LLM usage: {totals.calls} call(s), "
+        f"{totals.input_tokens:,} in / {totals.output_tokens:,} out"
+    )
+    cost = estimate_cost(totals.input_tokens, totals.output_tokens)
+    if cost is not None:
+        line += f"  (~{cost:.4f} at your configured rates)"
+    lines = [line]
+    if totals.estimated_calls:
+        lines.append(
+            f"   {totals.measured_calls} call(s) reported by the provider, "
+            f"{totals.estimated_calls} estimated"
+        )
+    if cost is None:
+        lines.append(
+            "   Set ANKIGEN_LLM_PRICE_INPUT_PER_MTOK / "
+            "ANKIGEN_LLM_PRICE_OUTPUT_PER_MTOK to see a cost figure."
+        )
+    return lines
+
+
 def generate_structured_response[ResponseModelT: BaseModel](
     *,
     response_model: type[ResponseModelT],
@@ -1186,13 +1356,14 @@ def generate_structured_response[ResponseModelT: BaseModel](
                 messages=[{"role": "user", "content": user_prompt}],
             )
 
+            _record_call_usage(response, system_prompt, user_prompt)
             text_blocks = [block.text for block in response.content if block.type == "text"]
             raw_text = "\n".join(text_blocks).strip()
             return _parse_structured_json(response_model, raw_text)
 
         if use_stream_progress(provider):
             raw_client = create_openai_client()
-            raw_text = _stream_openai_chat_json(
+            raw_text, stream_usage = _stream_openai_chat_json(
                 raw_client,
                 model=model,
                 system_prompt=system_prompt,
@@ -1200,13 +1371,21 @@ def generate_structured_response[ResponseModelT: BaseModel](
                 provider=provider,
                 max_tokens=max_tokens,
             )
+            if stream_usage is not None:
+                _record_usage(
+                    input_tokens=stream_usage[0],
+                    output_tokens=stream_usage[1],
+                    measured=True,
+                )
+            else:
+                _record_estimated_usage(system_prompt, user_prompt, raw_text)
             return _parse_structured_json(response_model, raw_text)
 
         openai_client = get_client()
         extra = _deepseek_structured_extra_body()
         try:
             if extra is not None:
-                return openai_client.chat.completions.create(  # type: ignore[no-any-return]
+                result = openai_client.chat.completions.create(
                     model=model,
                     response_model=response_model,
                     messages=[
@@ -1216,15 +1395,18 @@ def generate_structured_response[ResponseModelT: BaseModel](
                     max_tokens=max_tokens,
                     extra_body=extra,
                 )
-            return openai_client.chat.completions.create(  # type: ignore[no-any-return]
-                model=model,
-                response_model=response_model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                max_tokens=max_tokens,
-            )
+            else:
+                result = openai_client.chat.completions.create(
+                    model=model,
+                    response_model=response_model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    max_tokens=max_tokens,
+                )
+            _record_call_usage(result, system_prompt, user_prompt)
+            return result
         except ValidationError as exc:
             log_invalid_json_response(exc, model_name=response_model.__name__)
             raise
@@ -1249,6 +1431,80 @@ def generate_structured_response[ResponseModelT: BaseModel](
         _request_bucket.record()
 
 
+class PromptSpec(NamedTuple):
+    """A ready-to-send request: the two prompts plus the model they expect back.
+
+    Prompt construction is factored out so the cost estimator can measure
+    exactly what will be sent without duplicating any of it. Two copies of a
+    prompt would drift the moment either is edited, and a cost preview that
+    quietly measures the wrong text is worse than none.
+    """
+
+    system: str
+    user: str
+    response_model: type[BaseModel]
+
+    def estimated_input_tokens(self) -> int:
+        return estimate_tokens(self.system) + estimate_tokens(self.user)
+
+
+def sentence_prompts(word: str, lang: Language, num_sentences: int) -> PromptSpec:
+    """Request spec for :func:`generate_sentences`."""
+    config = LANGUAGE_CONFIG[lang]
+    response_model = create_sentence_response(num_sentences, with_notes=True)
+    return PromptSpec(
+        system=_system_prompt_with_json(
+            f"You are a helpful {config['name']} language tutor. "
+            "Generate natural, useful example sentences and concise usage notes.",
+            response_model,
+            lang=lang,
+        ),
+        user=config["sentence_prompt"].format(word=word, num_sentences=num_sentences),
+        response_model=response_model,
+    )
+
+
+def remark_prompts(word: str, sentences: list[str], lang: Language) -> PromptSpec:
+    """Request spec for :func:`remark_sentences`."""
+    config = LANGUAGE_CONFIG[lang]
+    response_model = create_sentence_response(len(sentences), with_notes=False)
+    numbered = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(sentences))
+    return PromptSpec(
+        system=_system_prompt_with_json(
+            f"You are a helpful {config['name']} language tutor. "
+            "Mark vocabulary in existing sentences; never change their wording.",
+            response_model,
+            lang=lang,
+        ),
+        user=config["remark_prompt"].format(
+            word=word, num_sentences=len(sentences), sentences=numbered
+        ),
+        response_model=response_model,
+    )
+
+
+def translation_prompts(word: str, lang: Language) -> PromptSpec:
+    """Request spec for :func:`translate_word`."""
+    config = LANGUAGE_CONFIG[lang]
+    if lang == "ko":
+        response_model: type[BaseModel] = KoreanTranslationResponse
+        role = (
+            f"You are a {config['name']}-English translator. "
+            "Provide accurate, concise translations and include Hanja for Sino-Korean words."
+        )
+    else:
+        response_model = TranslationResponse
+        role = (
+            f"You are a {config['name']}-English translator. "
+            "Provide accurate, concise translations."
+        )
+    return PromptSpec(
+        system=_system_prompt_with_json(role, response_model, lang=lang),
+        user=config["translation_prompt"].format(word=word),
+        response_model=response_model,
+    )
+
+
 def generate_sentences(word: str, lang: Language = "zh", num_sentences: int = 3) -> SentenceResult:
     """
     Generate example sentences plus context notes for a word using the LLM.
@@ -1263,21 +1519,15 @@ def generate_sentences(word: str, lang: Language = "zh", num_sentences: int = 3)
         learner context notes (``""`` when the LLM had nothing to add).
     """
     model = get_model()
-    config = LANGUAGE_CONFIG[lang]
-    SentenceResponse = create_sentence_response(num_sentences, with_notes=True)
+    spec = sentence_prompts(word, lang, num_sentences)
 
     logger.debug("Generating %d sentences for '%s' using %s", num_sentences, word, model)
     start_time = time.time()
 
     response = generate_structured_response(
-        response_model=SentenceResponse,
-        system_prompt=_system_prompt_with_json(
-            f"You are a helpful {config['name']} language tutor. "
-            "Generate natural, useful example sentences and concise usage notes.",
-            SentenceResponse,
-            lang=lang,
-        ),
-        user_prompt=config["sentence_prompt"].format(word=word, num_sentences=num_sentences),
+        response_model=spec.response_model,
+        system_prompt=spec.system,
+        user_prompt=spec.user,
     )
 
     elapsed = time.time() - start_time
@@ -1297,27 +1547,16 @@ def remark_sentences(word: str, sentences: list[str], lang: Language = "zh") -> 
     if not sentences:
         return []
     model = get_model()
-    config = LANGUAGE_CONFIG[lang]
     num = len(sentences)
-    SentenceResponse = create_sentence_response(num, with_notes=False)
-    numbered = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(sentences))
+    spec = remark_prompts(word, sentences, lang)
 
     logger.debug("Remarking %d sentence(s) for '%s' using %s", num, word, model)
     start_time = time.time()
 
     response = generate_structured_response(
-        response_model=SentenceResponse,
-        system_prompt=_system_prompt_with_json(
-            f"You are a helpful {config['name']} language tutor. "
-            "Mark vocabulary in existing sentences; never change their wording.",
-            SentenceResponse,
-            lang=lang,
-        ),
-        user_prompt=config["remark_prompt"].format(
-            word=word,
-            num_sentences=num,
-            sentences=numbered,
-        ),
+        response_model=spec.response_model,
+        system_prompt=spec.system,
+        user_prompt=spec.user,
     )
 
     elapsed = time.time() - start_time
@@ -1409,34 +1648,24 @@ def translate_word(word: str, lang: Language = "zh") -> TranslationResult:
         Hanja form.
     """
     model = get_model()
-    config = LANGUAGE_CONFIG[lang]
+    spec = translation_prompts(word, lang)
 
     logger.debug("Translating '%s' (%s) using %s", word, lang, model)
     start_time = time.time()
 
     if lang == "ko":
         ko_response = generate_structured_response(
-            response_model=KoreanTranslationResponse,
-            system_prompt=_system_prompt_with_json(
-                f"You are a {config['name']}-English translator. "
-                "Provide accurate, concise translations and include Hanja for Sino-Korean words.",
-                KoreanTranslationResponse,
-                lang=lang,
-            ),
-            user_prompt=config["translation_prompt"].format(word=word),
+            response_model=spec.response_model,
+            system_prompt=spec.system,
+            user_prompt=spec.user,
         )
         translation = ko_response.translation  # type: ignore[attr-defined]
         hanja = ko_response.hanja or ""  # type: ignore[attr-defined]
     else:
         zh_response = generate_structured_response(
-            response_model=TranslationResponse,
-            system_prompt=_system_prompt_with_json(
-                f"You are a {config['name']}-English translator. "
-                "Provide accurate, concise translations.",
-                TranslationResponse,
-                lang=lang,
-            ),
-            user_prompt=config["translation_prompt"].format(word=word),
+            response_model=spec.response_model,
+            system_prompt=spec.system,
+            user_prompt=spec.user,
         )
         translation = zh_response.translation  # type: ignore[attr-defined]
         hanja = ""

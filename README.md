@@ -91,6 +91,8 @@ Every LLM-bound subcommand (`extract`, `generate`, `audit`/`backfill`) routes th
 | `ANKIGEN_STAGING_DIR` | `{ANKIGEN_OUTPUT_DIR}/.staging` | Extract checkpoints (manifests, cached text, per-chunk LLM results) for resume after crashes. |
 | `ANKIGEN_LLM_STREAM_PROGRESS` | on for `deepseek` only | Stream completions and log byte progress during long LLM calls (`first bytes`, periodic updates, `complete`). Set `1`/`0` to force on/off. |
 | `ANKIGEN_LLM_STREAM_LOG_INTERVAL_SEC` | `15` | Minimum seconds between streaming progress log lines. |
+| `ANKIGEN_LLM_PRICE_INPUT_PER_MTOK` | unset | Your input price per million tokens. Set it to see cost figures; no price table is bundled. |
+| `ANKIGEN_LLM_PRICE_OUTPUT_PER_MTOK` | unset | Your output price per million tokens. |
 
 When either bucket fires, ankigen logs an `INFO` line naming the dimension that drove the pause (tokens vs requests) so progress stays visible during long backfills.
 
@@ -607,10 +609,25 @@ Projected LLM calls: 72
    translations:     24
    sentence top-ups: 36
    keyword marking:  12
+Input tokens: ~25,140 (output up to 294,912)
+Estimated cost: 0.0068 - 0.3312 at your configured rates
 At least 1.4 minutes at ANKIGEN_LLM_RATE_LIMIT_RPM=50
 ```
 
-These counts are **exact, not a guess**. Everything that decides whether a note reaches the LLM — its audit reasons, its current field contents, and the local Hanja resolver — is available without spending anything, so the projection walks the same branches `backfill` will. A test runs the estimator and the real code over a corpus covering every branch and asserts the call counts match, so the two can't drift apart. The one assumption is that generated sentences arrive carrying `**markers**` as the prompt requires; a model that ignores that adds one marking call for the affected card.
+**Cost figures need your rates.** ankigen ships no price table — rates change often and the model is a free-form config string, so a stale hardcoded price would quote a confidently wrong number. Set `ANKIGEN_LLM_PRICE_INPUT_PER_MTOK` and `ANKIGEN_LLM_PRICE_OUTPUT_PER_MTOK` from your provider's pricing page and the previews show money; leave them unset and you get token counts to paste into a calculator.
+
+The cost is a **range**, not a point. Input tokens are computed from the actual prompt objects the calls will send, so that half is solid; output length is the model's choice and is only bounded above by `ANKIGEN_LLM_MAX_OUTPUT_TOKENS`, which is deliberately generous. Real runs land near the low end — the usage report below is the number to trust.
+
+**What a run actually spent.** Every command ends by reporting real usage, taken from the providers' own numbers rather than estimated:
+
+```
+LLM usage: 48 call(s), 18,590 in / 7,830 out  (~0.0136 at your configured rates)
+   47 call(s) reported by the provider, 1 estimated
+```
+
+It prints however the command ends, so an interrupted run still tells you what it cost, and it says how many calls were measured versus estimated so you know how much to trust the total. Providers that return no usage block fall back to the input-token estimate rather than being silently dropped.
+
+The call counts are **exact, not a guess**. Everything that decides whether a note reaches the LLM — its audit reasons, its current field contents, and the local Hanja resolver — is available without spending anything, so the projection walks the same branches `backfill` will. A test runs the estimator and the real code over a corpus covering every branch and asserts the call counts match, so the two can't drift apart. The one assumption is that generated sentences arrive carrying `**markers**` as the prompt requires; a model that ignores that adds one marking call for the affected card.
 
 **LLM call volume.** `--include-empty-hanja` issues ~1 LLM call per Hangul-only Korean note, `--check-content` issues ~1 per reviewed card *at audit time* (the only rule that costs anything before backfill), and `too_few_sentences` can also be call-heavy on large decks. Both `audit` and `backfill` pace themselves against:
 
