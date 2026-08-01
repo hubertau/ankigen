@@ -55,6 +55,44 @@ def create_sentence_response(
     return SentenceResponseWithNotes
 
 
+# ---------------------------------------------------------------------------
+# Content review
+# ---------------------------------------------------------------------------
+
+
+class SentenceVerdict(BaseModel):
+    """One sentence's content-review result."""
+
+    index: int = Field(
+        ...,
+        description="1-based position of the sentence in the list that was reviewed",
+    )
+    ok: bool = Field(
+        ...,
+        description=(
+            "True when the sentence is grammatical, natural, and uses the target "
+            "word with the stated meaning. False only for a clear, describable defect."
+        ),
+    )
+    issue: str = Field(
+        default="",
+        description=(
+            "Short description of the defect when `ok` is false (a few words, e.g. "
+            "'wrong particle' or 'uses the noun sense, gloss is the verb'). "
+            "Empty string when `ok` is true."
+        ),
+    )
+
+
+class ContentReviewResponse(BaseModel):
+    """Response model for reviewing a card's example sentences."""
+
+    verdicts: list[SentenceVerdict] = Field(
+        default_factory=list,
+        description="Exactly one verdict per reviewed sentence, in the same order.",
+    )
+
+
 class TranslationResponse(BaseModel):
     """Response model for word translation."""
 

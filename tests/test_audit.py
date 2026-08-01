@@ -790,3 +790,184 @@ class TestAuditNotesWithOverrides:
             audit_notes(notes, target_sentences=3, overrides={}, jyutping_resolver=lambda _: "")
         # Aggregated count: 3 notes skipped under one note type.
         assert "Skipped 3 note(s) from unrecognised note type 'Korean (legacy)'" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Content review (--check-content)
+# ---------------------------------------------------------------------------
+
+
+def _reject_none(_word, _english, _sentences, _lang):
+    return []
+
+
+class TestContentReview:
+    """Duplicate detection (free) plus the opt-in LLM judge."""
+
+    def test_off_by_default(self):
+        """Content review must not run — or spend money — unless asked for."""
+        called = False
+
+        def reviewer(*args):
+            nonlocal called
+            called = True
+            return [0]
+
+        note = _ko_note(comments=_three_ko_sentences())
+        results = audit_notes(
+            [note], target_sentences=3, jyutping_resolver=_fake_jyutping, content_reviewer=reviewer
+        )
+        assert results == []
+        assert called is False
+
+    def test_duplicate_sentences_flagged_without_llm(self):
+        called = False
+
+        def reviewer(*args):
+            nonlocal called
+            called = True
+            return []
+
+        html = format_sentences(
+            "1. 저는 음식을 좋아해요. 2. 저는 음식을 좋아해요. 3. 매일 음식을 먹어요.", "음식"
+        )
+        results = audit_notes(
+            [_ko_note(comments=html)],
+            target_sentences=3,
+            jyutping_resolver=_fake_jyutping,
+            check_content=True,
+            content_reviewer=reviewer,
+        )
+        codes = {r.code: r.detail for r in results[0].reasons}
+        assert codes["duplicate_sentences"] == "2"  # 1-based, first kept
+        # The judge still runs on the survivors, but never saw the duplicate.
+        assert called is True
+
+    def test_duplicates_excluded_from_judge_input(self):
+        seen: list[list[str]] = []
+
+        def reviewer(_word, _english, sentences, _lang):
+            seen.append(sentences)
+            return []
+
+        html = format_sentences(
+            "1. 저는 음식을 좋아해요. 2. 저는 음식을 좋아해요. 3. 매일 음식을 먹어요.", "음식"
+        )
+        audit_notes(
+            [_ko_note(comments=html)],
+            target_sentences=3,
+            jyutping_resolver=_fake_jyutping,
+            check_content=True,
+            content_reviewer=reviewer,
+        )
+        assert seen == [["저는 음식을 좋아해요.", "매일 음식을 먹어요."]]
+
+    def test_judge_positions_map_back_to_card_positions(self):
+        # The judge sees a compacted list (duplicate removed); its index 1 is
+        # the card's index 2.
+        html = format_sentences(
+            "1. 저는 음식을 좋아해요. 2. 저는 음식을 좋아해요. 3. 매일 음식을 먹어요.", "음식"
+        )
+        results = audit_notes(
+            [_ko_note(comments=html)],
+            target_sentences=3,
+            jyutping_resolver=_fake_jyutping,
+            check_content=True,
+            content_reviewer=lambda *a: [1],
+        )
+        codes = {r.code: r.detail for r in results[0].reasons}
+        assert codes["sentence_quality"] == "3"
+
+    def test_sentence_quality_flagged(self):
+        results = audit_notes(
+            [_ko_note(comments=_three_ko_sentences())],
+            target_sentences=3,
+            jyutping_resolver=_fake_jyutping,
+            check_content=True,
+            content_reviewer=lambda *a: [0, 2],
+        )
+        codes = {r.code: r.detail for r in results[0].reasons}
+        assert codes["sentence_quality"] == "1,3"
+
+    def test_clean_card_not_flagged(self):
+        results = audit_notes(
+            [_ko_note(comments=_three_ko_sentences())],
+            target_sentences=3,
+            jyutping_resolver=_fake_jyutping,
+            check_content=True,
+            content_reviewer=_reject_none,
+        )
+        assert results == []
+
+    def test_judge_skipped_when_sentences_already_being_rewritten(self):
+        """too_few_sentences / plain_text_sentences already regenerate the field."""
+        for comments, expected_code in [
+            (format_sentences("1. 저는 음식을 좋아해요.", "음식"), "too_few_sentences"),
+            (
+                "저는 음식을 좋아해요. 매일 음식을 먹어요. 한국 음식이 맛있어요.",
+                "plain_text_sentences",
+            ),
+        ]:
+            called = False
+
+            def reviewer(*args):
+                nonlocal called
+                called = True
+                return [0]
+
+            results = audit_notes(
+                [_ko_note(comments=comments)],
+                target_sentences=3,
+                jyutping_resolver=_fake_jyutping,
+                check_content=True,
+                content_reviewer=reviewer,
+            )
+            codes = {r.code for r in results[0].reasons}
+            assert expected_code in codes
+            assert "sentence_quality" not in codes
+            assert called is False, f"judge should not run for {expected_code}"
+
+    def test_duplicates_still_detected_when_judge_skipped(self):
+        # Free check runs even when the paid one is skipped.
+        html = format_sentences("1. 같은 음식. 2. 같은 음식.", "음식")
+        results = audit_notes(
+            [_ko_note(comments=html)],
+            target_sentences=3,
+            jyutping_resolver=_fake_jyutping,
+            check_content=True,
+            content_reviewer=_reject_none,
+        )
+        codes = {r.code for r in results[0].reasons}
+        assert "too_few_sentences" in codes
+        assert "duplicate_sentences" in codes
+
+    def test_notes_block_not_reviewed_as_a_sentence(self):
+        seen: list[list[str]] = []
+
+        def reviewer(_w, _e, sentences, _l):
+            seen.append(sentences)
+            return []
+
+        html = format_context_notes("Compare 음식 with 요리.") + _three_ko_sentences()
+        audit_notes(
+            [_ko_note(comments=html)],
+            target_sentences=3,
+            jyutping_resolver=_fake_jyutping,
+            check_content=True,
+            content_reviewer=reviewer,
+        )
+        assert len(seen[0]) == 3
+        assert not any("Compare" in s for s in seen[0])
+
+    def test_reasons_round_trip_through_jsonl(self, tmp_path: Path):
+        results = audit_notes(
+            [_ko_note(comments=_three_ko_sentences())],
+            target_sentences=3,
+            jyutping_resolver=_fake_jyutping,
+            check_content=True,
+            content_reviewer=lambda *a: [1],
+        )
+        path = tmp_path / "audit.jsonl"
+        write_audit_jsonl(results, path)
+        loaded = read_audit_jsonl(path)
+        assert [(r.code, r.detail) for r in loaded[0].reasons] == [("sentence_quality", "2")]

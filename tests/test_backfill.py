@@ -943,3 +943,93 @@ class TestBackfillResume:
         assert sum(1 for h in headers if h.startswith("#separator")) == 1
         # Both data rows present.
         assert len(rows) == 2
+
+
+class TestBackfillContentReview:
+    """`duplicate_sentences` / `sentence_quality` drop positions and top back up."""
+
+    def _card(self) -> str:
+        from ankigen.formatter import format_sentence_list
+
+        return format_sentence_list(
+            ["첫번째 **음식을** 먹어요.", "두번째 **음식이** 맛있어요.", "세번째 **음식을** 사요."],
+            "음식",
+        )
+
+    def test_rejected_sentence_dropped_and_replaced(self, mocker):
+        mocker.patch(
+            "ankigen.backfill.generate_sentences",
+            return_value=SentenceResult(sentences=["새로운 **음식을** 만들어요."]),
+        )
+        note = _ko_note(comments=self._card())
+        out, touched = backfill_note(
+            _entry(note, reasons=[("sentence_quality", "2")]),
+            target_sentences=3,
+        )
+        assert split_sentences_from_html(out["Comment"]) == [
+            "첫번째 음식을 먹어요.",
+            "세번째 음식을 사요.",
+            "새로운 음식을 만들어요.",
+        ]
+        assert touched == ["Comment"]
+
+    def test_duplicate_and_quality_combine(self, mocker):
+        sentences_mock = mocker.patch(
+            "ankigen.backfill.generate_sentences",
+            return_value=SentenceResult(
+                sentences=["대체 하나 **음식을** 사요.", "대체 둘 **음식이** 좋아요."]
+            ),
+        )
+        note = _ko_note(comments=self._card())
+        out, _ = backfill_note(
+            _entry(
+                note,
+                reasons=[("duplicate_sentences", "2"), ("sentence_quality", "3")],
+            ),
+            target_sentences=3,
+        )
+        # Two dropped, so exactly two are requested to get back to the target.
+        sentences_mock.assert_called_once_with("음식", "ko", 2)
+        assert split_sentences_from_html(out["Comment"]) == [
+            "첫번째 음식을 먹어요.",
+            "대체 하나 음식을 사요.",
+            "대체 둘 음식이 좋아요.",
+        ]
+
+    def test_stale_out_of_range_index_ignored(self, mocker):
+        # The field may have been edited in Anki between audit and backfill;
+        # a stale index must not delete the wrong sentence.
+        sentences_mock = mocker.patch("ankigen.backfill.generate_sentences")
+        note = _ko_note(comments=self._card())
+        out, _ = backfill_note(
+            _entry(note, reasons=[("sentence_quality", "9")]),
+            target_sentences=3,
+        )
+        assert len(split_sentences_from_html(out["Comment"])) == 3
+        sentences_mock.assert_not_called()
+
+    def test_notes_block_survives_a_content_rewrite(self, mocker):
+        mocker.patch(
+            "ankigen.backfill.generate_sentences",
+            return_value=SentenceResult(sentences=["새로운 **음식을** 만들어요."]),
+        )
+        notes = format_context_notes("Compare 음식 with 요리.")
+        note = _ko_note(comments=notes + self._card())
+        out, _ = backfill_note(
+            _entry(note, reasons=[("sentence_quality", "2")]),
+            target_sentences=3,
+        )
+        assert out["Comment"].startswith(notes)
+
+    def test_topup_disabled_still_drops_rejected(self, mocker):
+        sentences_mock = mocker.patch("ankigen.backfill.generate_sentences")
+        note = _ko_note(comments=self._card())
+        out, _ = backfill_note(
+            _entry(note, reasons=[("sentence_quality", "2")]),
+            target_sentences=0,
+        )
+        assert split_sentences_from_html(out["Comment"]) == [
+            "첫번째 음식을 먹어요.",
+            "세번째 음식을 사요.",
+        ]
+        sentences_mock.assert_not_called()

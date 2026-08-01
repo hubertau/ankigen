@@ -13,6 +13,7 @@ Generate Anki vocabulary **and grammar** CSVs with LLM-powered example sentences
 - **Input cleaning**: Automatically remove translations, romanization, and annotations from input files
 - **Similarity review**: Scan an Anki deck (or word list) for near-duplicate, variant, and contained terms
 - **Audit & backfill**: Sweep an existing Anki deck for cards missing the current format (e.g. blank Hanja column, too few example sentences) and regenerate only the weak fields into a GUID-keyed Anki-update TSV
+- **Content review**: Opt into `--check-content` to also flag duplicated example sentences and have an LLM judge whether each sentence is correct, natural, and uses the word with the meaning on the card
 - **Flexible providers**: OpenAI, Anthropic, OpenRouter, DeepSeek, or local models (Ollama, vLLM)
 - **HTML formatting**: Keywords highlighted in red, sentences in blue
 - **Configurable**: Number of sentences, output paths, and more
@@ -462,8 +463,26 @@ Default paths mirror the rest of ankigen: the JSONL audit report lands in `input
 | `too_few_sentences` | `Comment` has fewer than `-n` sentence blocks | `Sentence` has fewer than `-n` blocks |
 | `keyword_not_highlighted` | `Comment` non-empty, formatted with spans, but no red `<span>` related to `Korean` (conjugated/particled forms count as related) | `Sentence` non-empty but no red `<span>` matches `Hanzi` |
 | `plain_text_sentences` | `Comment` non-empty but contains no `<span` tags (legacy) | `Sentence` non-empty but contains no `<span` tags |
+| `duplicate_sentences` | The same sentence appears twice (opt in via `--check-content`; free, no LLM call) | same |
+| `sentence_quality` | The LLM judge rejected one or more sentences (opt in via `--check-content`) | same |
 
-All three sentence rules ignore the trailing context-notes block, so notes never inflate the sentence count or mask a legacy plain-text card.
+All the sentence rules ignore the trailing context-notes block, so notes never inflate the sentence count or mask a legacy plain-text card.
+
+**Content review (`--check-content`)**
+
+Every other rule checks a card's *shape*. Content review checks what the sentences actually **say** — the failure mode where a card has three well-formed, correctly-highlighted sentences and one of them is simply wrong. It runs in two tiers:
+
+1. **Duplicate detection** — free. Catches the most common generator failure (emitting the same sentence twice), comparing with markers stripped and whitespace folded so near-identical repeats still collapse.
+2. **LLM judge** — one request per card, covering all of its sentences at once. Each sentence is checked for grammar, naturalness, whether it actually uses the headword, and whether that use matches the card's English gloss.
+
+Both tiers report *positions*, not rewritten text. The audit records which sentences to replace; `backfill` drops exactly those and tops the card back up through the normal sentence path, so a content-flagged card costs no more to fix than a short one.
+
+Two deliberate economies:
+
+- Cards already flagged `too_few_sentences` or `plain_text_sentences` skip the judge — backfill rewrites those sentences anyway, so judging them would pay for text that is about to change.
+- Sentences already condemned as duplicates are excluded from the judge's request.
+
+The judge is biased toward passing: it is told to flag only clear, describable defects and to pass anything merely simple or plain. A false positive spends an API call regenerating a sentence that was fine; a false negative just leaves the card as it was.
 
 **Backfill actions**
 
@@ -476,6 +495,12 @@ All three sentence rules ignore the trailing context-notes block, so notes never
 | `too_few_sentences` | Existing sentences are preserved; LLM `generate_sentences` is asked for the shortfall only, then `format_sentences` re-renders the whole field |
 | `keyword_not_highlighted` | Preserve existing red spans as `**markers**` and re-run `format_sentences` (no LLM); if there are no red spans, LLM `remark_sentences` then `format_sentences` |
 | `plain_text_sentences` | `format_sentences` re-run over the existing text (no LLM) |
+| `duplicate_sentences` | The repeats are dropped and the card is topped back up to `-n` (first occurrence kept) |
+| `sentence_quality` | The rejected sentences are dropped and the card is topped back up to `-n` |
+
+All the sentence rules run as a **single pass** over the field: sentences are recovered, rejected positions are dropped, the shortfall is requested in one `generate_sentences` call, and unmarked sentences are marked. So a card flagged for several sentence reasons at once still costs at most one top-up call plus one marking call — and, unlike the old per-rule branches, its pre-existing sentences can't be left behind unfixed.
+
+Positions recorded at audit time are re-validated against the card at backfill time; a stale index (because you edited the note in Anki in between) is ignored rather than deleting the wrong sentence.
 
 The headword (`Korean` / `Hanzi`) is **immutable** — backfill never overwrites it. An existing context-notes block is also preserved verbatim: backfill strips it before re-rendering the sentences and re-prepends it above them.
 
@@ -500,7 +525,7 @@ When a note type has neither a recognised default schema nor a matching override
 
 **Important: quit Anki first.** The live `collection.anki2` is locked by Anki for SQLite reads; the audit will report "deck not found" or fail to open the file. Quit Anki (or export an `.apkg` and point `--anki-db` at that) before running.
 
-**LLM call volume.** `--include-empty-hanja` issues ~1 LLM call per Hangul-only Korean note, and `too_few_sentences` can also be call-heavy on large decks. Both `audit` and `backfill` pace themselves against:
+**LLM call volume.** `--include-empty-hanja` issues ~1 LLM call per Hangul-only Korean note, `--check-content` issues ~1 per reviewed card *at audit time* (the only rule that costs anything before backfill), and `too_few_sentences` can also be call-heavy on large decks. Both `audit` and `backfill` pace themselves against:
 
 | Env var | Default | Meaning |
 |---|---|---|
@@ -516,6 +541,7 @@ Both buckets sleep proactively when a call would breach the ceiling; `ANKIGEN_LL
 | `--lang {zh,ko}` | Language (default: `ko`) |
 | `-n, --sentences INT` | Target sentence count per card (default: 3; use `0` to disable the sentence rule) |
 | `--include-empty-hanja` | Korean only: flag every Hangul-only word with a blank Hanja column |
+| `--check-content` | Review what the sentences say, not just their shape: duplicates (free) plus an LLM judge (~1 call per reviewed card) |
 | `-o, --output FILE` | Audit JSONL output (default: `inputs/{lang}/audit_{lang}_{YYYYMMDD}.jsonl`) |
 | `--anki-db`, `--anki-deck` | Anki deck to audit; see [Anki database filtering](#anki-database-filtering-optional). `--anki-field` is unused (we read whole notes). |
 

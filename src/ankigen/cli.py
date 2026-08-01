@@ -962,6 +962,7 @@ def cmd_audit(args: argparse.Namespace) -> None:
         notes,
         target_sentences=args.sentences,
         include_empty_hanja=args.include_empty_hanja,
+        check_content=args.check_content,
     )
 
     if args.output is not None:
@@ -982,6 +983,9 @@ def cmd_audit(args: argparse.Namespace) -> None:
         print("\nReasons:")
         for code in sorted(summary):
             print(f"  {code:<30} {summary[code]}")
+    if args.check_content:
+        content_hits = summary.get("duplicate_sentences", 0) + summary.get("sentence_quality", 0)
+        print(f"\nContent review: on — {content_hits} card(s) have sentences to replace")
     print(f"\nAudit JSONL written to: {output_path}")
     if audited:
         print("\nNext step:")
@@ -1462,6 +1466,18 @@ def main() -> None:
             "Also flag every Hangul-only Korean word with a blank Hanja column "
             "(wide sweep). Costs ~1 LLM call per Hangul-only note in backfill — "
             "paced by ANKIGEN_LLM_RATE_LIMIT_RPM (default 50). Korean only."
+        ),
+    )
+    audit_parser.add_argument(
+        "--check-content",
+        action="store_true",
+        help=(
+            "Also review what the example sentences SAY, not just their shape: "
+            "flags repeated sentences (free) and asks the LLM to judge each "
+            "card's sentences for grammar, naturalness, and whether they use "
+            "the word with the meaning on the card. Costs ~1 LLM call per card "
+            "— cards already flagged for too-few/plain-text sentences are "
+            "skipped since backfill rewrites those anyway."
         ),
     )
     audit_parser.add_argument(

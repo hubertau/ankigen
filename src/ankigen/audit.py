@@ -48,6 +48,13 @@ from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
 from ankigen.anki_db import AnkiNote
+from ankigen.content import (
+    SentenceReviewer,
+    encode_indices,
+    find_duplicate_sentences,
+    parse_indices,
+    review_note_sentences,
+)
 from ankigen.formatter import BR_SPLIT_RE, has_keyword_highlight, split_field
 from ankigen.hanja_lookup import extract_hanja_chars
 from ankigen.llm import Language
@@ -332,7 +339,14 @@ ReasonCode = Literal[
     "too_few_sentences",
     "keyword_not_highlighted",
     "plain_text_sentences",
+    "duplicate_sentences",
+    "sentence_quality",
 ]
+
+# Reason codes whose ``detail`` is a 1-based list of sentence positions to
+# replace (see :func:`ankigen.content.encode_indices`). Backfill drops those
+# positions and tops the card back up.
+SENTENCE_INDEX_REASONS: frozenset[str] = frozenset({"duplicate_sentences", "sentence_quality"})
 
 # Regex matching the inline ``한글(漢字)`` annotation a user may have typed
 # directly into the Korean field instead of (or in addition to) populating
@@ -567,6 +581,60 @@ def _rule_keyword_not_highlighted(
     )
 
 
+def _card_sentences(note: AnkiNote, resolved: ResolvedFields) -> list[str]:
+    """Plain sentence text from a note's sentence field, notes block excluded."""
+    from ankigen.backfill import split_sentences_from_html
+
+    return split_sentences_from_html(note.fields.get(resolved.sentence, ""))
+
+
+def _rule_duplicate_sentences(note: AnkiNote, *, resolved: ResolvedFields) -> AuditReason | None:
+    """Flag a card that repeats the same example sentence.
+
+    Deterministic and free — no LLM call. The detail carries the 1-based
+    positions of the repeats (the first occurrence is always kept).
+    """
+    dupes = find_duplicate_sentences(_card_sentences(note, resolved))
+    if not dupes:
+        return None
+    return AuditReason("duplicate_sentences", encode_indices(dupes))
+
+
+def _rule_sentence_quality(
+    note: AnkiNote,
+    *,
+    resolved: ResolvedFields,
+    lang: Language,
+    reviewer: SentenceReviewer,
+    skip_positions: set[int],
+) -> AuditReason | None:
+    """Flag sentences the LLM judge rejected. Costs one request per card.
+
+    ``skip_positions`` holds sentences already condemned by a cheaper rule
+    (currently duplicates); they are excluded from the request so the judge
+    never spends tokens on text that is being replaced regardless.
+    """
+    sentences = _card_sentences(note, resolved)
+    candidates = [(i, s) for i, s in enumerate(sentences) if i not in skip_positions]
+    if not candidates:
+        return None
+
+    headword = note.fields.get(resolved.headword, "")
+    english = note.fields.get(resolved.english, "")
+    # The judge sees a compacted list, so map its positions back to the card's.
+    local_bad = review_note_sentences(
+        headword,
+        english,
+        [s for _, s in candidates],
+        lang,
+        reviewer=reviewer,
+    )
+    bad = [candidates[i][0] for i in local_bad]
+    if not bad:
+        return None
+    return AuditReason("sentence_quality", encode_indices(bad))
+
+
 def _rule_plain_text_sentences(note: AnkiNote, *, resolved: ResolvedFields) -> AuditReason | None:
     """Flag a non-empty sentence field with no ``<span`` tags at all.
 
@@ -604,6 +672,8 @@ def audit_notes(
     include_empty_hanja: bool = False,
     jyutping_resolver: Callable[[str], str] | None = None,
     overrides: dict[str, dict[str, str]] | None = None,
+    check_content: bool = False,
+    content_reviewer: SentenceReviewer | None = None,
 ) -> list[AuditedNote]:
     """Score every note and return only the flagged ones.
 
@@ -625,12 +695,30 @@ def audit_notes(
         overrides: Override mapping (see
             :func:`get_note_type_overrides`). Omit to read from the
             ``ANKIGEN_NOTE_TYPE_OVERRIDES`` env var.
+        check_content: Enable content review — read each card's example
+            sentences and flag ones that are wrong rather than merely
+            mis-shaped. Duplicate detection is free; the LLM judge costs one
+            request per reviewed card, so this is off by default.
+        content_reviewer: The judge used by ``sentence_quality``. Injected for
+            testability; defaults to :func:`ankigen.llm.review_sentences`.
+            Ignored unless ``check_content`` is set.
+
+    Content review deliberately skips cards whose sentence field is already
+    being rewritten for a structural reason (``too_few_sentences``,
+    ``plain_text_sentences``): those sentences are regenerated or reformatted
+    by backfill regardless, so judging them would spend a request on text that
+    is about to change.
     """
     if jyutping_resolver is None:
         jyutping_resolver = _get_default_jyutping_fn()
 
     if overrides is None:
         overrides = get_note_type_overrides()
+
+    if check_content and content_reviewer is None:
+        from ankigen.llm import review_sentences
+
+        content_reviewer = review_sentences
 
     # Shared warning cache so the same `(model_name, role)` warning fires
     # at most once across the whole audit even when thousands of notes
@@ -640,6 +728,7 @@ def audit_notes(
     audited: list[AuditedNote] = []
     skipped_unknown_lang = 0
     skipped_per_model: dict[str, int] = {}
+    reviewed = 0  # cards sent to the paid content judge
 
     for note in notes:
         lang = detect_lang(note)
@@ -685,6 +774,29 @@ def audit_notes(
         if reason is not None:
             reasons.append(reason)
 
+        if check_content:
+            structural = {r.code for r in reasons} & {
+                "too_few_sentences",
+                "plain_text_sentences",
+            }
+            dupes: set[int] = set()
+            reason = _rule_duplicate_sentences(note, resolved=resolved)
+            if reason is not None:
+                reasons.append(reason)
+                dupes = parse_indices(reason.detail)
+            # Skip the paid judge when the field is already being rewritten.
+            if not structural and content_reviewer is not None:
+                reviewed += 1
+                reason = _rule_sentence_quality(
+                    note,
+                    resolved=resolved,
+                    lang=lang,
+                    reviewer=content_reviewer,
+                    skip_positions=dupes,
+                )
+                if reason is not None:
+                    reasons.append(reason)
+
         if reasons:
             audited.append(AuditedNote(note=note, lang=lang, resolved=resolved, reasons=reasons))
 
@@ -699,6 +811,8 @@ def audit_notes(
             count,
             model_name,
         )
+    if check_content:
+        logger.info("Content review sent %d card(s) to the LLM judge", reviewed)
     logger.info("Audit found %d flagged note(s) out of %d", len(audited), len(notes))
     return audited
 
@@ -874,6 +988,7 @@ def _resolved_from_row(row: dict[str, Any], lang: Language) -> ResolvedFields:
 __all__ = [
     "AuditReason",
     "AuditedNote",
+    "SENTENCE_INDEX_REASONS",
     "ReasonCode",
     "ResolvedFields",
     "audit_notes",

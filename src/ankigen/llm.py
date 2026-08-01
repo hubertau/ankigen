@@ -18,6 +18,7 @@ from pydantic import BaseModel, ValidationError
 
 from ankigen.chunking import estimate_tokens
 from ankigen.models import (
+    ContentReviewResponse,
     GrammarExample,
     KoreanTranslationResponse,
     TranslationResponse,
@@ -122,6 +123,23 @@ LANGUAGE_CONFIG = {
             "sentence in double asterisks, e.g. **{word}**. "
             "Sentences:\n{sentences}"
         ),
+        "content_review_prompt": (
+            "Review these Chinese example sentences for the word '{word}' "
+            "(English gloss: {english}).\n\n"
+            "For each sentence return a verdict. Mark `ok` false ONLY for a clear, "
+            "describable defect:\n"
+            "- ungrammatical, or not something a native speaker would write;\n"
+            "- does not actually use '{word}';\n"
+            "- uses '{word}' in a sense the gloss does not cover;\n"
+            "- wrong measure word, wrong aspect marker, or a word-order error;\n"
+            "- truncated, or padded out with filler.\n\n"
+            "Mark `ok` true for anything merely simple, short, or stylistically plain — "
+            "these are learner cards, not prose. When in doubt, mark it ok. A false "
+            "alarm costs the user an API call to regenerate a sentence that was fine.\n\n"
+            "Ignore any ** ** markers; they flag the target word and are not part of "
+            "the sentence. Return exactly one verdict per sentence, in order.\n\n"
+            "Sentences:\n{sentences}"
+        ),
         "translation_prompt": "Translate the Chinese word '{word}' to English. Include the part of speech and any common meanings or usages. Do NOT include pinyin or the original Chinese characters. Be concise.",
         "grammar_extraction_system": (
             "You are a Chinese language expert helping a learner build Anki grammar cards "
@@ -193,6 +211,25 @@ LANGUAGE_CONFIG = {
             "add sentences. Wrap the vocabulary word '{word}' in each sentence using "
             "its natural surface form (conjugated or with particles) in double asterisks, "
             "e.g. **먹었어요** for 먹다 or **음식을** for 음식. "
+            "Sentences:\n{sentences}"
+        ),
+        "content_review_prompt": (
+            "Review these Korean example sentences for the word '{word}' "
+            "(English gloss: {english}).\n\n"
+            "For each sentence return a verdict. Mark `ok` false ONLY for a clear, "
+            "describable defect:\n"
+            "- ungrammatical, or not something a native speaker would write;\n"
+            "- does not actually use '{word}' (in any conjugated form);\n"
+            "- uses '{word}' in a sense the gloss does not cover;\n"
+            "- wrong particle, wrong honorific level, or mismatched speech level "
+            "within the sentence;\n"
+            "- wrong conjugation, especially of an irregular stem;\n"
+            "- truncated, or padded out with filler.\n\n"
+            "Mark `ok` true for anything merely simple, short, or stylistically plain — "
+            "these are learner cards, not prose. When in doubt, mark it ok. A false "
+            "alarm costs the user an API call to regenerate a sentence that was fine.\n\n"
+            "Ignore any ** ** markers; they flag the target word and are not part of "
+            "the sentence. Return exactly one verdict per sentence, in order.\n\n"
             "Sentences:\n{sentences}"
         ),
         "translation_prompt": (
@@ -386,6 +423,13 @@ def structured_json_format_block(
                     "Compare 吃饭 (to eat a meal) with 用餐 (formal, 書面語); "
                     "口語 register, usually takes no object."
                 )
+    elif name == "ContentReviewResponse":
+        example = {
+            "verdicts": [
+                {"index": 1, "ok": True, "issue": ""},
+                {"index": 2, "ok": False, "issue": "wrong particle"},
+            ]
+        }
     elif name == "TranslationResponse":
         example = {"translation": "to eat; verb"}
     elif name == "KoreanTranslationResponse":
@@ -1238,6 +1282,72 @@ def remark_sentences(word: str, sentences: list[str], lang: Language = "zh") -> 
     remarked = response.sentences  # type: ignore[attr-defined]
     logger.debug("Remarked %d sentence(s) in %.2fs", len(remarked), elapsed)
     return remarked  # type: ignore[no-any-return]
+
+
+def review_sentences(
+    word: str,
+    english: str,
+    sentences: list[str],
+    lang: Language = "zh",
+) -> list[int]:
+    """Ask the LLM which of ``sentences`` are defective. Returns 0-based indices.
+
+    One call per card covering every sentence, so reviewing a deck costs one
+    request per card rather than one per sentence.
+
+    The prompt is deliberately biased toward passing: a false positive makes
+    backfill spend an API call regenerating a sentence that was fine, whereas a
+    false negative just leaves an existing card as-is. Verdicts whose ``index``
+    is out of range are dropped rather than trusted.
+
+    Returns an empty list when ``sentences`` is empty.
+    """
+    if not sentences:
+        return []
+    config = LANGUAGE_CONFIG[lang]
+    numbered = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(sentences))
+
+    logger.debug("Reviewing %d sentence(s) for '%s'", len(sentences), word)
+    start_time = time.time()
+
+    response = generate_structured_response(
+        response_model=ContentReviewResponse,
+        system_prompt=_system_prompt_with_json(
+            f"You are a meticulous {config['name']} teacher checking a learner's "
+            "flashcards. You flag only real errors and never invent problems.",
+            ContentReviewResponse,
+            lang=lang,
+        ),
+        user_prompt=config["content_review_prompt"].format(  # type: ignore[index]
+            word=word,
+            english=english or "(none given)",
+            sentences=numbered,
+        ),
+    )
+
+    bad: list[int] = []
+    for verdict in response.verdicts:
+        if verdict.ok:
+            continue
+        idx = verdict.index - 1
+        if 0 <= idx < len(sentences):
+            bad.append(idx)
+        else:
+            logger.debug(
+                "Discarding out-of-range verdict index %d for '%s' (%d sentence(s))",
+                verdict.index,
+                word,
+                len(sentences),
+            )
+
+    logger.debug(
+        "Reviewed %d sentence(s) for '%s' in %.2fs → %d flagged",
+        len(sentences),
+        word,
+        time.time() - start_time,
+        len(bad),
+    )
+    return sorted(set(bad))
 
 
 def translate_word(word: str, lang: Language = "zh") -> TranslationResult:

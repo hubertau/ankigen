@@ -9,10 +9,13 @@ from ankigen.llm import (
     get_client,
     get_model,
     remark_sentences,
+    review_sentences,
     translate_word,
 )
 from ankigen.models import (
+    ContentReviewResponse,
     KoreanTranslationResponse,
+    SentenceVerdict,
     TranslationResponse,
     create_sentence_response,
 )
@@ -491,3 +494,80 @@ class TestSentenceResponseModel:
         # instructor/diagnostics dispatch on the class name, so both variants
         # must present the same one.
         assert Model.__name__ == "SentenceResponse"
+
+
+class TestReviewSentences:
+    """The content-review judge: one call per card, 1-based verdicts in."""
+
+    def _patch(self, mocker, verdicts):
+        return mocker.patch(
+            "ankigen.llm.generate_structured_response",
+            return_value=ContentReviewResponse(verdicts=[SentenceVerdict(**v) for v in verdicts]),
+        )
+
+    def test_returns_zero_based_indices_of_rejected(self, mocker):
+        self._patch(
+            mocker,
+            [
+                {"index": 1, "ok": True},
+                {"index": 2, "ok": False, "issue": "wrong particle"},
+                {"index": 3, "ok": False, "issue": "not natural"},
+            ],
+        )
+        assert review_sentences("듣다", "to hear", ["a", "b", "c"], "ko") == [1, 2]
+
+    def test_all_ok_returns_empty(self, mocker):
+        self._patch(mocker, [{"index": 1, "ok": True}, {"index": 2, "ok": True}])
+        assert review_sentences("듣다", "to hear", ["a", "b"], "ko") == []
+
+    def test_out_of_range_verdicts_discarded(self, mocker):
+        # A miscounting model must not make backfill delete a sentence that
+        # isn't there — or wrap around to a negative index.
+        self._patch(
+            mocker,
+            [
+                {"index": 0, "ok": False, "issue": "x"},
+                {"index": 7, "ok": False, "issue": "y"},
+                {"index": 2, "ok": False, "issue": "z"},
+            ],
+        )
+        assert review_sentences("듣다", "", ["a", "b"], "ko") == [1]
+
+    def test_duplicate_verdicts_deduped(self, mocker):
+        self._patch(
+            mocker,
+            [
+                {"index": 2, "ok": False, "issue": "x"},
+                {"index": 2, "ok": False, "issue": "x again"},
+            ],
+        )
+        assert review_sentences("듣다", "", ["a", "b"], "ko") == [1]
+
+    def test_no_llm_call_for_empty_sentences(self, mocker):
+        mock = mocker.patch("ankigen.llm.generate_structured_response")
+        assert review_sentences("듣다", "to hear", [], "ko") == []
+        mock.assert_not_called()
+
+    @pytest.mark.parametrize("lang,word", [("ko", "듣다"), ("zh", "促使")])
+    def test_prompt_carries_word_gloss_and_numbered_sentences(self, mocker, lang, word):
+        mock = self._patch(mocker, [{"index": 1, "ok": True}])
+        review_sentences(word, "to hear", ["첫번째.", "두번째."], lang)
+        user_prompt = mock.call_args.kwargs["user_prompt"]
+        assert word in user_prompt
+        assert "to hear" in user_prompt
+        assert "1. 첫번째." in user_prompt
+        assert "2. 두번째." in user_prompt
+
+    def test_missing_gloss_is_labelled(self, mocker):
+        mock = self._patch(mocker, [{"index": 1, "ok": True}])
+        review_sentences("듣다", "", ["a"], "ko")
+        assert "(none given)" in mock.call_args.kwargs["user_prompt"]
+
+    @pytest.mark.parametrize("lang", ["ko", "zh"])
+    def test_prompt_biases_toward_passing(self, mocker, lang):
+        # A false positive costs a regeneration call; the prompt must say so.
+        mock = self._patch(mocker, [{"index": 1, "ok": True}])
+        review_sentences("x", "y", ["a"], lang)
+        lowered = mock.call_args.kwargs["user_prompt"].lower()
+        assert "when in doubt" in lowered
+        assert "only" in lowered

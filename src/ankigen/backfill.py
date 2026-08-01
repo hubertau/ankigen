@@ -20,10 +20,13 @@ from pathlib import Path
 from typing import NamedTuple
 
 from ankigen.audit import (
+    SENTENCE_INDEX_REASONS,
     AuditedNote,
+    AuditReason,
     read_audit_jsonl,
 )
 from ankigen.cleaner import parse_hanja_token
+from ankigen.content import parse_indices
 from ankigen.formatter import (
     _ANY_SPAN_RE,
     BR_SPLIT_RE,
@@ -99,6 +102,22 @@ class _Backfilled(NamedTuple):
     guid: str
     field_order: list[str]
     fields: dict[str, str]
+
+
+def _rejected_positions(reasons: list[AuditReason], count: int) -> set[int]:
+    """0-based sentence positions the audit asked to replace.
+
+    Collected from every reason whose detail encodes positions (see
+    :data:`ankigen.audit.SENTENCE_INDEX_REASONS`). Positions outside the
+    card's current sentence range are dropped: the field may have been edited
+    in Anki between the audit and the backfill, and deleting by a stale index
+    would throw away the wrong sentence.
+    """
+    positions: set[int] = set()
+    for reason in reasons:
+        if reason.code in SENTENCE_INDEX_REASONS:
+            positions |= parse_indices(reason.detail)
+    return {i for i in positions if 0 <= i < count}
 
 
 def _resolve_hanja_local(korean: str) -> str:
@@ -197,15 +216,21 @@ def backfill_note(
         _set(resolved.english, escape_text(translation_result.translation))
 
     # ----- Sentences -------------------------------------------------------
-    # All three sentence rules operate on the same field, so they run as one
-    # pass: recover the sentences, top up if short, make sure each one carries
-    # a marker, then format once. Running them as independent branches used to
-    # mean a card flagged for BOTH `too_few_sentences` and
-    # `keyword_not_highlighted` got its new sentences marked but kept its old
-    # unmarked ones — and then passed every later audit.
+    # Every sentence rule operates on the same field, so they run as one pass:
+    # recover the sentences, drop any the audit rejected, top up if short, make
+    # sure each one carries a marker, then format once. Running them as
+    # independent branches used to mean a card flagged for BOTH
+    # `too_few_sentences` and `keyword_not_highlighted` got its new sentences
+    # marked but kept its old unmarked ones — and then passed every later audit.
     sentence_field = resolved.sentence
     wants_sentences = bool(
-        reason_codes & {"plain_text_sentences", "too_few_sentences", "keyword_not_highlighted"}
+        reason_codes
+        & {
+            "plain_text_sentences",
+            "too_few_sentences",
+            "keyword_not_highlighted",
+            *SENTENCE_INDEX_REASONS,
+        }
     )
 
     if wants_sentences:
@@ -217,7 +242,20 @@ def backfill_note(
         pairs = split_sentences_with_highlights(existing_html)
         sentences = [apply_markers(s, reds) for s, reds in pairs]
 
-        if "too_few_sentences" in reason_codes and target_sentences > 0:
+        # Content review reports positions to replace (duplicates, sentences the
+        # judge rejected). Drop them here and let the top-up below refill the
+        # gap, so rejected and missing sentences share one regeneration path.
+        rejected = _rejected_positions(entry.reasons, len(sentences))
+        if rejected:
+            logger.info(
+                "Dropping %d rejected sentence(s) for '%s': %s",
+                len(rejected),
+                headword,
+                sorted(i + 1 for i in rejected),
+            )
+            sentences = [s for i, s in enumerate(sentences) if i not in rejected]
+
+        if ("too_few_sentences" in reason_codes or rejected) and target_sentences > 0:
             needed = max(target_sentences - len(sentences), 0)
             if needed > 0:
                 try:
