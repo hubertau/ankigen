@@ -63,7 +63,7 @@ from ankigen.extractor import (
     get_watch_dir,
     process_folder,
 )
-from ankigen.formatter import escape_text, format_sentence_list
+from ankigen.formatter import escape_text, format_context_notes, format_sentence_list
 from ankigen.grammar import (
     extract_grammar_from_file,
     generate_grammar_csv,
@@ -136,6 +136,7 @@ def process_word(
     num_sentences: int,
     *,
     inline_hanja: str = "",
+    include_notes: bool = True,
 ) -> dict[str, str]:
     """
     Process a single word: get translation, Jyutping (for Chinese) or Hanja
@@ -148,6 +149,8 @@ def process_word(
         num_sentences: Number of sentences to generate (0 to skip).
         inline_hanja: Hanja captured from a ``한글(漢字)`` annotation upstream.
             Ignored for Chinese.
+        include_notes: Prepend the LLM's context notes block above the
+            sentences. No effect when ``num_sentences`` is 0.
 
     Returns:
         Dict with language-appropriate field names.
@@ -162,8 +165,12 @@ def process_word(
     translation = escape_text(result.translation)
 
     if num_sentences > 0:
-        sentences = generate_sentences(word, lang, num_sentences)
-        formatted = format_sentence_list(sentences, word)
+        sentence_result = generate_sentences(word, lang, num_sentences)
+        formatted = format_sentence_list(sentence_result.sentences, word)
+        if include_notes:
+            notes_html = format_context_notes(sentence_result.notes)
+            if notes_html:
+                formatted = notes_html + formatted
     else:
         formatted = ""
 
@@ -185,7 +192,7 @@ def process_word(
         "Korean": word,
         "Hanja": hanja,
         "English": translation,
-        "Comments": formatted,
+        "Comment": formatted,
     }
 
 
@@ -223,6 +230,7 @@ def generate_csv(
     clean_input: bool = False,
     exclude_words: set[str] | None = None,
     overwrite: bool = False,
+    include_notes: bool = True,
 ) -> None:
     """
     Generate the output CSV from a word list.
@@ -234,6 +242,8 @@ def generate_csv(
         num_sentences: Number of sentences to generate per word (0 to skip)
         clean_input: If True, clean the input before processing
         exclude_words: Optional NFC-normalized terms to skip (e.g. from Anki)
+        include_notes: If True, prepend the LLM's context notes above the
+            sentences in the same field
         overwrite: If True, wipe and rewrite. Otherwise an existing output
             file is resumed: rows already written are kept and skipped, and
             each new row is fsync'd so an interrupted run loses nothing.
@@ -264,7 +274,7 @@ def generate_csv(
     if lang == "zh":
         fieldnames = ["Hanzi", "Pinyin", "Jyutping", "English", "Sentence"]
     else:  # Korean
-        fieldnames = ["Korean", "Hanja", "English", "Comments"]
+        fieldnames = ["Korean", "Hanja", "English", "Comment"]
     key_column = fieldnames[0]
 
     resuming = not overwrite and output_file.exists() and output_file.stat().st_size > 0
@@ -286,7 +296,13 @@ def generate_csv(
             bare, inline_hanja = parse_hanja_token(raw) if lang == "ko" else (raw, "")
             if normalize_anki_term(bare) in done:
                 continue
-            row = process_word(bare, lang, num_sentences, inline_hanja=inline_hanja)
+            row = process_word(
+                bare,
+                lang,
+                num_sentences,
+                inline_hanja=inline_hanja,
+                include_notes=include_notes,
+            )
             writer.writerow(row)
             durable_write(f)
             written += 1
@@ -420,6 +436,7 @@ def cmd_generate(args: argparse.Namespace) -> None:
                 clean_input=args.clean,
                 exclude_words=exclude_words or None,
                 overwrite=args.overwrite,
+                include_notes=not args.no_notes,
             )
         else:
             logger.warning("Vocab sibling not found: %s — skipping vocab CSV", vocab_path)
@@ -468,6 +485,7 @@ def cmd_generate(args: argparse.Namespace) -> None:
         clean_input=args.clean,
         exclude_words=exclude_words or None,
         overwrite=args.overwrite,
+        include_notes=not args.no_notes,
     )
 
 
@@ -1110,7 +1128,7 @@ def cmd_status(args: argparse.Namespace) -> None:
     if not raw_overrides:
         print(
             "   ANKIGEN_NOTE_TYPE_OVERRIDES: (not set — using KO/ZH defaults)\n"
-            "   Defaults: KO = Korean | Hanja | English | Comments\n"
+            "   Defaults: KO = Korean | Hanja | English | Comment\n"
             "             ZH = Hanzi  | Jyutping | English | Sentence"
         )
     else:
@@ -1201,6 +1219,12 @@ def main() -> None:
         type=int,
         default=3,
         help="Number of example sentences per word (default: 3, use 0 to skip)",
+    )
+    gen_parser.add_argument(
+        "--no-notes",
+        action="store_true",
+        help="Skip the context notes block (similar words, register, collocation "
+        "quirks) that is placed above the example sentences.",
     )
     gen_parser.add_argument(
         "-c",
@@ -1410,7 +1434,7 @@ def main() -> None:
         "audit",
         help="Audit an Anki vocab deck for missing/weak fields",
         description=(
-            "Scan an existing Anki vocab deck (Korean: Korean|Hanja|English|Comments; "
+            "Scan an existing Anki vocab deck (Korean: Korean|Hanja|English|Comment; "
             "Chinese: Hanzi|Jyutping|English|Sentence), flag notes that don't match "
             "the current format, and write a JSONL audit file with one entry per "
             "flagged note. Pair with `ankigen backfill` to regenerate the weak "

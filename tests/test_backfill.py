@@ -14,8 +14,8 @@ from ankigen.backfill import (
     split_sentences_from_html,
     write_update_tsvs,
 )
-from ankigen.formatter import format_sentences
-from ankigen.llm import TranslationResult
+from ankigen.formatter import format_context_notes, format_sentences
+from ankigen.llm import SentenceResult, TranslationResult
 
 # ---------------------------------------------------------------------------
 # Builders (kept close to test_audit's builders for consistency)
@@ -37,8 +37,8 @@ def _ko_note(
         mid=100,
         model_name="Korean Vocab",
         deck_id=1,
-        fields={"Korean": korean, "Hanja": hanja, "English": english, "Comments": comments},
-        field_order=["Korean", "Hanja", "English", "Comments"],
+        fields={"Korean": korean, "Hanja": hanja, "English": english, "Comment": comments},
+        field_order=["Korean", "Hanja", "English", "Comment"],
     )
 
 
@@ -63,7 +63,7 @@ def _zh_note(
 
 
 _KO_DEFAULT_RESOLVED = ResolvedFields(
-    headword="Korean", secondary="Hanja", english="English", sentence="Comments"
+    headword="Korean", secondary="Hanja", english="English", sentence="Comment"
 )
 _ZH_DEFAULT_RESOLVED = ResolvedFields(
     headword="Hanzi", secondary="Jyutping", english="English", sentence="Sentence"
@@ -222,7 +222,7 @@ class TestBackfillNoteKorean:
         existing = format_sentences("1. 저는 음식을 좋아해요.", "음식")
         sentences_mock = mocker.patch(
             "ankigen.backfill.generate_sentences",
-            return_value=["새로운 첫번째 문장.", "또 다른 문장 입니다."],
+            return_value=SentenceResult(sentences=["새로운 첫번째 문장.", "또 다른 문장 입니다."]),
         )
         note = _ko_note(comments=existing)
         out, _ = backfill_note(
@@ -234,11 +234,50 @@ class TestBackfillNoteKorean:
         # All three sentences make it through.
         from ankigen.backfill import split_sentences_from_html
 
-        assert split_sentences_from_html(out["Comments"]) == [
+        assert split_sentences_from_html(out["Comment"]) == [
             "저는 음식을 좋아해요.",
             "새로운 첫번째 문장.",
             "또 다른 문장 입니다.",
         ]
+
+    def test_too_few_sentences_preserves_context_notes(self, mocker):
+        notes = format_context_notes("Compare 음식 with 요리; neutral register.")
+        existing = notes + format_sentences("1. 저는 음식을 좋아해요.", "음식")
+        mocker.patch(
+            "ankigen.backfill.generate_sentences",
+            return_value=SentenceResult(sentences=["새로운 첫번째 문장.", "또 다른 문장 입니다."]),
+        )
+        note = _ko_note(comments=existing)
+        out, _ = backfill_note(
+            _entry(note, reasons=[("too_few_sentences", "1<3")]),
+            target_sentences=3,
+        )
+        # The notes block survives verbatim and stays above the sentences...
+        assert out["Comment"].startswith(notes)
+        assert out["Comment"].count("ankigen-notes") == 1
+        # ...and was never mistaken for a sentence.
+        assert split_sentences_from_html(out["Comment"]) == [
+            "저는 음식을 좋아해요.",
+            "새로운 첫번째 문장.",
+            "또 다른 문장 입니다.",
+        ]
+
+    def test_plain_text_sentences_preserves_context_notes(self, mocker):
+        notes = format_context_notes("Register: casual speech only.")
+        mocker.patch("ankigen.backfill.generate_sentences")
+        note = _ko_note(comments=notes + "저는 음식을 좋아해요. 매일 음식을 먹어요.")
+        out, _ = backfill_note(
+            _entry(note, reasons=[("plain_text_sentences", "")]),
+            target_sentences=3,
+        )
+        assert out["Comment"].startswith(notes)
+        assert '<span style="color: red;">음식</span>' in out["Comment"]
+
+    def test_split_sentences_from_html_drops_notes_block(self):
+        html = format_context_notes("Compare 음식 with 요리.") + format_sentences(
+            "1. 저는 음식을 좋아해요.", "음식"
+        )
+        assert split_sentences_from_html(html) == ["저는 음식을 좋아해요."]
 
     def test_too_few_sentences_with_enough_existing_no_llm(self, mocker):
         existing = format_sentences(
@@ -293,7 +332,9 @@ class TestBackfillNoteKorean:
         existing = format_sentence_list(["저는 매일 음악을 들어요."], "듣다")
         mocker.patch(
             "ankigen.backfill.generate_sentences",
-            return_value=["어제 음악을 **들었어요**.", "라디오를 **듣습니다**."],
+            return_value=SentenceResult(
+                sentences=["어제 음악을 **들었어요**.", "라디오를 **듣습니다**."]
+            ),
         )
         remark_mock = mocker.patch(
             "ankigen.backfill.remark_sentences",
@@ -306,7 +347,7 @@ class TestBackfillNoteKorean:
         )
         # Only the unmarked sentence was sent to the LLM for marking.
         remark_mock.assert_called_once_with("듣다", ["저는 매일 음악을 들어요."], "ko")
-        assert has_keyword_highlight(out["Comments"], "듣다", "ko") is True
+        assert has_keyword_highlight(out["Comment"], "듣다", "ko") is True
 
     def test_remark_skipped_when_headword_appears_verbatim(self, mocker):
         # Chinese (and unconjugated Korean) already highlight via exact match,
@@ -335,8 +376,8 @@ class TestBackfillNoteKorean:
             _entry(note, reasons=[("keyword_not_highlighted", "")]),
             target_sentences=3,
         )
-        assert "color: red" not in out["Comments"]
-        assert "매일 음악을 들어요." in split_sentences_from_html(out["Comments"])
+        assert "color: red" not in out["Comment"]
+        assert "매일 음악을 들어요." in split_sentences_from_html(out["Comment"])
 
     def test_plain_text_sentences_reformatted_no_llm(self, mocker):
         sentences_mock = mocker.patch("ankigen.backfill.generate_sentences")
@@ -346,8 +387,8 @@ class TestBackfillNoteKorean:
             target_sentences=3,
         )
         sentences_mock.assert_not_called()
-        assert '<span style="color: blue;">' in out["Comments"]
-        assert '<span style="color: red;">음식</span>' in out["Comments"]
+        assert '<span style="color: blue;">' in out["Comment"]
+        assert '<span style="color: red;">음식</span>' in out["Comment"]
 
     def test_keyword_not_highlighted_preserves_conjugated_red(self, mocker):
         existing = format_sentences(
@@ -364,9 +405,9 @@ class TestBackfillNoteKorean:
             target_sentences=3,
         )
         remark_mock.assert_not_called()
-        assert touched == ["Comments"]
-        assert '<span style="color: red;">들어요</span>' in out["Comments"]
-        assert '<span style="color: red;">들었어요</span>' in out["Comments"]
+        assert touched == ["Comment"]
+        assert '<span style="color: red;">들어요</span>' in out["Comment"]
+        assert '<span style="color: red;">들었어요</span>' in out["Comment"]
 
     def test_keyword_not_highlighted_reformatted_no_llm(self, mocker):
         # 3 sentences with keyword "음식" highlighted, but headword renamed
@@ -386,12 +427,12 @@ class TestBackfillNoteKorean:
         remark_mock.assert_not_called()
         from ankigen.backfill import split_sentences_from_html
 
-        assert split_sentences_from_html(out["Comments"]) == [
+        assert split_sentences_from_html(out["Comment"]) == [
             "저는 음식을 좋아해요.",
             "한국 음식이 맛있어요.",
             "매일 음식을 먹어요.",
         ]
-        assert '<span style="color: red;">음식</span>' in out["Comments"]
+        assert '<span style="color: red;">음식</span>' in out["Comment"]
 
     def test_keyword_not_highlighted_all_blue_calls_remark(self, mocker):
         existing = format_sentences(
@@ -415,8 +456,8 @@ class TestBackfillNoteKorean:
             target_sentences=3,
         )
         remark_mock.assert_called_once()
-        assert touched == ["Comments"]
-        assert '<span style="color: red;">바빠요</span>' in out["Comments"]
+        assert touched == ["Comment"]
+        assert '<span style="color: red;">바빠요</span>' in out["Comment"]
 
     def test_headword_never_overwritten(self, mocker):
         mocker.patch(
@@ -500,7 +541,7 @@ class TestWriteUpdateTsvs:
         assert "#guid column:3" in headers
         # The #columns header lists the union of metadata + note fields.
         columns_line = [h for h in headers if h.startswith("#columns:")][0]
-        assert columns_line == "#columns:notetype\tdeck\tguid\tKorean\tHanja\tEnglish\tComments"
+        assert columns_line == "#columns:notetype\tdeck\tguid\tKorean\tHanja\tEnglish\tComment"
         # One row of data, with the updated English.
         assert len(rows) == 1
         assert rows[0][0] == "Korean Vocab"  # notetype
@@ -624,7 +665,7 @@ class TestBackfillJsonl:
         # without making any further failing calls.
         mocker.patch(
             "ankigen.backfill.generate_sentences",
-            return_value=["s1.", "s2.", "s3."],
+            return_value=SentenceResult(sentences=["s1.", "s2.", "s3."]),
         )
         with caplog.at_level("WARNING"):
             paths = backfill_jsonl(jsonl, tmp_path / "update", target_sentences=3)
@@ -654,38 +695,46 @@ class TestBackfillRespectsResolvedFields:
     def test_writes_to_overridden_sentence_field(self, mocker, tmp_path: Path):
         mocker.patch(
             "ankigen.backfill.generate_sentences",
-            return_value=["문장 하나입니다.", "문장 둘입니다.", "문장 셋입니다."],
+            return_value=SentenceResult(
+                sentences=["문장 하나입니다.", "문장 둘입니다.", "문장 셋입니다."]
+            ),
         )
-        # Note has singular "Comment", not "Comments".
+        # Legacy note type has plural "Comments", not the default "Comment".
         note = AnkiNote(
             nid=1,
-            guid="g-adv",
+            guid="g-legacy",
             mid=999,
-            model_name="Korean (advanced)",
+            model_name="Korean (legacy)",
             deck_id=1,
             fields={
                 "Korean": "음식",
                 "Hanja": "",
                 "English": "food",
-                "Comment": "",
+                "Comments": "",
             },
-            field_order=["Korean", "Hanja", "English", "Comment"],
+            field_order=["Korean", "Hanja", "English", "Comments"],
         )
         resolved = ResolvedFields(
-            headword="Korean", secondary="Hanja", english="English", sentence="Comment"
+            headword="Korean", secondary="Hanja", english="English", sentence="Comments"
         )
         entry = _entry(
             note,
             reasons=[("too_few_sentences", "0<3")],
             resolved=resolved,
         )
+        # Freshly generated sentences normally arrive with **markers**; the mock
+        # above returns them unmarked, so the marking pass would otherwise fire.
+        mocker.patch(
+            "ankigen.backfill.remark_sentences",
+            side_effect=lambda word, sentences, lang: sentences,
+        )
         out, touched = backfill_note(entry, target_sentences=3)
-        # Plural "Comments" is NOT a key on the returned fields — only
-        # singular "Comment" was touched.
-        assert "Comments" not in out
-        assert "Comment" in out
-        assert touched == ["Comment"]
-        assert '<span style="color: blue;">' in out["Comment"]
+        # The default "Comment" is NOT a key on the returned fields — only
+        # the overridden plural "Comments" was touched.
+        assert "Comment" not in out
+        assert "Comments" in out
+        assert touched == ["Comments"]
+        assert '<span style="color: blue;">' in out["Comments"]
 
     def test_writes_to_overridden_secondary_field_for_korean(self, mocker):
         mocker.patch(
@@ -700,11 +749,11 @@ class TestBackfillRespectsResolvedFields:
             mid=999,
             model_name="Custom",
             deck_id=1,
-            fields={"Korean": "사랑", "HanjaCol": "", "English": "love", "Comments": ""},
-            field_order=["Korean", "HanjaCol", "English", "Comments"],
+            fields={"Korean": "사랑", "HanjaCol": "", "English": "love", "Comment": ""},
+            field_order=["Korean", "HanjaCol", "English", "Comment"],
         )
         resolved = ResolvedFields(
-            headword="Korean", secondary="HanjaCol", english="English", sentence="Comments"
+            headword="Korean", secondary="HanjaCol", english="English", sentence="Comment"
         )
         entry = _entry(
             note,
@@ -784,8 +833,8 @@ class TestReadAuditJsonlBackwardCompat:
         path.write_text(
             '{"guid": "g", "nid": 1, "mid": 100, "model": "Korean Vocab", '
             '"lang": "ko", "deck_id": 1, '
-            '"fields": {"Korean": "음식", "Hanja": "", "English": "food", "Comments": ""}, '
-            '"field_order": ["Korean", "Hanja", "English", "Comments"], '
+            '"fields": {"Korean": "음식", "Hanja": "", "English": "food", "Comment": ""}, '
+            '"field_order": ["Korean", "Hanja", "English", "Comment"], '
             '"reasons": [{"code": "empty_english", "detail": ""}]}\n',
             encoding="utf-8",
         )
@@ -856,7 +905,7 @@ class TestBackfillResume:
 
         paths = backfill_jsonl(jsonl, tmp_path / "update")
         _, rows = _read_tsv(paths[0])
-        # Columns: notetype, deck, guid, Korean, Hanja, English, Comments
+        # Columns: notetype, deck, guid, Korean, Hanja, English, Comment
         assert rows[0][5] == "first"  # English field
 
         self._patch_translate(mocker, translation="second")

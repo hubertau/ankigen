@@ -1,6 +1,11 @@
 """Tests for the formatter module (pure functions, no mocking needed)."""
 
-from ankigen.formatter import format_sentence_list, format_sentences
+from ankigen.formatter import (
+    format_context_notes,
+    format_sentence_list,
+    format_sentences,
+    split_field,
+)
 
 
 class TestFormatSentences:
@@ -351,3 +356,44 @@ class TestHighlightHelpers:
         )
         assert '<span style="color: red;">들어요</span>' in restored
         assert '<span style="color: red;">들었어요</span>' in restored
+
+
+class TestContextNotes:
+    def test_blank_notes_render_nothing(self):
+        assert format_context_notes("") == ""
+        assert format_context_notes("   \n ") == ""
+
+    def test_notes_wrapped_in_delimited_block(self):
+        result = format_context_notes("  Compare 음식 with 요리; neutral register.  ")
+        assert result == (
+            '<div class="ankigen-notes"><span style="color: gray;">'
+            "Compare 음식 with 요리; neutral register.</span></div>"
+        )
+
+    def test_notes_are_html_escaped(self):
+        result = format_context_notes("Use <으>ㄹ까 & not 겠")
+        assert "&lt;으&gt;ㄹ까 &amp; not 겠" in result
+        # The escaped angle brackets must not create a stray tag.
+        assert result.count("<span") == 1
+
+    def test_split_field_without_notes(self):
+        html = format_sentences("1. 저는 음식을 먹었어요.", "음식")
+        assert split_field(html) == (html, "")
+
+    def test_split_field_separates_notes(self):
+        sentences = format_sentences("1. 저는 음식을 먹었어요. 2. 음식이 맛있어요.", "음식")
+        notes = format_context_notes("Compare 음식 with 요리.")
+        assert split_field(notes + sentences) == (sentences, notes)
+        # Legacy cards that still trail the notes block also split cleanly.
+        assert split_field(sentences + notes) == (sentences, notes)
+
+    def test_split_field_on_blank_input(self):
+        assert split_field("") == ("", "")
+
+    def test_notes_do_not_disturb_sentence_parsing(self):
+        from ankigen.formatter import split_sentences_with_highlights
+
+        sentences = format_sentences("1. 저는 **음식을** 먹었어요.", "음식")
+        combined = format_context_notes("Compare 음식 with 요리.") + sentences
+        body, _ = split_field(combined)
+        assert split_sentences_with_highlights(body) == [("저는 음식을 먹었어요.", ["음식을"])]

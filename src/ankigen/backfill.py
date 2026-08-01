@@ -31,6 +31,7 @@ from ankigen.formatter import (
     escape_text,
     format_sentence_list,
     has_markers,
+    split_field,
     split_sentences_with_highlights,
     unescape_text,
 )
@@ -65,11 +66,15 @@ def split_sentences_from_html(html: str) -> list[str]:
     text: ``**...**`` markers have already been converted to red spans, so use
     :func:`ankigen.formatter.split_sentences_with_highlights` when you need to
     preserve where the highlights were.
+
+    Any context-notes block is dropped rather than returned as a sentence;
+    callers that rewrite the field re-prepend it themselves.
     """
-    if not html.strip():
+    sentences_html, _ = split_field(html)
+    if not sentences_html.strip():
         return []
     sentences: list[str] = []
-    for piece in BR_SPLIT_RE.split(html):
+    for piece in BR_SPLIT_RE.split(sentences_html):
         body = unescape_text(_ANY_SPAN_RE.sub("", piece)).strip()
         if body:
             sentences.append(body)
@@ -204,16 +209,19 @@ def backfill_note(
     )
 
     if wants_sentences:
+        # The context-notes block shares this field; keep it aside and re-attach
+        # it so a sentence rewrite never drops the card's notes.
+        existing_html, notes_html = split_field(fields.get(sentence_field, ""))
         # `apply_markers` re-wraps whatever is already highlighted so correct
         # existing spans survive the reformat instead of being recomputed.
-        pairs = split_sentences_with_highlights(fields.get(sentence_field, ""))
+        pairs = split_sentences_with_highlights(existing_html)
         sentences = [apply_markers(s, reds) for s, reds in pairs]
 
         if "too_few_sentences" in reason_codes and target_sentences > 0:
             needed = max(target_sentences - len(sentences), 0)
             if needed > 0:
                 try:
-                    sentences += list(generate_sentences(headword, lang, needed))
+                    sentences += list(generate_sentences(headword, lang, needed).sentences)
                 except Exception as exc:  # noqa: BLE001 — provider SDKs raise heterogeneous types
                     logger.warning(
                         "Sentence top-up failed for '%s' (%s); keeping %d existing sentence(s)",
@@ -252,7 +260,7 @@ def backfill_note(
                 )
 
         if sentences:
-            _set(sentence_field, format_sentence_list(sentences, headword))
+            _set(sentence_field, notes_html + format_sentence_list(sentences, headword))
 
     # Headword sanity check — backfill must never overwrite it.
     fields[resolved.headword] = headword

@@ -801,7 +801,7 @@ class TestLoadAnkiNotes:
             deck_id=1001,
             deck_name="Korean::Vocab",
             model_name="Korean Vocab",
-            field_names=["Korean", "Hanja", "English", "Comments"],
+            field_names=["Korean", "Hanja", "English", "Comment"],
             notes=[
                 (1, "guid-aaa", ["음식", "", "food", ""]),
                 (2, "guid-bbb", ["飮食", "飮食", "food (sino)", "<span>...</span>"]),

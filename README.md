@@ -103,10 +103,10 @@ Run `ankigen status` to see resolved Anki-related paths and whether the database
 
 #### Custom note-type field names (audit / backfill only)
 
-`audit` and `backfill` default to the canonical schemas produced by `ankigen generate` (Korean: `Korean | Hanja | English | Comments`; Chinese: `Hanzi | Jyutping | English | Sentence`). To audit a custom note type with different field names, set `ANKIGEN_NOTE_TYPE_OVERRIDES` to a JSON object keyed by Anki **model name**:
+`audit` and `backfill` default to the canonical schemas produced by `ankigen generate` (Korean: `Korean | Hanja | English | Comment`; Chinese: `Hanzi | Jyutping | English | Sentence`). To audit a custom note type with different field names, set `ANKIGEN_NOTE_TYPE_OVERRIDES` to a JSON object keyed by Anki **model name**:
 
 ```bash
-export ANKIGEN_NOTE_TYPE_OVERRIDES='{"Korean (advanced)": {"sentence_field": "Comment"}}'
+export ANKIGEN_NOTE_TYPE_OVERRIDES='{"Korean (legacy)": {"sentence_field": "Comments"}}'
 ```
 
 Only the roles that differ from the language defaults need to be listed. Valid keys are `headword_field`, `hanja_field` (Korean) / `jyutping_field` (Chinese), `english_field`, and `sentence_field`. See the [Audit & Backfill](#audit--backfill) section for the full schema, warning behaviour, and progress-log format.
@@ -121,7 +121,7 @@ ankigen uses subcommands for different operations:
 
 | `--mode` | Input | Output | Anki note shape |
 |----------|-------|--------|-----------------|
-| `vocab` (default) | `.txt` (one word per line) | `outputs/{lang}/output_{stem}.csv` | zh: Hanzi, Pinyin, Jyutping, English, Sentence — ko: **Korean, Hanja, English, Comments** |
+| `vocab` (default) | `.txt` (one word per line) | `outputs/{lang}/output_{stem}.csv` | zh: Hanzi, Pinyin, Jyutping, English, Sentence — ko: **Korean, Hanja, English, Comment** |
 | `grammar` (auto-detected from `.jsonl`) | `_grammar.jsonl` | `outputs/{lang}/output_{stem}_grammar.csv` | **Pattern, Hanja, Meaning, Examples** (4 cols; Hanja is populated for Sino-Korean roots, empty otherwise; Meaning bolds the short gloss with the longer explanation on the next line) |
 | `all` | Either of the two — sibling is inferred | Both CSVs | both |
 
@@ -146,14 +146,29 @@ Add a matching `Pinyin` field to your Chinese note type before importing.
 
 **Vocab output (Korean)** (`outputs/ko/output_words.csv`):
 
-| Korean | Hanja | English | Comments |
-|--------|-------|---------|----------|
-| 음식 | 飮食 | Noun: food, cuisine | (HTML formatted sentences) |
-| 예쁘다 |  | Adjective: pretty | (HTML formatted sentences) |
+| Korean | Hanja | English | Comment |
+|--------|-------|---------|---------|
+| 음식 | 飮食 | Noun: food, cuisine | (HTML formatted sentences + context notes) |
+| 예쁘다 |  | Adjective: pretty | (HTML formatted sentences + context notes) |
 
 The Hanja column is filled for Sino-Korean words (`음식 → 飮食`) and left empty
 for native-Korean words (`예쁘다`). The card-model side needs a matching
 `Hanja` field — add one to your Korean note type before importing.
+
+**Context notes.** The same LLM call that produces the example sentences also
+returns short usage notes — the closest confusable words and how they differ,
+the register (written vs spoken, formal vs casual), and any collocation quirk
+worth remembering. They are placed above the example sentences in the
+sentence field (`Comment` for Korean, `Sentence` for Chinese) inside a
+`<div class="ankigen-notes">` wrapper so `audit` and `backfill` can tell
+them apart from the sentences:
+
+```html
+<div class="ankigen-notes"><span style="color: gray;">Compare 음식 (food in general) with 요리 (a cooked dish); neutral register.</span></div><span style="color: blue;">저는 <span style="color: red;">음식을</span> 좋아해요.</span><br>…
+```
+
+Pass `--no-notes` to omit the block. The wrapper class is stable, so you can
+style it in your card template (e.g. smaller font, indented).
 
 **Grammar output** (`outputs/ko/output_20260516_grammar.csv`):
 
@@ -193,6 +208,7 @@ this header, so appends stay consistent.
 | `--lang {zh,ko}` | Language: Chinese or Korean (default: zh) |
 | `--mode {vocab,grammar,all}` | What to generate (default: vocab; `.jsonl` inputs auto-detect grammar) |
 | `-n, --sentences N` | Number of sentences/examples per card (default: 3, 0 to skip). In grammar mode this is the *target* — verbatim teacher examples are kept and the LLM is only called for the missing ones. |
+| `--no-notes` | Skip the context-notes block placed above the example sentences (vocab mode only) |
 | `-c, --clean` | Clean input before processing (removes translations, romanization). No-op in grammar mode. |
 | `--anki-db PATH` | Anki collection (`.anki2` / `.apkg`); overrides `ANKIGEN_ANKI_DB` |
 | `--anki-deck NAME` | Deck to scan (e.g. `Chinese::Vocab`, `Korean::Grammar`); overrides env |
@@ -443,9 +459,11 @@ Default paths mirror the rest of ankigen: the JSONL audit report lands in `input
 | `empty_hanja_optional` | `Hanja` blank on a Hangul-only word (opt in via `--include-empty-hanja`) | — |
 | `missing_jyutping` | — | `Jyutping` blank AND pycantonese can resolve `Hanzi` |
 | `empty_english` | `English` blank | `English` blank |
-| `too_few_sentences` | `Comments` has fewer than `-n` sentence blocks | `Sentence` has fewer than `-n` blocks |
-| `keyword_not_highlighted` | `Comments` non-empty, formatted with spans, but no red `<span>` related to `Korean` (conjugated/particled forms count as related) | `Sentence` non-empty but no red `<span>` matches `Hanzi` |
-| `plain_text_sentences` | `Comments` non-empty but contains no `<span` tags (legacy) | `Sentence` non-empty but contains no `<span` tags |
+| `too_few_sentences` | `Comment` has fewer than `-n` sentence blocks | `Sentence` has fewer than `-n` blocks |
+| `keyword_not_highlighted` | `Comment` non-empty, formatted with spans, but no red `<span>` related to `Korean` (conjugated/particled forms count as related) | `Sentence` non-empty but no red `<span>` matches `Hanzi` |
+| `plain_text_sentences` | `Comment` non-empty but contains no `<span` tags (legacy) | `Sentence` non-empty but contains no `<span` tags |
+
+All three sentence rules ignore the trailing context-notes block, so notes never inflate the sentence count or mask a legacy plain-text card.
 
 **Backfill actions**
 
@@ -459,26 +477,26 @@ Default paths mirror the rest of ankigen: the JSONL audit report lands in `input
 | `keyword_not_highlighted` | Preserve existing red spans as `**markers**` and re-run `format_sentences` (no LLM); if there are no red spans, LLM `remark_sentences` then `format_sentences` |
 | `plain_text_sentences` | `format_sentences` re-run over the existing text (no LLM) |
 
-The headword (`Korean` / `Hanzi`) is **immutable** — backfill never overwrites it.
+The headword (`Korean` / `Hanzi`) is **immutable** — backfill never overwrites it. An existing context-notes block is also preserved verbatim: backfill strips it before re-rendering the sentences and re-prepends it above them.
 
-**Note-type field overrides.** The audit assumes the canonical schema produced by `ankigen generate` (Korean: `Korean | Hanja | English | Comments`; Chinese: `Hanzi | Jyutping | English | Sentence`). If you have a custom note type that uses different field names — e.g. `Korean (advanced)` with a singular `Comment` field instead of plural `Comments` — set `ANKIGEN_NOTE_TYPE_OVERRIDES` to a JSON object keyed by Anki model name:
+**Note-type field overrides.** The audit assumes the canonical schema produced by `ankigen generate` (Korean: `Korean | Hanja | English | Comment`; Chinese: `Hanzi | Jyutping | English | Sentence`). If you have a custom note type that uses different field names — e.g. an older `Korean (legacy)` note type with a plural `Comments` field — set `ANKIGEN_NOTE_TYPE_OVERRIDES` to a JSON object keyed by Anki model name:
 
 ```bash
 export ANKIGEN_NOTE_TYPE_OVERRIDES='{
-  "Korean (advanced)": {
+  "Korean (legacy)": {
     "headword_field": "Korean",
     "hanja_field": "Hanja",
     "english_field": "English",
-    "sentence_field": "Comment"
+    "sentence_field": "Comments"
   }
 }'
 ```
 
 You only need to list the roles that differ from the defaults — unspecified roles fall back to the language default. Valid role keys are `headword_field`, `hanja_field` (Korean) / `jyutping_field` (Chinese), `english_field`, and `sentence_field`. Run `ankigen status` to confirm your overrides parsed correctly.
 
-When a note type has neither a recognised default schema nor a matching override, the entire note type is **skipped with a `WARNING`** at audit time (so it never silently slips through to backfill). The warning lists the missing field, any plausible candidate it spotted on the note (e.g. it would flag `Comment` as a likely match for `sentence_field`), and prints a ready-to-paste `ANKIGEN_NOTE_TYPE_OVERRIDES=...` snippet.
+When a note type has neither a recognised default schema nor a matching override, the entire note type is **skipped with a `WARNING`** at audit time (so it never silently slips through to backfill). The warning lists the missing field, any plausible candidate it spotted on the note (e.g. it would flag `Comments` as a likely match for `sentence_field`), and prints a ready-to-paste `ANKIGEN_NOTE_TYPE_OVERRIDES=...` snippet.
 
-**Backfill progress logs.** During backfill, each note is logged at `INFO` as `[N/total] guid=… model=… reasons=[…] → touched=[…]` so you can follow long runs without `-v`. The `INFO` line `Note-type override active for 'Model name': sentence_field='Comment'` confirms an override was applied.
+**Backfill progress logs.** During backfill, each note is logged at `INFO` as `[N/total] guid=… model=… reasons=[…] → touched=[…]` so you can follow long runs without `-v`. The `INFO` line `Note-type override active for 'Model name': sentence_field='Comments'` confirms an override was applied.
 
 **Important: quit Anki first.** The live `collection.anki2` is locked by Anki for SQLite reads; the audit will report "deck not found" or fail to open the file. Quit Anki (or export an `.apkg` and point `--anki-db` at that) before running.
 
