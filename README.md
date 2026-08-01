@@ -599,6 +599,19 @@ When a note type has neither a recognised default schema nor a matching override
 
 **Important: quit Anki first.** The live `collection.anki2` is locked by Anki for SQLite reads; the audit will report "deck not found" or fail to open the file. Quit Anki (or export an `.apkg` and point `--anki-db` at that) before running.
 
+**Cost preview.** `audit` ends by projecting what backfilling the flagged notes will cost, and `backfill --dry-run` prints the same figures without calling anything or writing a file:
+
+```
+Notes to backfill:  120
+Projected LLM calls: 72
+   translations:     24
+   sentence top-ups: 36
+   keyword marking:  12
+At least 1.4 minutes at ANKIGEN_LLM_RATE_LIMIT_RPM=50
+```
+
+These counts are **exact, not a guess**. Everything that decides whether a note reaches the LLM — its audit reasons, its current field contents, and the local Hanja resolver — is available without spending anything, so the projection walks the same branches `backfill` will. A test runs the estimator and the real code over a corpus covering every branch and asserts the call counts match, so the two can't drift apart. The one assumption is that generated sentences arrive carrying `**markers**` as the prompt requires; a model that ignores that adds one marking call for the affected card.
+
 **LLM call volume.** `--include-empty-hanja` issues ~1 LLM call per Hangul-only Korean note, `--check-content` issues ~1 per reviewed card *at audit time* (the only rule that costs anything before backfill), and `too_few_sentences` can also be call-heavy on large decks. Both `audit` and `backfill` pace themselves against:
 
 | Env var | Default | Meaning |

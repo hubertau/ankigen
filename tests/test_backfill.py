@@ -9,10 +9,13 @@ import pytest
 from ankigen.anki_db import AnkiNote
 from ankigen.audit import AuditedNote, AuditReason, ResolvedFields
 from ankigen.backfill import (
+    BackfillEstimate,
     backfill_jsonl,
     backfill_note,
+    estimate_backfill,
+    estimate_note_calls,
+    format_estimate,
     split_sentences_from_html,
-    write_update_tsvs,
 )
 from ankigen.formatter import format_context_notes, format_sentences
 from ankigen.llm import SentenceResult, TranslationResult
@@ -529,7 +532,7 @@ def _read_tsv(path: Path) -> tuple[list[str], list[list[str]]]:
     return header_lines, rows
 
 
-class TestWriteUpdateTsvs:
+class TestUpdateTsvOutput:
     def test_header_carries_guid_column_directive(self, tmp_path: Path, mocker):
         mocker.patch(
             "ankigen.backfill.translate_word",
@@ -700,15 +703,6 @@ class TestBackfillJsonl:
         assert len(rows) == 1
         assert rows[0][2] == "g-ko"
         assert "Backfill failed" in caplog.text
-
-
-# ---------------------------------------------------------------------------
-# write_update_tsvs called directly (no JSONL trip)
-# ---------------------------------------------------------------------------
-
-
-def test_write_update_tsvs_empty_returns_empty(tmp_path: Path):
-    assert write_update_tsvs([], tmp_path / "stem") == []
 
 
 # ---------------------------------------------------------------------------
@@ -1059,3 +1053,203 @@ class TestBackfillContentReview:
             "세번째 음식을 사요.",
         ]
         sentences_mock.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Cost preview
+# ---------------------------------------------------------------------------
+
+
+def _estimate_corpus() -> list[AuditedNote]:
+    """Entries spanning every branch that decides whether an LLM call happens."""
+    from ankigen.formatter import format_sentence_list
+
+    three = format_sentence_list(
+        ["첫째 **음식을** 먹어요.", "둘째 **음식이** 좋아요.", "셋째 **음식을** 사요."], "음식"
+    )
+    one_marked = format_sentence_list(["하나 **음식을** 먹어요."], "음식")
+    one_unmarked = format_sentence_list(["설명이 없는 문장."], "음식")
+
+    return [
+        # No LLM at all: local Hanja resolver succeeds.
+        _entry(_ko_note(korean="飮食", hanja=""), reasons=[("missing_hanja_for_sino", "")]),
+        # Local resolver fails -> one translate.
+        _entry(_ko_note(korean="사랑", hanja=""), reasons=[("missing_hanja_for_sino", "")]),
+        # Coalesced translate.
+        _entry(
+            _ko_note(korean="사랑", hanja="", english=""),
+            reasons=[("empty_english", ""), ("empty_hanja_optional", "")],
+        ),
+        # Top-up only; existing sentence is marked so no remark.
+        _entry(_ko_note(comments=one_marked), reasons=[("too_few_sentences", "1<3")]),
+        # Top-up AND remark: the existing sentence lacks a marker and the headword.
+        _entry(_ko_note(comments=one_unmarked), reasons=[("too_few_sentences", "1<3")]),
+        # Already enough sentences -> no top-up, no remark.
+        _entry(_ko_note(comments=three), reasons=[("too_few_sentences", "3<3")]),
+        # Content review drops one -> top-up refills it.
+        _entry(_ko_note(comments=three), reasons=[("sentence_quality", "2")]),
+        # Stale index drops nothing -> no calls.
+        _entry(_ko_note(comments=three), reasons=[("sentence_quality", "9")]),
+        # Plain text, headword present verbatim -> reformat only, no LLM.
+        _entry(
+            _ko_note(comments="저는 음식을 좋아해요. 매일 음식을 먹어요. 한국 음식이 맛있어요."),
+            reasons=[("plain_text_sentences", "")],
+        ),
+        # Chinese: pycantonese is local, so no LLM.
+        _entry(
+            _zh_note(hanzi="促使", jyutping=""),
+            lang="zh",
+            reasons=[("missing_jyutping", "")],
+        ),
+    ]
+
+
+class TestEstimateMatchesReality:
+    """The estimate is only worth printing if it tracks what backfill actually does."""
+
+    def test_per_note_estimate_matches_actual_calls(self, mocker):
+        translate = mocker.patch(
+            "ankigen.backfill.translate_word",
+            return_value=TranslationResult(translation="x", hanja="愛"),
+        )
+        sentences = mocker.patch(
+            "ankigen.backfill.generate_sentences",
+            # Marked, as the prompt requires — matching the estimator's assumption.
+            return_value=SentenceResult(sentences=["새 **음식을** 먹어요."] * 3),
+        )
+        remark = mocker.patch(
+            "ankigen.backfill.remark_sentences",
+            side_effect=lambda word, sents, lang: sents,
+        )
+
+        for entry in _estimate_corpus():
+            translate.reset_mock()
+            sentences.reset_mock()
+            remark.reset_mock()
+
+            predicted = estimate_note_calls(entry, 3)
+            backfill_note(entry, target_sentences=3, jyutping_resolver=lambda w: "jyut")
+            actual = (
+                translate.call_count,
+                sentences.call_count,
+                remark.call_count,
+            )
+            assert predicted == actual, (
+                f"estimate drifted for {entry.note.fields[entry.resolved.headword]!r} "
+                f"reasons={[r.code for r in entry.reasons]}: "
+                f"predicted {predicted}, actual {actual}"
+            )
+
+    def test_totals_sum_the_per_note_counts(self):
+        corpus = _estimate_corpus()
+        est = estimate_backfill(corpus, 3)
+        assert est.notes == len(corpus)
+        expected = [estimate_note_calls(e, 3) for e in corpus]
+        assert est.translate_calls == sum(t for t, _, _ in expected)
+        assert est.sentence_calls == sum(s for _, s, _ in expected)
+        assert est.remark_calls == sum(r for _, _, r in expected)
+        assert est.total == est.translate_calls + est.sentence_calls + est.remark_calls
+
+    def test_empty_input(self):
+        est = estimate_backfill([], 3)
+        assert est.notes == 0 and est.total == 0
+
+    def test_minutes_at_rpm(self):
+        est = estimate_backfill(_estimate_corpus(), 3)
+        assert est.minutes_at_rpm(0) == 0.0  # pacing disabled
+        assert est.minutes_at_rpm(est.total or 1) == pytest.approx(est.total / (est.total or 1))
+
+    def test_estimating_makes_no_llm_calls(self, mocker):
+        translate = mocker.patch("ankigen.backfill.translate_word")
+        sentences = mocker.patch("ankigen.backfill.generate_sentences")
+        remark = mocker.patch("ankigen.backfill.remark_sentences")
+        estimate_backfill(_estimate_corpus(), 3)
+        translate.assert_not_called()
+        sentences.assert_not_called()
+        remark.assert_not_called()
+
+
+class TestFormatEstimate:
+    def test_reports_breakdown(self):
+        est = estimate_backfill(_estimate_corpus(), 3)
+        text = "\n".join(format_estimate(est, 50))
+        assert f"Projected LLM calls: {est.total}" in text
+        assert "translations:" in text
+        assert "sentence top-ups:" in text
+        assert "keyword marking:" in text
+
+    def test_time_line_omitted_when_pacing_disabled(self):
+        est = estimate_backfill(_estimate_corpus(), 3)
+        assert not any("minute" in line for line in format_estimate(est, 0))
+
+    def test_time_line_omitted_when_nothing_to_do(self):
+        est = estimate_backfill([], 3)
+        assert not any("minute" in line for line in format_estimate(est, 50))
+
+    def test_singular_minute(self):
+        est = BackfillEstimate(notes=50, translate_calls=50, sentence_calls=0, remark_calls=0)
+        assert "1.0 minute at" in format_estimate(est, 50)[-1]
+
+    def test_plural_minutes(self):
+        est = BackfillEstimate(notes=70, translate_calls=70, sentence_calls=0, remark_calls=0)
+        assert "1.4 minutes at" in format_estimate(est, 50)[-1]
+
+
+class TestBackfillDryRun:
+    """`--dry-run` reports cost and touches nothing."""
+
+    def _args(self, jsonl: Path, stem: Path, dry_run: bool):
+        import argparse
+
+        return argparse.Namespace(
+            input_file=jsonl,
+            output=stem,
+            sentences=3,
+            overwrite=False,
+            dry_run=dry_run,
+            anki_db=None,
+            anki_deck=None,
+            anki_field=None,
+        )
+
+    def test_makes_no_calls_and_writes_nothing(self, tmp_path: Path, mocker, capsys):
+        from ankigen.audit import write_audit_jsonl
+        from ankigen.cli import cmd_backfill
+
+        translate = mocker.patch("ankigen.backfill.translate_word")
+        sentences = mocker.patch("ankigen.backfill.generate_sentences")
+        jsonl = tmp_path / "audit.jsonl"
+        write_audit_jsonl(_estimate_corpus(), jsonl)
+
+        stem = tmp_path / "update"
+        cmd_backfill(self._args(jsonl, stem, dry_run=True))
+
+        out = capsys.readouterr().out
+        assert "DRY RUN" in out
+        assert "Projected LLM calls:" in out
+        translate.assert_not_called()
+        sentences.assert_not_called()
+        assert list(tmp_path.glob("update*.tsv")) == []
+
+    def test_without_dry_run_it_still_runs(self, tmp_path: Path, mocker):
+        from ankigen.audit import write_audit_jsonl
+        from ankigen.cli import cmd_backfill
+
+        mocker.patch(
+            "ankigen.backfill.translate_word",
+            return_value=TranslationResult(translation="x", hanja="愛"),
+        )
+        mocker.patch(
+            "ankigen.backfill.generate_sentences",
+            return_value=SentenceResult(sentences=["새 **음식을** 먹어요."] * 3),
+        )
+        mocker.patch(
+            "ankigen.backfill.remark_sentences",
+            side_effect=lambda word, sents, lang: sents,
+        )
+        jsonl = tmp_path / "audit.jsonl"
+        write_audit_jsonl(_estimate_corpus(), jsonl)
+
+        stem = tmp_path / "update"
+        cmd_backfill(self._args(jsonl, stem, dry_run=False))
+        assert list(tmp_path.glob("update__*.tsv"))

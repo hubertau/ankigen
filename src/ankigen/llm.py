@@ -1007,7 +1007,8 @@ def _get_tpm_limit() -> int:
     return max(0, value)
 
 
-def _get_rpm_limit() -> int:
+def get_rate_limit_rpm() -> int:
+    """Rolling-60s requests-per-minute ceiling (``ANKIGEN_LLM_RATE_LIMIT_RPM``)."""
     raw = os.getenv("ANKIGEN_LLM_RATE_LIMIT_RPM")
     if not raw:
         return _DEFAULT_RPM
@@ -1042,7 +1043,7 @@ def _throttle_for_tokens(estimate: int) -> None:
     know that one more call is coming, not how big it is.
     """
     tpm = _get_tpm_limit()
-    rpm = _get_rpm_limit()
+    rpm = get_rate_limit_rpm()
     tpm_wait = _token_bucket.sleep_needed(estimate, tpm) if tpm > 0 else 0.0
     rpm_wait = _request_bucket.sleep_needed(rpm) if rpm > 0 else 0.0
     sleep_for = max(tpm_wait, rpm_wait)

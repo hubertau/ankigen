@@ -133,6 +133,121 @@ def _resolve_hanja_local(korean: str) -> str:
     return local
 
 
+class BackfillEstimate(NamedTuple):
+    """Projected LLM spend for a backfill run.
+
+    Counts are *exact*, not a heuristic: every input that decides whether
+    :func:`backfill_note` calls the LLM — the audit reasons, the note's current
+    fields, and the local Hanja resolver — is available without spending
+    anything. The one assumption is that generated sentences arrive carrying
+    ``**markers**`` as the prompt requires; a model that ignores that adds one
+    remark call for the affected card.
+    """
+
+    notes: int
+    translate_calls: int
+    sentence_calls: int
+    remark_calls: int
+
+    @property
+    def total(self) -> int:
+        return self.translate_calls + self.sentence_calls + self.remark_calls
+
+    def minutes_at_rpm(self, rpm: int) -> float:
+        """Lower bound on wall-clock, given a requests-per-minute ceiling."""
+        if rpm <= 0:
+            return 0.0
+        return self.total / rpm
+
+
+def estimate_note_calls(entry: AuditedNote, target_sentences: int) -> tuple[int, int, int]:
+    """Return ``(translate, sentence, remark)`` call counts for one note.
+
+    Mirrors the branching in :func:`backfill_note`. The two are kept in step by
+    a test that runs both over a corpus and asserts the counts match, so this
+    can't quietly drift into a comfortable lie.
+    """
+    lang = entry.lang
+    resolved = entry.resolved
+    fields = entry.note.fields
+    reason_codes = {r.code for r in entry.reasons}
+    headword = fields.get(resolved.headword, "")
+
+    translate = 0
+    if "empty_english" in reason_codes or ("empty_hanja_optional" in reason_codes and lang == "ko"):
+        translate = 1
+    elif lang == "ko" and "missing_hanja_for_sino" in reason_codes:
+        # Only reaches the LLM when the local resolver comes up empty — and
+        # that resolver is deterministic, so we can just ask it.
+        if not _resolve_hanja_local(headword):
+            translate = 1
+
+    sentence = 0
+    remark = 0
+    wants_sentences = bool(
+        reason_codes
+        & {
+            "plain_text_sentences",
+            "too_few_sentences",
+            "keyword_not_highlighted",
+            *SENTENCE_INDEX_REASONS,
+        }
+    )
+    if wants_sentences:
+        existing_html, _ = split_field(fields.get(resolved.sentence, ""))
+        pairs = split_sentences_with_highlights(existing_html)
+        sentences = [apply_markers(s, reds) for s, reds in pairs]
+        rejected = _rejected_positions(entry.reasons, len(sentences))
+        if rejected:
+            sentences = [s for i, s in enumerate(sentences) if i not in rejected]
+
+        topping_up = "too_few_sentences" in reason_codes or bool(rejected)
+        needed = max(target_sentences - len(sentences), 0) if target_sentences > 0 else 0
+        if topping_up and needed > 0:
+            sentence = 1
+
+        if any(not has_markers(s) and headword and headword not in s for s in sentences):
+            remark = 1
+
+    return translate, sentence, remark
+
+
+def estimate_backfill(
+    entries: list[AuditedNote],
+    target_sentences: int,
+) -> BackfillEstimate:
+    """Project the LLM spend for backfilling ``entries``."""
+    translate = sentence = remark = 0
+    for entry in entries:
+        t, s, r = estimate_note_calls(entry, target_sentences)
+        translate += t
+        sentence += s
+        remark += r
+    return BackfillEstimate(
+        notes=len(entries),
+        translate_calls=translate,
+        sentence_calls=sentence,
+        remark_calls=remark,
+    )
+
+
+def format_estimate(estimate: BackfillEstimate, rpm: int) -> list[str]:
+    """Human-readable cost preview lines."""
+    lines = [
+        f"Notes to backfill:  {estimate.notes}",
+        f"Projected LLM calls: {estimate.total}",
+        f"   translations:     {estimate.translate_calls}",
+        f"   sentence top-ups: {estimate.sentence_calls}",
+        f"   keyword marking:  {estimate.remark_calls}",
+    ]
+    if estimate.total and rpm > 0:
+        minutes = estimate.minutes_at_rpm(rpm)
+        shown = f"{minutes:.1f}"
+        unit = "minute" if shown == "1.0" else "minutes"
+        lines.append(f"At least {shown} {unit} at ANKIGEN_LLM_RATE_LIMIT_RPM={rpm}")
+    return lines
+
+
 def backfill_note(
     entry: AuditedNote,
     *,
@@ -322,37 +437,6 @@ def _sanitize_for_tsv(value: str) -> str:
     return value.replace("\t", "&#9;").replace("\r\n", "<br>").replace("\n", "<br>")
 
 
-def write_update_tsvs(
-    backfilled: list[_Backfilled],
-    output_stem: Path,
-) -> list[Path]:
-    """Write one TSV per note type. Returns the list of paths written.
-
-    Output filenames follow ``{output_stem}__{slug(model_name)}.tsv`` so
-    multiple note types from the same audit JSONL don't collide.
-    """
-    if not backfilled:
-        logger.info("No notes to write — empty backfill batch")
-        return []
-
-    # Group by note type id; preserve insertion order for stable output.
-    groups: dict[int, list[_Backfilled]] = {}
-    for row in backfilled:
-        groups.setdefault(row.mid, []).append(row)
-
-    written: list[Path] = []
-    for mid, rows in groups.items():
-        model_name = rows[0].model_name or f"model_{mid}"
-        slug = _slugify(model_name)
-        out_path = output_stem.with_name(f"{output_stem.name}__{slug}.tsv")
-        # All rows in this group share the same note type, so they share a
-        # field_order. Use the first row's field_order as authoritative.
-        field_order = list(rows[0].field_order)
-        _write_one_tsv(out_path, model_name, rows, field_order)
-        written.append(out_path)
-    return written
-
-
 def _tsv_done_guids(output_stem: Path) -> set[str]:
     """Return GUIDs already written to any TSV for this output stem."""
     done: set[str] = set()
@@ -389,35 +473,6 @@ def _write_backfilled_row(path: Path, row: _Backfilled) -> None:
             values.append(_sanitize_for_tsv(row.fields.get(col, "")))
         f.write("\t".join(values) + "\n")
         durable_write(f)
-
-
-def _write_one_tsv(
-    path: Path,
-    model_name: str,
-    rows: list[_Backfilled],
-    field_order: list[str],
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    header_columns = ["notetype", "deck", "guid", *field_order]
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        # Anki text-file import directives — `notetype column:1` etc. tell
-        # Anki to ignore the first N columns as metadata and update by GUID.
-        f.write("#separator:tab\n")
-        f.write("#html:true\n")
-        f.write("#notetype column:1\n")
-        f.write("#deck column:2\n")
-        f.write("#guid column:3\n")
-        f.write("#columns:" + "\t".join(header_columns) + "\n")
-        for row in rows:
-            values = [
-                _sanitize_for_tsv(model_name),
-                _sanitize_for_tsv(row.deck_name),
-                _sanitize_for_tsv(row.guid),
-            ]
-            for col in field_order:
-                values.append(_sanitize_for_tsv(row.fields.get(col, "")))
-            f.write("\t".join(values) + "\n")
-    logger.info("Wrote %d row(s) to %s", len(rows), path)
 
 
 def _slugify(model_name: str) -> str:
@@ -545,8 +600,11 @@ def backfill_jsonl(
 
 
 __all__ = [
+    "BackfillEstimate",
     "backfill_jsonl",
     "backfill_note",
+    "estimate_backfill",
+    "estimate_note_calls",
+    "format_estimate",
     "split_sentences_from_html",
-    "write_update_tsvs",
 ]

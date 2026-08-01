@@ -53,7 +53,11 @@ from ankigen.audit import (
     summarize_audit,
     write_audit_jsonl,
 )
-from ankigen.backfill import backfill_jsonl
+from ankigen.backfill import (
+    backfill_jsonl,
+    estimate_backfill,
+    format_estimate,
+)
 from ankigen.cleaner import clean_and_write, clean_vocabulary_file, parse_hanja_token
 from ankigen.extractor import (
     ExtractMode,
@@ -70,7 +74,12 @@ from ankigen.grammar import (
     write_grammar_jsonl,
 )
 from ankigen.hanja_lookup import resolve_hanja
-from ankigen.llm import Language, generate_sentences, translate_word
+from ankigen.llm import (
+    Language,
+    generate_sentences,
+    get_rate_limit_rpm,
+    translate_word,
+)
 from ankigen.logging_config import get_log_dir, get_log_level, get_log_retention, setup_logging
 from ankigen.pattern_format import (
     has_pattern_notation,
@@ -1012,8 +1021,16 @@ def cmd_audit(args: argparse.Namespace) -> None:
         print(f"\nContent review: on — {content_hits} card(s) have sentences to replace")
     print(f"\nAudit JSONL written to: {output_path}")
     if audited:
+        # The audit itself is nearly free; backfilling is where the money goes,
+        # and this is the point where you still get to decide.
+        print("\nProjected backfill cost:")
+        for line in format_estimate(
+            estimate_backfill(audited, args.sentences), get_rate_limit_rpm()
+        ):
+            print(f"  {line}")
         print("\nNext step:")
         print(f"  ankigen backfill {output_path} -n {args.sentences}")
+        print(f"  ankigen backfill {output_path} -n {args.sentences} --dry-run   # costs only")
 
 
 def cmd_backfill(args: argparse.Namespace) -> None:
@@ -1053,6 +1070,20 @@ def cmd_backfill(args: argparse.Namespace) -> None:
                 "'deck'. Re-run audit to embed deck_name in the JSONL.",
                 db_path,
             )
+
+    if args.dry_run:
+        from ankigen.audit import read_audit_jsonl
+
+        entries = read_audit_jsonl(args.input_file)
+        print("=" * 60)
+        print("BACKFILL DRY RUN — no LLM calls made, nothing written")
+        print("=" * 60)
+        for line in format_estimate(
+            estimate_backfill(entries, args.sentences), get_rate_limit_rpm()
+        ):
+            print(f"  {line}")
+        print(f"\nWould write TSV(s) under: {output_stem}__<notetype>.tsv")
+        return
 
     paths = backfill_jsonl(
         args.input_file,
@@ -1554,6 +1585,12 @@ def main() -> None:
         action="store_true",
         default=False,
         help="Delete existing TSV(s) and regenerate all notes from scratch (default: resume).",
+    )
+    backfill_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report the projected LLM call count and exit without calling anything "
+        "or writing any file.",
     )
     _add_anki_args(backfill_parser)
 
