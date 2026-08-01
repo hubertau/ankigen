@@ -58,7 +58,11 @@ class GrammarExample(BaseModel):
 
     target: str = Field(
         ...,
-        description="The example sentence in the target language (e.g., Korean or Chinese)",
+        description=(
+            "The example sentence in the target language (e.g., Korean or Chinese), "
+            "with the part that realises the grammar pattern wrapped in double "
+            "asterisks (e.g. '한국어를 잘**하게 되었어요**.')"
+        ),
     )
     english: str = Field(
         default="",

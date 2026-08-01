@@ -44,6 +44,17 @@ _KO_SYLLABIC_ENDINGS = (
     "았어요",
     "었어요",
     "였어요",
+    # Bare infinitive/connective forms. The polite "-요" versions are listed
+    # above, but the plain forms they are built from (듣다 → 들어, 들어서) also
+    # appear on their own and need the same stem treatment. Decomposed, these
+    # only ever strip syllables whose initial is ㅇ, so noun endings like
+    # 음료's 료 are untouched.
+    "어서",
+    "아서",
+    "여서",
+    "어",
+    "아",
+    "여",
     "하다",
     "되다",
     "지다",

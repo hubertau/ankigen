@@ -1,6 +1,7 @@
 """HTML formatting for vocabulary sentences."""
 
 import re
+from collections.abc import Sequence
 from typing import Literal
 
 from ankigen.similarity import ko_highlight_related
@@ -75,53 +76,117 @@ def has_keyword_highlight(
     keyword: str,
     lang: Language = "ko",
 ) -> bool:
-    """True if ``html`` has a red span related to ``keyword``."""
+    """True if **every** sentence in ``html`` has a red span related to ``keyword``.
+
+    Checked per sentence rather than over the whole field: a card where only
+    one of three sentences is highlighted is still a card that needs fixing,
+    and an any-match rule would let it pass the audit forever (topping a card
+    up with freshly-marked sentences would permanently mask the older,
+    unhighlighted ones).
+    """
     if not keyword.strip():
         return False
-    reds = extract_red_spans(html)
-    if not reds:
+    pairs = split_sentences_with_highlights(html)
+    if not pairs:
         return False
-    return any(headword_matches_highlight(keyword, red, lang) for red in reds)
+    return all(
+        any(headword_matches_highlight(keyword, red, lang) for red in reds) for _, reds in pairs
+    )
+
+
+def has_markers(text: str) -> bool:
+    """True when ``text`` carries at least one ``**...**`` marker."""
+    return bool(_MARKER_RE.search(text))
+
+
+def strip_markers(text: str) -> str:
+    """Remove ``**...**`` markers, keeping the text they wrap."""
+    return _MARKER_RE.sub(r"\1", text)
+
+
+def highlight_keyword(text: str, *keywords: str) -> str:
+    """Wrap the keyword's surface form in ``text`` with red spans.
+
+    The result is meant to sit *inside* an outer blue span, so each red run
+    closes the blue span, opens a red one, then reopens blue (the caller
+    strips any empty blue span left at the edges).
+
+    Two strategies, in order:
+
+    1. ``**...**`` markers placed by the LLM. These carry the form as it
+       actually appears in the sentence, so they survive conjugation and
+       attached particles (``돕다`` → ``**도와요**``).
+    2. Exact substring match against each of ``keywords`` in turn, using the
+       first one that occurs in ``text``. This covers cards written before
+       markers existed, Chinese (where the word is usually unchanged), and
+       grammar patterns whose canonical form appears verbatim.
+
+    Returns ``text`` unchanged when neither strategy finds anything.
+    """
+    if _MARKER_RE.search(text):
+        return _MARKER_RE.sub(lambda m: f"{_END}{_RED}{m.group(1)}{_END}{_BLUE}", text)
+    for keyword in keywords:
+        if keyword and keyword in text:
+            return text.replace(keyword, f"{_END}{_RED}{keyword}{_END}{_BLUE}")
+    return text
+
+
+def format_sentence_list(sentences: Sequence[str], keyword: str) -> str:
+    """Format already-separated sentences as inline HTML.
+
+    Preferred over :func:`format_sentences`: the caller almost always has a
+    real ``list[str]`` (straight from the LLM, or from
+    :func:`~ankigen.backfill.split_sentences_from_html`), and joining it into
+    a numbered string just to split it apart again loses any sentence
+    containing a number followed by a period (``3.5달러`` → two sentences).
+
+    Args:
+        sentences: One sentence per element. Each may carry ``**...**``
+            markers identifying the keyword's surface form.
+        keyword: Fallback for sentences with no marker.
+
+    Returns:
+        HTML string with blue text and red keyword, separated by ``<br>``.
+    """
+    formatted = [
+        f"{_BLUE}{highlight_keyword(s.strip(), keyword)}{_END}" for s in sentences if s.strip()
+    ]
+    result = "<br>".join(formatted)
+    # Clean up empty spans left by a marker or exact match at position 0.
+    return result.replace(f"{_BLUE}{_END}", "")
 
 
 def format_sentences(text: str, keyword: str) -> str:
     """
     Takes numbered sentences and formats them as inline HTML.
 
+    Prefer :func:`format_sentence_list` when you already have the sentences
+    separated — splitting a numbered string is inherently ambiguous.
+
     Args:
         text: Input text with numbered sentences (e.g., "1. 句子一 2. 句子二").
+              A number is only treated as a sentence marker when followed by
+              whitespace, so decimals inside a sentence survive intact.
               Sentences may contain **word** markers placed by the LLM to
               identify the keyword's surface form (conjugated, with particles,
-              etc.).  When markers are present they are used for the red span;
-              otherwise the function falls back to an exact substring search on
-              ``keyword`` for backward compatibility.
+              etc.).
         keyword: The word to highlight in red (used as fallback when no marker).
 
     Returns:
         HTML string with blue text and red keyword, separated by <br>
     """
-    # Remove sentence numbers (e.g., "1. ", "2. ", etc.)
-    sentences = re.split(r"\d+\.\s*", text)
-    sentences = [s.strip() for s in sentences if s.strip()]
+    return format_sentence_list(_split_numbered(text), keyword)
 
-    formatted = []
-    for sentence in sentences:
-        if _MARKER_RE.search(sentence):
-            # LLM marked the keyword's surface form — use those positions.
-            highlighted = _MARKER_RE.sub(
-                lambda m: f"{_END}{_RED}{m.group(1)}{_END}{_BLUE}",
-                sentence,
-            )
-        else:
-            # Fallback: exact literal match (existing cards, Chinese where the
-            # word is typically unchanged, or when the LLM omitted the marker).
-            highlighted = sentence.replace(
-                keyword,
-                f"{_END}{_RED}{keyword}{_END}{_BLUE}",
-            )
-        formatted.append(f"{_BLUE}{highlighted}{_END}")
 
-    result = "<br>".join(formatted)
-    # Clean up empty spans left by a leading marker or exact match at position 0.
-    result = result.replace(f"{_BLUE}{_END}", "")
-    return result
+# A sentence number is a run of digits + "." that (a) starts the string or
+# follows whitespace or sentence-ending punctuation, and (b) is NOT followed by
+# another digit. Condition (b) is what keeps "3.5달러" — and any other
+# in-sentence decimal — from being split into two sentences. Condition (a) is
+# written to allow "。2." because Chinese output separates sentences with 。
+# and no space.
+_NUMBER_PREFIX_RE = re.compile(r"(?:(?<=^)|(?<=[\s。．.!?！？]))\d+\.(?!\d)\s*")
+
+
+def _split_numbered(text: str) -> list[str]:
+    """Split ``"1. a 2. b"`` into ``["a", "b"]``, ignoring in-sentence decimals."""
+    return [s.strip() for s in _NUMBER_PREFIX_RE.split(text) if s.strip()]

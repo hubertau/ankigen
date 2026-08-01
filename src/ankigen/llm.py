@@ -98,7 +98,10 @@ LANGUAGE_CONFIG = {
             "For every construction, capture the teacher's example sentences VERBATIM in "
             "Chinese, alongside any English translations the teacher provides. Keep the "
             "explanation short (1-3 sentences) and prefer the teacher's wording when present. "
-            "Return the canonical Chinese pattern as the `pattern` field — never English."
+            "Return the canonical Chinese pattern as the `pattern` field — never English. "
+            "In each example's `target`, wrap the part of the sentence that realises the "
+            "pattern in double asterisks (e.g. **会**). Adding these markers is the ONLY "
+            "change you may make to a verbatim example; leave every other character alone."
         ),
         "grammar_extraction_user": (
             "Extract every grammatical construction taught in this Chinese class-notes "
@@ -110,8 +113,10 @@ LANGUAGE_CONFIG = {
         "grammar_example_topup_prompt": (
             "Generate exactly {num_examples} natural Chinese example sentences that use the "
             "grammar pattern '{pattern}'. Each example should clearly demonstrate the pattern "
-            "and feel like something a teacher would write for a learner. For every example, "
-            "also provide a short English translation. Do NOT include pinyin."
+            "and feel like something a teacher would write for a learner. In each `target` "
+            "sentence, wrap the part that realises the pattern in double asterisks, "
+            "e.g. **会** for 会. For every example, also provide a short English "
+            "translation (no asterisks in the translation). Do NOT include pinyin."
         ),
     },
     "ko": {
@@ -155,7 +160,11 @@ LANGUAGE_CONFIG = {
             "When the pattern contains Sino-Korean noun roots (e.g. 박사, 과정, 중, 이유), "
             "set the `hanja` field to their canonical Hanja form (e.g. '博士 課程 中', "
             "'理由'); leave `hanja` empty for purely grammatical endings/particles or "
-            "native-Korean content."
+            "native-Korean content. "
+            "In each example's `target`, wrap the part of the sentence that realises the "
+            "pattern — conjugated as it actually appears — in double asterisks "
+            "(e.g. **하게 되었어요** for '~게 되다'). Adding these markers is the ONLY "
+            "change you may make to a verbatim example; leave every other character alone."
         ),
         "grammar_extraction_user": (
             "Extract every grammatical construction taught in this Korean class-notes "
@@ -167,8 +176,11 @@ LANGUAGE_CONFIG = {
         "grammar_example_topup_prompt": (
             "Generate exactly {num_examples} natural Korean example sentences that use the "
             "grammar pattern '{pattern}'. Each example should clearly demonstrate the pattern "
-            "and feel like something a teacher would write for a learner. For every example, "
-            "also provide a short English translation. Do NOT include romanization."
+            "and feel like something a teacher would write for a learner. In each `target` "
+            "sentence, wrap the part that realises the pattern — conjugated as it actually "
+            "appears — in double asterisks, e.g. **하게 되었어요** for '~게 되다'. For every "
+            "example, also provide a short English translation (no asterisks in the "
+            "translation). Do NOT include romanization."
         ),
     },
 }

@@ -167,6 +167,29 @@ class TestFormatGrammarExamples:
         assert "아무 관련 없는 문장" in html
         assert "Unrelated." in html
 
+    def test_marker_highlights_inflected_pattern(self) -> None:
+        # '~게 되다' surfaces as '하게 되었어요' — a literal match finds nothing,
+        # so the LLM marks the realised form instead.
+        examples = [
+            GrammarExample(target="한국어를 잘**하게 되었어요**.", english="I came to speak it."),
+        ]
+        html = format_grammar_examples(examples, pattern="~게 되다")
+        assert '<span style="color: red;">하게 되었어요</span>' in html
+        assert "**" not in html
+
+    def test_tilde_is_stripped_for_literal_fallback(self) -> None:
+        # Legacy example with no marker: the citation form carries a leading '~'
+        # that never appears in a sentence, so it must be stripped before matching.
+        examples = [GrammarExample(target="밥을 먹게 되다.", english="")]
+        html = format_grammar_examples(examples, pattern="~게 되다")
+        assert '<span style="color: red;">게 되다</span>' in html
+
+    def test_markers_do_not_leak_into_english(self) -> None:
+        examples = [GrammarExample(target="**하게 되었어요**.", english="I came to.")]
+        html = format_grammar_examples(examples, pattern="~게 되다")
+        assert "**" not in html
+        assert "I came to." in html
+
 
 class TestExtractGrammarItems:
     def test_calls_llm_with_korean_prompts(self, mocker) -> None:

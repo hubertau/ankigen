@@ -63,7 +63,7 @@ from ankigen.extractor import (
     get_watch_dir,
     process_folder,
 )
-from ankigen.formatter import format_sentences
+from ankigen.formatter import format_sentence_list
 from ankigen.grammar import (
     extract_grammar_from_file,
     generate_grammar_csv,
@@ -159,8 +159,7 @@ def process_word(
 
     if num_sentences > 0:
         sentences = generate_sentences(word, lang, num_sentences)
-        numbered = " ".join(f"{i + 1}. {s}" for i, s in enumerate(sentences))
-        formatted = format_sentences(numbered, word)
+        formatted = format_sentence_list(sentences, word)
     else:
         formatted = ""
 

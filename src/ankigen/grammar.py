@@ -25,6 +25,7 @@ from ankigen.anki_db import normalize_anki_term
 from ankigen.chunking import estimate_tokens, split_text_for_extraction
 from ankigen.extract_checkpoint import ExtractRunCheckpoint, FileCheckpoint
 from ankigen.extractor import extract_source_text
+from ankigen.formatter import highlight_keyword, strip_markers
 from ankigen.hanja_lookup import resolve_hanja
 from ankigen.llm import (
     LANGUAGE_CONFIG,
@@ -43,6 +44,15 @@ GRAMMAR_CSV_FIELDNAMES = ["Pattern", "Hanja", "Meaning", "Examples"]
 # ---------------------------------------------------------------------------
 # Extraction
 # ---------------------------------------------------------------------------
+
+
+def _normalise_example_target(target: str) -> str:
+    """Dedupe key for an example sentence: NFC, stripped, markers removed.
+
+    Markers are dropped so the same teacher sentence appearing in two chunks
+    collapses to one example even when the LLM marked a different span each time.
+    """
+    return unicodedata.normalize("NFC", strip_markers(target).strip())
 
 
 def _merge_grammar_items(chunks: list[list[GrammarItem]]) -> list[GrammarItem]:
@@ -66,7 +76,7 @@ def _merge_grammar_items(chunks: list[list[GrammarItem]]) -> list[GrammarItem]:
                 deduped_examples: list[GrammarExample] = []
                 target_seen: set[str] = set()
                 for ex in item.examples:
-                    norm = unicodedata.normalize("NFC", ex.target.strip())
+                    norm = _normalise_example_target(ex.target)
                     if norm and norm not in target_seen:
                         target_seen.add(norm)
                         deduped_examples.append(ex)
@@ -350,6 +360,22 @@ def format_grammar_meaning(meaning: str, explanation: str) -> str:
     return m or e
 
 
+def _pattern_fallbacks(pattern: str) -> list[str]:
+    """Literal forms of a grammar pattern worth trying for exact-match highlighting.
+
+    Patterns are stored in their citation form, which by convention carries a
+    leading ``~`` for endings and particles (``~게 되다``). That tilde never
+    appears in a real sentence, so it has to be stripped before any literal
+    match can succeed. Used only as the fallback when an example carries no
+    ``**...**`` marker.
+    """
+    forms: list[str] = []
+    for candidate in (pattern.strip(), pattern.strip().lstrip("~").strip()):
+        if candidate and candidate not in forms:
+            forms.append(candidate)
+    return forms
+
+
 def format_grammar_examples(examples: list[GrammarExample], pattern: str) -> str:
     """
     Render examples as inline HTML for an Anki cell.
@@ -357,22 +383,22 @@ def format_grammar_examples(examples: list[GrammarExample], pattern: str) -> str
     Each example becomes a blue line with the grammar pattern highlighted in red,
     optionally followed by a muted gray English translation on the next line.
     Examples are separated by blank ``<br>`` lines.
+
+    The red span comes from the ``**...**`` marker the LLM places around the
+    pattern's surface form. Korean endings inflect (``~게 되다`` surfaces as
+    ``하게 되었어요``), so a literal match on the citation form finds nothing —
+    it is kept only as a fallback for examples extracted before markers existed.
     """
     if not examples:
         return ""
 
+    fallbacks = _pattern_fallbacks(pattern)
     blocks: list[str] = []
     for ex in examples:
         target = ex.target.strip()
         if not target:
             continue
-        if pattern and pattern in target:
-            target_html = target.replace(
-                pattern,
-                f'</span><span style="color: red;">{pattern}</span><span style="color: blue;">',
-            )
-        else:
-            target_html = target
+        target_html = highlight_keyword(target, *fallbacks)
         line = f'<span style="color: blue;">{target_html}</span>'
         line = line.replace('<span style="color: blue;"></span>', "")
         if ex.english.strip():

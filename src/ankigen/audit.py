@@ -534,7 +534,11 @@ def _rule_too_few_sentences(
 def _rule_keyword_not_highlighted(
     note: AnkiNote, *, resolved: ResolvedFields, lang: Language
 ) -> AuditReason | None:
-    """Flag a non-empty sentence field that doesn't highlight the headword.
+    """Flag a sentence field where any sentence fails to highlight the headword.
+
+    The check is per sentence, not per field: one highlighted sentence out of
+    three still leaves two broken sentences on the card, and an any-match rule
+    would hide them permanently once a top-up added a correctly-marked one.
 
     Skipped when the field is blank (``too_few_sentences`` covers that case
     separately) or when the field is plain text (``plain_text_sentences``
@@ -558,8 +562,11 @@ def _rule_keyword_not_highlighted(
 def _rule_plain_text_sentences(note: AnkiNote, *, resolved: ResolvedFields) -> AuditReason | None:
     """Flag a non-empty sentence field with no ``<span`` tags at all.
 
-    Legacy un-formatted card; backfill can re-apply :func:`format_sentences`
-    over the existing plain text without calling the LLM.
+    Legacy un-formatted card; backfill re-applies
+    :func:`~ankigen.formatter.format_sentence_list` over the existing plain
+    text. That is free when the headword appears verbatim; a conjugated Korean
+    sentence costs one :func:`~ankigen.llm.remark_sentences` call to locate the
+    surface form.
     """
     html = note.fields.get(resolved.sentence, "")
     if not is_plain_text(html):

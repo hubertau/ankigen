@@ -1,6 +1,6 @@
 """Tests for the formatter module (pure functions, no mocking needed)."""
 
-from ankigen.formatter import format_sentences
+from ankigen.formatter import format_sentence_list, format_sentences
 
 
 class TestFormatSentences:
@@ -163,6 +163,94 @@ class TestFormatSentencesMarkers:
         text = "1. 促使他努力工作。"
         result = format_sentences(text, "促使")
         assert '<span style="color: red;">促使</span>' in result
+
+
+class TestFormatSentenceList:
+    """Sentences arrive as a list — no lossy numbered-string round-trip."""
+
+    def test_decimal_inside_sentence_is_not_split(self):
+        result = format_sentence_list(["가격이 3.5달러예요.", "**먹었어요** 밥을."], "먹다")
+        assert result.count("<br>") == 1
+        assert "3.5달러" in result
+
+    def test_numbered_string_path_also_keeps_decimals(self):
+        # format_sentences() still parses "1. ... 2. ...", but a number is only a
+        # sentence marker when it isn't followed by another digit.
+        result = format_sentences("1. 가격이 3.5달러예요. 2. 밥을 먹었어요.", "먹다")
+        assert result.count("<br>") == 1
+        assert "3.5달러" in result
+
+    def test_chinese_numbering_without_space_still_splits(self):
+        # Chinese output separates sentences with 。 and no space before "2.".
+        result = format_sentences("1. 他促使我。2. 政策促使了发展。", "促使")
+        assert result.count("<br>") == 1
+
+    def test_blank_entries_dropped(self):
+        assert format_sentence_list(["", "   "], "x") == ""
+
+    def test_matches_format_sentences_for_simple_input(self):
+        listed = format_sentence_list(["저는 **음식을** 먹어요.", "맛있어요."], "음식")
+        numbered = format_sentences("1. 저는 **음식을** 먹어요. 2. 맛있어요.", "음식")
+        assert listed == numbered
+
+
+class TestMarkerHelpers:
+    def test_has_markers(self):
+        from ankigen.formatter import has_markers
+
+        assert has_markers("저는 **음식을** 먹어요.") is True
+        assert has_markers("저는 음식을 먹어요.") is False
+
+    def test_strip_markers(self):
+        from ankigen.formatter import strip_markers
+
+        assert strip_markers("저는 **음식을** 먹어요.") == "저는 음식을 먹어요."
+        assert strip_markers("no markers here") == "no markers here"
+
+    def test_highlight_keyword_prefers_marker(self):
+        from ankigen.formatter import highlight_keyword
+
+        out = highlight_keyword("그가 나를 **도와요**.", "돕다")
+        assert '<span style="color: red;">도와요</span>' in out
+
+    def test_highlight_keyword_tries_fallbacks_in_order(self):
+        from ankigen.formatter import highlight_keyword
+
+        # First candidate absent, second present → second is used.
+        out = highlight_keyword("밥을 먹게 되다.", "~게 되다", "게 되다")
+        assert '<span style="color: red;">게 되다</span>' in out
+
+    def test_highlight_keyword_no_match_returns_text(self):
+        from ankigen.formatter import highlight_keyword
+
+        assert highlight_keyword("아무 관련 없는 문장", "없는패턴") == "아무 관련 없는 문장"
+
+
+class TestHasKeywordHighlightRequiresEverySentence:
+    """A card is only 'highlighted' when every sentence is."""
+
+    def test_all_sentences_highlighted_passes(self):
+        from ankigen.formatter import has_keyword_highlight
+
+        html = format_sentence_list(["매일 **들어요**.", "어제 **들었어요**."], "듣다")
+        assert has_keyword_highlight(html, "듣다", "ko") is True
+
+    def test_one_unhighlighted_sentence_fails(self):
+        from ankigen.formatter import has_keyword_highlight
+
+        # Regression: an any-match rule let this card pass the audit forever,
+        # so the first sentence would never get fixed.
+        html = format_sentence_list(["저는 매일 음악을 들어요.", "어제 **들었어요**."], "듣다")
+        assert has_keyword_highlight(html, "듣다", "ko") is False
+
+    def test_bare_connective_counts_as_related(self):
+        from ankigen.formatter import headword_matches_highlight
+
+        # 듣다 → 들어 (ㄷ-irregular, bare connective form).
+        assert headword_matches_highlight("듣다", "들어", "ko") is True
+        assert headword_matches_highlight("듣다", "들어서", "ko") is True
+        # Still rejects genuinely unrelated words.
+        assert headword_matches_highlight("음료", "음식", "ko") is False
 
 
 class TestHighlightHelpers:

@@ -28,7 +28,8 @@ from ankigen.formatter import (
     _ANY_SPAN_RE,
     BR_SPLIT_RE,
     apply_markers,
-    format_sentences,
+    format_sentence_list,
+    has_markers,
     split_sentences_with_highlights,
 )
 from ankigen.hanja_lookup import resolve_hanja
@@ -44,22 +45,24 @@ logger = logging.getLogger("ankigen.backfill")
 
 
 def split_sentences_from_html(html: str) -> list[str]:
-    """Return the raw sentence strings from a ``format_sentences`` output.
+    """Return the raw sentence strings from a ``format_sentence_list`` output.
 
     Sentences are separated by ``<br>`` (a single sentence may carry
     multiple alternating blue/red spans because the keyword interrupts
-    the outer blue span — see :func:`ankigen.formatter.format_sentences`).
-    For each ``<br>``-delimited piece we strip every ``<span ...>`` /
-    ``</span>`` tag so the inner red-span keyword is rejoined with the
-    blue-span context, then trim and drop empties.
+    the outer blue span — see
+    :func:`ankigen.formatter.format_sentence_list`). For each
+    ``<br>``-delimited piece we strip every ``<span ...>`` / ``</span>`` tag
+    so the inner red-span keyword is rejoined with the blue-span context,
+    then trim and drop empties.
 
     Round-trip property (tested in `tests/test_backfill.py`):
 
-        ``split_sentences_from_html(format_sentences(numbered, kw)) == sentences``
+        ``split_sentences_from_html(format_sentence_list(sentences, kw)) == sentences``
 
-    for any ``sentences`` and ``kw``, where ``numbered`` is
-    ``"1. s1 2. s2 ..."`` and each sentence has had its leading number
-    stripped (``format_sentences`` removes ``\\d+\\. `` prefixes).
+    for any non-blank ``sentences`` and ``kw``. Note this recovers the *plain*
+    text: ``**...**`` markers have already been converted to red spans, so use
+    :func:`ankigen.formatter.split_sentences_with_highlights` when you need to
+    preserve where the highlights were.
     """
     if not html.strip():
         return []
@@ -184,63 +187,67 @@ def backfill_note(
         _set(resolved.english, translation_result.translation)
 
     # ----- Sentences -------------------------------------------------------
+    # All three sentence rules operate on the same field, so they run as one
+    # pass: recover the sentences, top up if short, make sure each one carries
+    # a marker, then format once. Running them as independent branches used to
+    # mean a card flagged for BOTH `too_few_sentences` and
+    # `keyword_not_highlighted` got its new sentences marked but kept its old
+    # unmarked ones — and then passed every later audit.
     sentence_field = resolved.sentence
-    existing_html = fields.get(sentence_field, "")
+    wants_sentences = bool(
+        reason_codes & {"plain_text_sentences", "too_few_sentences", "keyword_not_highlighted"}
+    )
 
-    if "plain_text_sentences" in reason_codes:
-        # Pure re-format pass — no LLM call. Wrap the existing sentences in
-        # the standard spans (and add keyword highlighting).
-        existing_sentences = split_sentences_from_html(existing_html)
-        if existing_sentences:
-            numbered = " ".join(f"{i + 1}. {s}" for i, s in enumerate(existing_sentences))
-            _set(sentence_field, format_sentences(numbered, headword))
+    if wants_sentences:
+        # `apply_markers` re-wraps whatever is already highlighted so correct
+        # existing spans survive the reformat instead of being recomputed.
+        pairs = split_sentences_with_highlights(fields.get(sentence_field, ""))
+        sentences = [apply_markers(s, reds) for s, reds in pairs]
 
-    if "too_few_sentences" in reason_codes and target_sentences > 0:
-        existing_sentences = split_sentences_from_html(fields.get(sentence_field, ""))
-        needed = max(target_sentences - len(existing_sentences), 0)
-        if needed > 0:
-            try:
-                new_sentences = generate_sentences(headword, lang, needed)
-            except Exception as exc:  # noqa: BLE001 — provider SDKs raise heterogeneous types
-                logger.warning(
-                    "Sentence top-up failed for '%s' (%s); keeping %d existing sentence(s)",
-                    headword,
-                    exc,
-                    len(existing_sentences),
-                )
-                new_sentences = []
-            combined = existing_sentences + list(new_sentences)
-        else:
-            combined = existing_sentences
-
-        if combined:
-            numbered = " ".join(f"{i + 1}. {s}" for i, s in enumerate(combined))
-            _set(sentence_field, format_sentences(numbered, headword))
-
-    if (
-        "keyword_not_highlighted" in reason_codes
-        and "plain_text_sentences" not in reason_codes
-        and "too_few_sentences" not in reason_codes
-    ):
-        existing_html = fields.get(sentence_field, "")
-        pairs = split_sentences_with_highlights(existing_html)
-        if pairs:
-            reds_exist = any(reds for _, reds in pairs)
-            if reds_exist:
-                marked = [apply_markers(s, reds) for s, reds in pairs]
-            else:
+        if "too_few_sentences" in reason_codes and target_sentences > 0:
+            needed = max(target_sentences - len(sentences), 0)
+            if needed > 0:
                 try:
-                    remarked = remark_sentences(headword, [s for s, _ in pairs], lang)
-                except Exception as exc:  # noqa: BLE001
+                    sentences += list(generate_sentences(headword, lang, needed))
+                except Exception as exc:  # noqa: BLE001 — provider SDKs raise heterogeneous types
                     logger.warning(
-                        "Sentence remark failed for '%s' (%s); keeping unmarked text",
+                        "Sentence top-up failed for '%s' (%s); keeping %d existing sentence(s)",
                         headword,
                         exc,
+                        len(sentences),
                     )
-                    remarked = [s for s, _ in pairs]
-                marked = remarked
-            numbered = " ".join(f"{i + 1}. {s}" for i, s in enumerate(marked))
-            _set(sentence_field, format_sentences(numbered, headword))
+
+        # Only sentences that have no marker AND don't contain the headword
+        # verbatim need the LLM — everything else already highlights via the
+        # marker path or the exact-match fallback in `highlight_keyword`.
+        unmarked = [
+            i
+            for i, s in enumerate(sentences)
+            if not has_markers(s) and headword and headword not in s
+        ]
+        if unmarked:
+            try:
+                remarked = remark_sentences(headword, [sentences[i] for i in unmarked], lang)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Sentence remark failed for '%s' (%s); keeping unmarked text",
+                    headword,
+                    exc,
+                )
+                remarked = []
+            if len(remarked) == len(unmarked):
+                for idx, sentence in zip(unmarked, remarked, strict=True):
+                    sentences[idx] = sentence
+            elif remarked:
+                logger.warning(
+                    "Remark returned %d sentence(s) for %d input(s) on '%s'; keeping originals",
+                    len(remarked),
+                    len(unmarked),
+                    headword,
+                )
+
+        if sentences:
+            _set(sentence_field, format_sentence_list(sentences, headword))
 
     # Headword sanity check — backfill must never overwrite it.
     fields[resolved.headword] = headword

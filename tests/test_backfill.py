@@ -252,6 +252,61 @@ class TestBackfillNoteKorean:
         )
         sentences_mock.assert_not_called()
 
+    def test_topup_also_marks_existing_unmarked_sentences(self, mocker):
+        # Regression: `too_few_sentences` and `keyword_not_highlighted` used to
+        # be independent branches, so a card flagged for both got its NEW
+        # sentences marked while the OLD one stayed unhighlighted — and then
+        # passed every later audit because the rule was an any-match.
+        from ankigen.formatter import format_sentence_list, has_keyword_highlight
+
+        existing = format_sentence_list(["저는 매일 음악을 들어요."], "듣다")
+        mocker.patch(
+            "ankigen.backfill.generate_sentences",
+            return_value=["어제 음악을 **들었어요**.", "라디오를 **듣습니다**."],
+        )
+        remark_mock = mocker.patch(
+            "ankigen.backfill.remark_sentences",
+            return_value=["저는 매일 음악을 **들어요**."],
+        )
+        note = _ko_note(korean="듣다", hanja="", english="to hear", comments=existing)
+        out, _ = backfill_note(
+            _entry(note, reasons=[("too_few_sentences", "1<3"), ("keyword_not_highlighted", "")]),
+            target_sentences=3,
+        )
+        # Only the unmarked sentence was sent to the LLM for marking.
+        remark_mock.assert_called_once_with("듣다", ["저는 매일 음악을 들어요."], "ko")
+        assert has_keyword_highlight(out["Comments"], "듣다", "ko") is True
+
+    def test_remark_skipped_when_headword_appears_verbatim(self, mocker):
+        # Chinese (and unconjugated Korean) already highlight via exact match,
+        # so no LLM call is needed to mark them.
+        mocker.patch("ankigen.backfill.generate_sentences")
+        remark_mock = mocker.patch("ankigen.backfill.remark_sentences")
+        note = _ko_note(comments="저는 음식을 좋아해요. 매일 음식을 먹어요.")
+        backfill_note(
+            _entry(note, reasons=[("keyword_not_highlighted", "")]),
+            target_sentences=3,
+        )
+        remark_mock.assert_not_called()
+
+    def test_remark_count_mismatch_keeps_originals(self, mocker):
+        # A short/long reply must not be zipped onto the wrong sentences.
+        from ankigen.formatter import format_sentence_list
+
+        existing = format_sentence_list(["매일 음악을 들어요.", "어제 잘 들었어요."], "듣다")
+        mocker.patch("ankigen.backfill.generate_sentences")
+        mocker.patch(
+            "ankigen.backfill.remark_sentences",
+            return_value=["매일 음악을 **들어요**."],  # 1 back for 2 sent
+        )
+        note = _ko_note(korean="듣다", hanja="", english="to hear", comments=existing)
+        out, _ = backfill_note(
+            _entry(note, reasons=[("keyword_not_highlighted", "")]),
+            target_sentences=3,
+        )
+        assert "color: red" not in out["Comments"]
+        assert "매일 음악을 들어요." in split_sentences_from_html(out["Comments"])
+
     def test_plain_text_sentences_reformatted_no_llm(self, mocker):
         sentences_mock = mocker.patch("ankigen.backfill.generate_sentences")
         note = _ko_note(comments="저는 음식을 좋아해요. 매일 음식을 먹어요.")
