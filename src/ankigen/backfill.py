@@ -36,9 +36,11 @@ from ankigen.formatter import (
     has_markers,
     split_field,
     split_sentences_with_highlights,
+    strip_html,
     unescape_text,
 )
 from ankigen.hanja_lookup import resolve_hanja
+from ankigen.jyutping import get_jyutping
 from ankigen.llm import (
     estimate_cost,
     generate_sentences,
@@ -378,13 +380,16 @@ def backfill_note(
             # leaving the field blank — same as not flagging the note).
             _set(resolved.secondary, translation_result.hanja)
 
-    elif lang == "zh" and "missing_jyutping" in reason_codes:
-        resolver = jyutping_resolver
-        if resolver is None:
-            from ankigen.cli import get_jyutping as _default_jyutping
-
-            resolver = _default_jyutping
-        _set(resolved.secondary, resolver(headword))
+    elif lang == "zh" and reason_codes & {"missing_jyutping", "wrong_jyutping"}:
+        resolver = jyutping_resolver or get_jyutping
+        # `headword` is a raw Anki field, so strip the editor's markup before
+        # handing it to a segmenter that would otherwise read tags as words.
+        new_jyutping = resolver(strip_html(headword))
+        # Only write a real reading. `_set` marks the field touched
+        # unconditionally, so writing "" here would blank a populated column
+        # and count the note as changed — the opposite of the repair intended.
+        if new_jyutping:
+            _set(resolved.secondary, new_jyutping)
 
     # ----- English ---------------------------------------------------------
     if needs_llm_translation and translation_result is not None:

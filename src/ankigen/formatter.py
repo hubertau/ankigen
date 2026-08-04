@@ -31,6 +31,12 @@ RED_SPAN_RE = re.compile(
 
 _ANY_SPAN_RE = re.compile(r"<span[^>]*>|</span>", flags=re.IGNORECASE)
 
+# Any HTML tag. Broader than _ANY_SPAN_RE, which only knows the <span>s we
+# emit ourselves — Anki fields can hold whatever the user typed in the editor
+# (<b>, <i>, <div>, a stray <br>), and a resolver reading a headword back out
+# needs the bare text regardless of provenance.
+_ANY_TAG_RE = re.compile(r"<[^>]+>")
+
 _RED = '<span style="color: red;">'
 _BLUE = '<span style="color: blue;">'
 _GRAY = '<span style="color: gray;">'
@@ -59,6 +65,21 @@ def unescape_text(text: str) -> str:
     audit/backfill round-trip.
     """
     return html.unescape(text)
+
+
+def strip_html(text: str) -> str:
+    """Recover the plain text of an Anki field: drop tags, then unescape.
+
+    Anki stores whatever the editor produced, so a headword can come back as
+    ``<b>促使</b>`` or ``促使&nbsp;``. Resolvers that feed the value to a
+    dictionary or segmenter need the bare characters — a stray tag turns into
+    an unknown token and silently poisons the lookup.
+
+    The order matters: tags are removed *before* unescaping, so an escaped
+    ``&lt;b&gt;`` in the user's text survives as literal text instead of being
+    unescaped into a tag and then stripped.
+    """
+    return unescape_text(_ANY_TAG_RE.sub("", text)).replace("\xa0", " ").strip()
 
 
 def format_context_notes(notes: str) -> str:

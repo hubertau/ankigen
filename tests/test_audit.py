@@ -362,6 +362,73 @@ class TestChineseRules:
         results = audit_notes([note], target_sentences=1, jyutping_resolver=lambda _: "")
         assert results == []
 
+    def test_missing_jyutping_detail_carries_the_reading(self):
+        # The report should say what backfill will write, not just that it can.
+        note = _zh_note(jyutping="", sentence=_one_zh_sentence())
+        results = audit_notes([note], target_sentences=1, jyutping_resolver=lambda _: "cuk1 si2")
+        reason = next(r for r in results[0].reasons if r.code == "missing_jyutping")
+        assert reason.detail == "cuk1 si2"
+
+    def test_headword_html_is_stripped_before_lookup(self):
+        seen: list[str] = []
+
+        def _record(word: str) -> str:
+            seen.append(word)
+            return "cuk1 si2"
+
+        note = _zh_note(hanzi="<b>促使</b>", jyutping="", sentence=_one_zh_sentence())
+        audit_notes([note], target_sentences=1, jyutping_resolver=_record)
+        assert seen == ["促使"]
+
+
+class TestWrongJyutping:
+    """Repair readings produced by the old lookup-without-converting path."""
+
+    def test_truncated_reading_is_flagged(self):
+        # The signature of the dropped-unresolvable-segment bug: 新鲜 -> "san1".
+        note = _zh_note(hanzi="新鲜", jyutping="san1", sentence=_one_zh_sentence("新鲜"))
+        results = audit_notes([note], target_sentences=1, jyutping_resolver=lambda _: "san1 sin1")
+        codes = {r.code for r in results[0].reasons}
+        assert "wrong_jyutping" in codes
+        assert "missing_jyutping" not in codes
+
+    def test_homograph_reading_is_flagged(self):
+        # Right syllable count, valid Jyutping, wrong word — caught only because
+        # the headword contains a character conversion rewrites.
+        note = _zh_note(hanzi="什么", jyutping="zaap6 jiu1", sentence=_one_zh_sentence("什么"))
+        results = audit_notes([note], target_sentences=1, jyutping_resolver=lambda _: "sam6 mo1")
+        codes = {r.code for r in results[0].reasons}
+        assert "wrong_jyutping" in codes
+
+    def test_detail_shows_the_replacement(self):
+        note = _zh_note(hanzi="新鲜", jyutping="san1", sentence=_one_zh_sentence("新鲜"))
+        results = audit_notes([note], target_sentences=1, jyutping_resolver=lambda _: "san1 sin1")
+        reason = next(r for r in results[0].reasons if r.code == "wrong_jyutping")
+        assert reason.detail == "san1 -> san1 sin1"
+
+    def test_correct_reading_is_not_flagged(self):
+        note = _zh_note(jyutping="cuk1 si2", sentence=_one_zh_sentence())
+        results = audit_notes([note], target_sentences=1, jyutping_resolver=lambda _: "cuk1 si2")
+        assert results == []
+
+    def test_concatenated_format_is_not_a_disagreement(self):
+        # Historical output used no separator. Same syllables, so leave it be.
+        note = _zh_note(hanzi="归纳", jyutping="gwai1naap6", sentence=_one_zh_sentence("归纳"))
+        results = audit_notes([note], target_sentences=1, jyutping_resolver=lambda _: "gwai1 naap6")
+        assert results == []
+
+    def test_traditional_headword_hand_edit_is_left_alone(self):
+        # Differing reading, matching syllable count, no simplified character:
+        # this is a hand-edit (or a tone-variant choice), not the old bug.
+        note = _zh_note(hanzi="學習", jyutping="hok6 zaap6", sentence=_one_zh_sentence("學習"))
+        results = audit_notes([note], target_sentences=1, jyutping_resolver=lambda _: "hok6 zap6")
+        assert results == []
+
+    def test_not_flagged_when_resolver_has_nothing_better(self):
+        note = _zh_note(hanzi="新鲜", jyutping="san1", sentence=_one_zh_sentence("新鲜"))
+        results = audit_notes([note], target_sentences=1, jyutping_resolver=lambda _: "")
+        assert results == []
+
     def test_empty_english_chinese(self):
         note = _zh_note(english="", sentence=_one_zh_sentence())
         results = audit_notes([note], target_sentences=1, jyutping_resolver=_fake_jyutping)

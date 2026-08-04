@@ -146,10 +146,18 @@ ankigen generate inputs/zh/words.txt
 
 | Hanzi | Pinyin | Jyutping | English | Sentence |
 |-------|--------|----------|---------|----------|
-| 促使 | cùshǐ | cuk1sai2 | Verb: to urge, to spur | (HTML formatted sentences) |
+| 促使 | cùshǐ | cuk1 si2 | Verb: to urge, to spur | (HTML formatted sentences) |
 
 The Pinyin column carries tone-marked Mandarin romanization (via `pypinyin`).
 Add a matching `Pinyin` field to your Chinese note type before importing.
+
+The Jyutping column carries Cantonese romanization as space-separated syllables
+with tone numbers (via `pycantonese`). Because pycantonese's dictionary is
+traditional-only, simplified input is converted to traditional before the lookup
+— the `Hanzi` column keeps whatever script you wrote. When a word can't be fully
+resolved the column is left **blank** rather than filled with a partial reading:
+a truncated romanization looks complete on a card, and there is no way to tell
+from the outside which syllables are missing.
 
 **Vocab output (Korean)** (`outputs/ko/output_words.csv`):
 
@@ -535,6 +543,7 @@ Default paths mirror the rest of ankigen: the JSONL audit report lands in `input
 | `missing_hanja_for_sino` | `Hanja` blank AND `Korean` contains embedded Hanja OR a `한글(漢字)` annotation | — |
 | `empty_hanja_optional` | `Hanja` blank on a Hangul-only word (opt in via `--include-empty-hanja`) | — |
 | `missing_jyutping` | — | `Jyutping` blank AND pycantonese can resolve `Hanzi` |
+| `wrong_jyutping` | — | `Jyutping` non-empty but contradicted by the resolver — either it has fewer syllables than `Hanzi` has characters, or `Hanzi` is simplified and the stored reading disagrees with the corrected one |
 | `empty_english` | `English` blank | `English` blank |
 | `too_few_sentences` | `Comment` has fewer than `-n` sentence blocks | `Sentence` has fewer than `-n` blocks |
 | `keyword_not_highlighted` | `Comment` non-empty, formatted with spans, but no red `<span>` related to `Korean` (conjugated/particled forms count as related) | `Sentence` non-empty but no red `<span>` matches `Hanzi` |
@@ -543,6 +552,8 @@ Default paths mirror the rest of ankigen: the JSONL audit report lands in `input
 | `sentence_quality` | The LLM judge rejected one or more sentences (opt in via `--check-content`) | same |
 
 All the sentence rules ignore the trailing context-notes block, so notes never inflate the sentence count or mask a legacy plain-text card.
+
+`wrong_jyutping` is the one rule that authorizes overwriting a field you may have edited yourself, so it is deliberately narrow. It fires only on the two signatures of romanization produced before simplified input was converted: a reading shorter than the headword (`新鲜` → `san1`, truncated at the first character the dictionary missed), or a simplified headword whose stored reading disagrees with the corrected one (`什么` → `zaap6 jiu1`, a complete and valid reading of an entirely different word). A traditional or colloquial-Cantonese headword can't satisfy the second condition, so hand-edited readings on those cards are never touched. Reformatting alone is not a disagreement — the older concatenated `gwai1naap6` compares equal to `gwai1 naap6`.
 
 **Content review (`--check-content`)**
 
@@ -567,6 +578,7 @@ The judge is biased toward passing: it is told to flag only clear, describable d
 | `missing_hanja_for_sino` | Local Hanja resolver (no LLM); falls back to LLM if local returns blank |
 | `empty_hanja_optional` | LLM `translate_word` (coalesced with `empty_english` when both fire — one call) |
 | `missing_jyutping` | `pycantonese` (no LLM) |
+| `wrong_jyutping` | `pycantonese` (no LLM); the existing value is overwritten, and left alone if the resolver has nothing better to offer |
 | `empty_english` | LLM `translate_word` |
 | `too_few_sentences` | Existing sentences are preserved; LLM `generate_sentences` is asked for the shortfall only, then `format_sentences` re-renders the whole field |
 | `keyword_not_highlighted` | Preserve existing red spans as `**markers**` and re-run `format_sentences` (no LLM); if there are no red spans, LLM `remark_sentences` then `format_sentences` |
