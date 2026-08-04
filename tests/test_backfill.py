@@ -341,6 +341,42 @@ class TestBackfillNoteKorean:
         assert out["Comment"] == format_context_notes("Register: written only.") + existing
         assert touched == ["Comment"]
 
+    def test_gloss_is_plain_text_when_asking_for_notes(self, mocker):
+        # The English field is raw Anki HTML, so it can carry tags and entities.
+        gen_notes = mocker.patch("ankigen.backfill.generate_notes", return_value="n")
+        note = _ko_note(
+            english="<b>Noun</b>: food &amp; drink",
+            comments=format_sentences("1. 저는 음식을 좋아해요.", "음식"),
+        )
+        backfill_note(
+            _entry(note, reasons=[("missing_context_notes", "no notes block")]),
+            target_sentences=3,
+        )
+        gen_notes.assert_called_once_with("음식", "ko", "Noun: food & drink")
+
+    def test_freshly_escaped_gloss_is_not_sent_as_entities(self, mocker):
+        # `empty_english` writes an escaped translation into the field a few
+        # lines before the notes branch reads it back.
+        mocker.patch(
+            "ankigen.backfill.translate_word",
+            return_value=TranslationResult(translation="Noun: food & drink", hanja=""),
+        )
+        gen_notes = mocker.patch("ankigen.backfill.generate_notes", return_value="n")
+        note = _ko_note(
+            english="", hanja="飮食", comments=format_sentences("1. 저는 음식을 좋아해요.", "음식")
+        )
+        out, _ = backfill_note(
+            _entry(
+                note,
+                reasons=[("empty_english", ""), ("missing_context_notes", "no notes block")],
+            ),
+            target_sentences=3,
+        )
+        # The card still stores the escaped form...
+        assert out["English"] == "Noun: food &amp; drink"
+        # ...but the model is asked about the word, not the entity.
+        assert gen_notes.call_args[0][2] == "Noun: food & drink"
+
     def test_empty_notes_block_is_replaced_not_duplicated(self, mocker):
         mocker.patch("ankigen.backfill.generate_notes", return_value="Real notes now.")
         stray = '<div class="ankigen-notes"><span style="color: gray;"></span></div>'
@@ -400,6 +436,37 @@ class TestBackfillNoteKorean:
         )
         assert out["Comment"] == existing
         assert touched == []
+
+    def test_no_notes_only_field_when_sentences_disabled(self, mocker):
+        # A JSONL audited at -n 3 can be backfilled at -n 0. The audit refuses
+        # to create a notes-and-no-examples card; backfill must too — and must
+        # not pay for notes it will not write.
+        gen_notes = mocker.patch("ankigen.backfill.generate_notes", return_value="Some notes.")
+        mocker.patch("ankigen.backfill.generate_sentences")
+        note = _ko_note(comments="")
+        out, touched = backfill_note(
+            _entry(
+                note,
+                reasons=[("too_few_sentences", "0<3"), ("missing_context_notes", "no notes block")],
+            ),
+            target_sentences=0,
+        )
+        gen_notes.assert_not_called()
+        assert out["Comment"] == ""
+        assert touched == []
+
+    def test_card_with_sentences_still_gets_notes_when_sentences_disabled(self, mocker):
+        # -n 0 only disables the sentence rules; a card that has examples and
+        # no notes is still repaired.
+        gen_notes = mocker.patch("ankigen.backfill.generate_notes", return_value="Some notes.")
+        existing = format_sentences("1. 저는 음식을 좋아해요.", "음식")
+        note = _ko_note(comments=existing)
+        out, _ = backfill_note(
+            _entry(note, reasons=[("missing_context_notes", "no notes block")]),
+            target_sentences=0,
+        )
+        gen_notes.assert_called_once()
+        assert out["Comment"] == format_context_notes("Some notes.") + existing
 
     def test_notes_not_written_when_rule_did_not_fire(self, mocker):
         # A plain top-up must not start adding notes to a `--no-notes` deck.
@@ -1474,6 +1541,57 @@ class TestEstimateMatchesReality:
             )
             assert predicted == actual, (
                 f"estimate drifted for {entry.note.fields[entry.resolved.headword]!r} "
+                f"reasons={[r.code for r in entry.reasons]}: "
+                f"predicted {predicted}, actual {actual}"
+            )
+
+    def test_per_note_estimate_matches_actual_calls_with_sentences_disabled(self, mocker):
+        # `-n 0` has its own branches on both sides (no top-up can run, and the
+        # notes guard refuses to build a notes-only card), so parity has to hold
+        # here too — a JSONL audited at -n 3 can be backfilled at -n 0.
+        translate = mocker.patch(
+            "ankigen.backfill.translate_word",
+            return_value=TranslationResult(translation="x", hanja="愛"),
+        )
+        sentences = mocker.patch(
+            "ankigen.backfill.generate_sentences",
+            return_value=SentenceResult(sentences=["새 **음식을** 먹어요."] * 3),
+        )
+        remark = mocker.patch(
+            "ankigen.backfill.remark_sentences",
+            side_effect=lambda word, sents, lang: sents,
+        )
+        context_notes = mocker.patch(
+            "ankigen.backfill.generate_notes",
+            return_value="Compare 음식 with 요리.",
+        )
+
+        corpus = [
+            *_estimate_corpus(),
+            # Blank sentence field: the guard must suppress the notes call.
+            _entry(
+                _ko_note(comments=""),
+                reasons=[
+                    ("too_few_sentences", "0<3"),
+                    ("missing_context_notes", "no notes block"),
+                ],
+            ),
+        ]
+        for entry in corpus:
+            for mock in (translate, sentences, remark, context_notes):
+                mock.reset_mock()
+
+            predicted = estimate_note_calls(entry, 0)
+            backfill_note(entry, target_sentences=0, jyutping_resolver=lambda w: "jyut")
+            actual = (
+                translate.call_count,
+                sentences.call_count,
+                remark.call_count,
+                context_notes.call_count,
+            )
+            assert predicted == actual, (
+                f"estimate drifted at -n 0 for "
+                f"{entry.note.fields[entry.resolved.headword]!r} "
                 f"reasons={[r.code for r in entry.reasons]}: "
                 f"predicted {predicted}, actual {actual}"
             )

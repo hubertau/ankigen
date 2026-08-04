@@ -199,8 +199,13 @@ def estimate_note_input_tokens(entry: AuditedNote, target_sentences: int) -> int
     if translate:
         tokens += translation_prompts(headword, lang).estimated_input_tokens()
     if context_notes:
+        # `strip_html` to match the real call. The gloss can still differ from
+        # what backfill sends: on a card also flagged `empty_english` the field
+        # is blank here and carries a fresh translation by the time the notes
+        # call goes out, so this understates that card by a few tokens. The
+        # call *count* is unaffected.
         tokens += notes_prompts(
-            headword, lang, fields.get(resolved.english, "")
+            headword, lang, strip_html(fields.get(resolved.english, ""))
         ).estimated_input_tokens()
 
     if sentence or remark:
@@ -272,7 +277,16 @@ def estimate_note_calls(entry: AuditedNote, target_sentences: int) -> tuple[int,
     # Only a card with no sentence top-up pays for its notes — otherwise the
     # top-up response carries them, and a blank `notes` in that response is
     # taken as "nothing to add" rather than a reason to ask again.
-    context_notes = 1 if "missing_context_notes" in reason_codes and not sentence else 0
+    context_notes = 0
+    if "missing_context_notes" in reason_codes and not sentence:
+        # The same `-n 0` guard `backfill_note` applies. Reading the *original*
+        # field is safe: at `target_sentences <= 0` no top-up can run, and the
+        # sentence pass only rewrites the field when it has sentences to write,
+        # so an empty sentence field cannot have become non-empty (or vice
+        # versa) by the time the notes branch looks at it.
+        existing_html, _ = split_field(fields.get(resolved.sentence, ""))
+        if target_sentences > 0 or existing_html.strip():
+            context_notes = 1
 
     return translate, sentence, remark, context_notes
 
@@ -523,19 +537,33 @@ def backfill_note(
     # it. Splitting again also drops the empty wrapper that flagged the card in
     # the `empty notes block` case.
     if "missing_context_notes" in reason_codes:
-        new_notes = harvested_notes
-        if not sentence_call_made:
-            try:
-                new_notes = generate_notes(headword, lang, fields.get(resolved.english, ""))
-            except Exception as exc:  # noqa: BLE001 — provider SDKs raise heterogeneous types
-                logger.warning("Context notes failed for '%s' (%s); leaving field", headword, exc)
-                new_notes = ""
-        # An empty result means the model had nothing to add. `_set` marks the
-        # field touched unconditionally, so writing it would rewrite the field
-        # to no effect and count the note as changed.
-        if new_notes:
-            sentences_html, _ = split_field(fields.get(sentence_field, ""))
-            _set(sentence_field, format_context_notes(new_notes) + sentences_html)
+        sentences_html, _ = split_field(fields.get(sentence_field, ""))
+        # Mirrors the audit's `-n 0` guard (see `_rule_missing_context_notes`):
+        # with sentences switched off, a card that has none would end up holding
+        # usage notes and no examples. Checked before the call so a run that
+        # writes nothing also pays for nothing — the audit normally filters
+        # these out, but a JSONL audited at `-n 3` can be backfilled at `-n 0`.
+        if target_sentences > 0 or sentences_html.strip():
+            new_notes = harvested_notes
+            if not sentence_call_made:
+                try:
+                    # `strip_html` because the gloss is a raw Anki field — and,
+                    # when `empty_english` fired above, one this function just
+                    # escaped. Sending `food &amp; drink` to the model would put
+                    # the entity in front of it rather than the word.
+                    new_notes = generate_notes(
+                        headword, lang, strip_html(fields.get(resolved.english, ""))
+                    )
+                except Exception as exc:  # noqa: BLE001 — provider SDKs raise heterogeneous types
+                    logger.warning(
+                        "Context notes failed for '%s' (%s); leaving field", headword, exc
+                    )
+                    new_notes = ""
+            # An empty result means the model had nothing to add. `_set` marks
+            # the field touched unconditionally, so writing it would rewrite the
+            # field to no effect and count the note as changed.
+            if new_notes:
+                _set(sentence_field, format_context_notes(new_notes) + sentences_html)
 
     # Headword sanity check — backfill must never overwrite it.
     fields[resolved.headword] = headword
