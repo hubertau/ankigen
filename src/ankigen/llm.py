@@ -21,6 +21,7 @@ from ankigen.models import (
     ContentReviewResponse,
     GrammarExample,
     KoreanTranslationResponse,
+    NotesResponse,
     TranslationResponse,
     create_grammar_example_response,
     create_sentence_response,
@@ -94,7 +95,12 @@ LANGUAGE_CONFIG = {
             "in double asterisks, e.g. **{word}**. "
             "Return the sentences in the `sentences` field, with no translations or "
             "explanations inside them.\n\n"
-            "Also return a `notes` field with concise usage notes for '{word}'. "
+        ),
+        # Appended to `sentence_prompt` by `sentence_prompts()` and sent alone by
+        # `notes_prompts()`. Kept in one place so the two callers can't drift —
+        # `{sentence_rule}` is the only part that differs between them.
+        "notes_prompt": (
+            "{notes_lead} a `notes` field with concise usage notes for '{word}'. "
             "Skip any section with nothing useful to say.\n\n"
             "1. BREAKDOWN — what each character contributes; literal/etymological "
             "image only where it aids memory.\n"
@@ -107,6 +113,7 @@ LANGUAGE_CONFIG = {
             "5. CANTONESE — Jyutping; spoken Cantonese vs written-only; natural HK "
             "colloquial equivalent if different; Mandarin/Cantonese false friends.\n\n"
             "RULES\n"
+            "{sentence_rule}"
             "- Be tight; one sharp distinction beats exhaustive coverage.\n"
             "- Simplified characters; note traditional form only when it matters.\n"
             "- Pinyin with tone marks; Jyutping with tone numbers; mark neutral tones "
@@ -116,6 +123,10 @@ LANGUAGE_CONFIG = {
             "- Write in English; cite Chinese in characters. No filler or dictionary "
             "restating. Return an empty string if there is genuinely nothing useful to add."
         ),
+        # Extra `notes_prompt` rule that only makes sense alongside freshly
+        # generated sentences. Empty for Chinese; Korean uses it to stop the
+        # notes from restating the examples.
+        "notes_sentence_rule": "",
         "remark_prompt": (
             "You are given exactly {num_sentences} existing Chinese example sentences. "
             "Return the same sentences verbatim — do not rewrite, reorder, merge, or "
@@ -181,7 +192,9 @@ LANGUAGE_CONFIG = {
             "e.g. **먹었어요** for 먹다 or **음식을** for 음식. "
             "Return the sentences in the `sentences` field, with no translations or "
             "explanations inside them.\n\n"
-            "Also return a `notes` field with supplementary usage notes for '{word}'. "
+        ),
+        "notes_prompt": (
+            "{notes_lead} a `notes` field with supplementary usage notes for '{word}'. "
             "The learner is upper-intermediate to advanced (TOPIK II, evidential "
             "endings, reported speech, formal register). Skip basic grammar and any "
             "section with nothing useful to say.\n\n"
@@ -198,13 +211,14 @@ LANGUAGE_CONFIG = {
             "native Korean.\n"
             "7. LEARNER ERROR — the single most likely mistake, as ✗ / ✓.\n\n"
             "RULES\n"
-            "- Do not repeat or rephrase the `sentences` you just generated.\n"
+            "{sentence_rule}"
             "- Write in English; cite Korean in Hangul. No romanization.\n"
             "- No filler; if unsure about a collocation or nuance, say so instead "
             "of inventing.\n"
             "- Under 150 words; plain text, one line per point, category in caps.\n"
             "- Return an empty string if there is genuinely nothing useful to add."
         ),
+        "notes_sentence_rule": "- Do not repeat or rephrase the `sentences` you just generated.\n",
         "remark_prompt": (
             "You are given exactly {num_sentences} existing Korean example sentences. "
             "Return the same sentences verbatim — do not rewrite, reorder, merge, or "
@@ -1448,6 +1462,22 @@ class PromptSpec(NamedTuple):
         return estimate_tokens(self.system) + estimate_tokens(self.user)
 
 
+def _notes_body(word: str, lang: Language, *, with_sentences: bool) -> str:
+    """The `notes` half of the prompt, shared by sentence and notes-only calls.
+
+    ``with_sentences`` controls the two spots that differ between the callers:
+    the lead-in ("Also return" only makes sense after a sentence request) and
+    the one rule that refers to sentences generated in the same call. A
+    notes-only request renders both without them.
+    """
+    config = LANGUAGE_CONFIG[lang]
+    return config["notes_prompt"].format(
+        word=word,
+        notes_lead="Also return" if with_sentences else "Return",
+        sentence_rule=config["notes_sentence_rule"] if with_sentences else "",
+    )
+
+
 def sentence_prompts(word: str, lang: Language, num_sentences: int) -> PromptSpec:
     """Request spec for :func:`generate_sentences`."""
     config = LANGUAGE_CONFIG[lang]
@@ -1459,8 +1489,37 @@ def sentence_prompts(word: str, lang: Language, num_sentences: int) -> PromptSpe
             response_model,
             lang=lang,
         ),
-        user=config["sentence_prompt"].format(word=word, num_sentences=num_sentences),
+        user=(
+            config["sentence_prompt"].format(word=word, num_sentences=num_sentences)
+            + _notes_body(word, lang, with_sentences=True)
+        ),
         response_model=response_model,
+    )
+
+
+def notes_prompts(word: str, lang: Language, english: str = "") -> PromptSpec:
+    """Request spec for :func:`generate_notes` — the notes half on its own.
+
+    Used by backfill for a card whose example sentences are fine but whose
+    context-notes block is missing, so there is no sentence generation to
+    piggyback on. ``english`` is the card's existing gloss; passing it pins
+    down which sense of a polysemous headword the notes should describe.
+    """
+    config = LANGUAGE_CONFIG[lang]
+    gloss = f" (English gloss: {english})" if english.strip() else ""
+    lead = (
+        f"Write usage notes for the {config['name']} word '{word}'{gloss}. "
+        "No example sentences — the card already has them.\n\n"
+    )
+    return PromptSpec(
+        system=_system_prompt_with_json(
+            f"You are a helpful {config['name']} language tutor. "
+            "Write concise usage notes for a vocabulary card.",
+            NotesResponse,
+            lang=lang,
+        ),
+        user=lead + _notes_body(word, lang, with_sentences=False),
+        response_model=NotesResponse,
     )
 
 
@@ -1537,6 +1596,32 @@ def generate_sentences(word: str, lang: Language = "zh", num_sentences: int = 3)
     notes = getattr(response, "notes", "") or ""
     logger.debug("Generated %d sentences in %.2fs", len(sentences), elapsed)
     return SentenceResult(sentences=sentences, notes=notes.strip())
+
+
+def generate_notes(word: str, lang: Language = "zh", english: str = "") -> str:
+    """Generate learner context notes for a word, without example sentences.
+
+    The notes normally arrive free with :func:`generate_sentences`; this is the
+    path for a card whose sentences are already good and only the notes block
+    is missing. Returns ``""`` when the model has nothing useful to add — the
+    caller leaves the field alone rather than writing an empty block.
+    """
+    model = get_model()
+    spec = notes_prompts(word, lang, english)
+
+    logger.debug("Generating context notes for '%s' using %s", word, model)
+    start_time = time.time()
+
+    response = generate_structured_response(
+        response_model=spec.response_model,
+        system_prompt=spec.system,
+        user_prompt=spec.user,
+    )
+
+    elapsed = time.time() - start_time
+    notes = getattr(response, "notes", "") or ""
+    logger.debug("Generated %d chars of notes in %.2fs", len(notes), elapsed)
+    return notes.strip()
 
 
 def remark_sentences(word: str, sentences: list[str], lang: Language = "zh") -> list[str]:

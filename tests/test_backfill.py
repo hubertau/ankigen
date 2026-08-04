@@ -289,6 +289,137 @@ class TestBackfillNoteKorean:
         assert out["Comment"].startswith(notes)
         assert '<span style="color: red;">음식</span>' in out["Comment"]
 
+    def test_missing_notes_harvested_free_from_a_top_up(self, mocker):
+        # The top-up response already carries notes, so a card flagged for both
+        # must not pay for a second call.
+        gen = mocker.patch(
+            "ankigen.backfill.generate_sentences",
+            return_value=SentenceResult(
+                sentences=["새로운 문장 하나.", "새로운 문장 둘."],
+                notes="Compare 음식 with 요리.",
+            ),
+        )
+        gen_notes = mocker.patch("ankigen.backfill.generate_notes")
+        mocker.patch(
+            "ankigen.backfill.remark_sentences",
+            side_effect=lambda word, sentences, lang: sentences,
+        )
+        note = _ko_note(comments=format_sentences("1. 저는 음식을 좋아해요.", "음식"))
+        out, touched = backfill_note(
+            _entry(
+                note,
+                reasons=[("too_few_sentences", "1<3"), ("missing_context_notes", "no notes block")],
+            ),
+            target_sentences=3,
+        )
+        gen_notes.assert_not_called()
+        assert gen.call_count == 1
+        assert out["Comment"].startswith(format_context_notes("Compare 음식 with 요리."))
+        assert touched == ["Comment"]
+        # The harvested notes sit above the sentences without becoming one.
+        assert split_sentences_from_html(out["Comment"]) == [
+            "저는 음식을 좋아해요.",
+            "새로운 문장 하나.",
+            "새로운 문장 둘.",
+        ]
+
+    def test_missing_notes_alone_costs_one_call(self, mocker):
+        gen = mocker.patch("ankigen.backfill.generate_sentences")
+        gen_notes = mocker.patch(
+            "ankigen.backfill.generate_notes", return_value="Register: written only."
+        )
+        existing = format_sentences(
+            "1. 저는 음식을 좋아해요. 2. 한국 음식이 맛있어요. 3. 매일 음식을 먹어요.", "음식"
+        )
+        note = _ko_note(comments=existing)
+        out, touched = backfill_note(
+            _entry(note, reasons=[("missing_context_notes", "no notes block")]),
+            target_sentences=3,
+        )
+        gen.assert_not_called()
+        gen_notes.assert_called_once_with("음식", "ko", "food")
+        assert out["Comment"] == format_context_notes("Register: written only.") + existing
+        assert touched == ["Comment"]
+
+    def test_empty_notes_block_is_replaced_not_duplicated(self, mocker):
+        mocker.patch("ankigen.backfill.generate_notes", return_value="Real notes now.")
+        stray = '<div class="ankigen-notes"><span style="color: gray;"></span></div>'
+        existing = format_sentences("1. 저는 음식을 좋아해요.", "음식")
+        note = _ko_note(comments=stray + existing)
+        out, _ = backfill_note(
+            _entry(note, reasons=[("missing_context_notes", "empty notes block")]),
+            target_sentences=3,
+        )
+        assert out["Comment"].count("ankigen-notes") == 1
+        assert out["Comment"] == format_context_notes("Real notes now.") + existing
+
+    def test_blank_notes_from_a_top_up_do_not_trigger_a_second_call(self, mocker):
+        # The top-up already asked; a blank `notes` means the model had nothing
+        # to add, so paying to ask the same question again is pure waste.
+        mocker.patch(
+            "ankigen.backfill.generate_sentences",
+            return_value=SentenceResult(sentences=["새로운 문장 하나."], notes=""),
+        )
+        gen_notes = mocker.patch("ankigen.backfill.generate_notes")
+        mocker.patch(
+            "ankigen.backfill.remark_sentences",
+            side_effect=lambda word, sentences, lang: sentences,
+        )
+        existing = format_sentences("1. 저는 음식을 좋아해요. 2. 매일 음식을 먹어요.", "음식")
+        note = _ko_note(comments=existing)
+        out, _ = backfill_note(
+            _entry(
+                note,
+                reasons=[("too_few_sentences", "2<3"), ("missing_context_notes", "no notes block")],
+            ),
+            target_sentences=3,
+        )
+        gen_notes.assert_not_called()
+        assert "ankigen-notes" not in out["Comment"]
+
+    def test_blank_llm_notes_leave_the_field_alone(self, mocker):
+        # Writing an empty block would mark the note touched and produce a TSV
+        # row that changes nothing.
+        mocker.patch("ankigen.backfill.generate_notes", return_value="")
+        existing = format_sentences("1. 저는 음식을 좋아해요.", "음식")
+        note = _ko_note(comments=existing)
+        out, touched = backfill_note(
+            _entry(note, reasons=[("missing_context_notes", "no notes block")]),
+            target_sentences=3,
+        )
+        assert out["Comment"] == existing
+        assert touched == []
+
+    def test_notes_failure_is_swallowed(self, mocker):
+        mocker.patch("ankigen.backfill.generate_notes", side_effect=RuntimeError("boom"))
+        existing = format_sentences("1. 저는 음식을 좋아해요.", "음식")
+        note = _ko_note(comments=existing)
+        out, touched = backfill_note(
+            _entry(note, reasons=[("missing_context_notes", "no notes block")]),
+            target_sentences=3,
+        )
+        assert out["Comment"] == existing
+        assert touched == []
+
+    def test_notes_not_written_when_rule_did_not_fire(self, mocker):
+        # A plain top-up must not start adding notes to a `--no-notes` deck.
+        mocker.patch(
+            "ankigen.backfill.generate_sentences",
+            return_value=SentenceResult(sentences=["새로운 문장."], notes="Unwanted notes."),
+        )
+        mocker.patch(
+            "ankigen.backfill.remark_sentences",
+            side_effect=lambda word, sentences, lang: sentences,
+        )
+        note = _ko_note(
+            comments=format_sentences("1. 저는 음식을 좋아해요. 2. 매일 음식을 먹어요.", "음식")
+        )
+        out, _ = backfill_note(
+            _entry(note, reasons=[("too_few_sentences", "2<3")]),
+            target_sentences=3,
+        )
+        assert "ankigen-notes" not in out["Comment"]
+
     def test_split_sentences_from_html_drops_notes_block(self):
         html = format_context_notes("Compare 음식 with 요리.") + format_sentences(
             "1. 저는 음식을 좋아해요.", "음식"
@@ -1289,6 +1420,19 @@ def _estimate_corpus() -> list[AuditedNote]:
             lang="zh",
             reasons=[("missing_jyutping", "")],
         ),
+        # Notes missing on an otherwise-fine card -> one notes call.
+        _entry(_ko_note(comments=three), reasons=[("missing_context_notes", "no notes block")]),
+        # Notes missing AND a top-up due -> the top-up carries them, no notes call.
+        _entry(
+            _ko_note(comments=one_marked),
+            reasons=[("too_few_sentences", "1<3"), ("missing_context_notes", "no notes block")],
+        ),
+        # Notes missing but the top-up is a no-op (already at target) -> the
+        # sentence call never happens, so the notes still have to be paid for.
+        _entry(
+            _ko_note(comments=three),
+            reasons=[("too_few_sentences", "3<3"), ("missing_context_notes", "no notes block")],
+        ),
     ]
 
 
@@ -1309,11 +1453,16 @@ class TestEstimateMatchesReality:
             "ankigen.backfill.remark_sentences",
             side_effect=lambda word, sents, lang: sents,
         )
+        context_notes = mocker.patch(
+            "ankigen.backfill.generate_notes",
+            return_value="Compare 음식 with 요리.",
+        )
 
         for entry in _estimate_corpus():
             translate.reset_mock()
             sentences.reset_mock()
             remark.reset_mock()
+            context_notes.reset_mock()
 
             predicted = estimate_note_calls(entry, 3)
             backfill_note(entry, target_sentences=3, jyutping_resolver=lambda w: "jyut")
@@ -1321,6 +1470,7 @@ class TestEstimateMatchesReality:
                 translate.call_count,
                 sentences.call_count,
                 remark.call_count,
+                context_notes.call_count,
             )
             assert predicted == actual, (
                 f"estimate drifted for {entry.note.fields[entry.resolved.headword]!r} "
@@ -1333,10 +1483,13 @@ class TestEstimateMatchesReality:
         est = estimate_backfill(corpus, 3)
         assert est.notes == len(corpus)
         expected = [estimate_note_calls(e, 3) for e in corpus]
-        assert est.translate_calls == sum(t for t, _, _ in expected)
-        assert est.sentence_calls == sum(s for _, s, _ in expected)
-        assert est.remark_calls == sum(r for _, _, r in expected)
-        assert est.total == est.translate_calls + est.sentence_calls + est.remark_calls
+        assert est.translate_calls == sum(t for t, _, _, _ in expected)
+        assert est.sentence_calls == sum(s for _, s, _, _ in expected)
+        assert est.remark_calls == sum(r for _, _, r, _ in expected)
+        assert est.context_notes_calls == sum(n for _, _, _, n in expected)
+        assert est.total == (
+            est.translate_calls + est.sentence_calls + est.remark_calls + est.context_notes_calls
+        )
 
     def test_empty_input(self):
         est = estimate_backfill([], 3)
@@ -1351,10 +1504,12 @@ class TestEstimateMatchesReality:
         translate = mocker.patch("ankigen.backfill.translate_word")
         sentences = mocker.patch("ankigen.backfill.generate_sentences")
         remark = mocker.patch("ankigen.backfill.remark_sentences")
+        context_notes = mocker.patch("ankigen.backfill.generate_notes")
         estimate_backfill(_estimate_corpus(), 3)
         translate.assert_not_called()
         sentences.assert_not_called()
         remark.assert_not_called()
+        context_notes.assert_not_called()
 
 
 class TestFormatEstimate:

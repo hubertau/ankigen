@@ -344,6 +344,77 @@ class TestKoreanRulesWithContextNotes:
         assert "keyword_not_highlighted" in codes
 
 
+class TestMissingContextNotes:
+    """The opt-in sweep for cards with no learner context-notes block."""
+
+    def _codes(self, note, **kwargs):
+        kwargs.setdefault("target_sentences", 3)
+        kwargs.setdefault("jyutping_resolver", _fake_jyutping)
+        results = audit_notes([note], **kwargs)
+        return {r.code for r in results[0].reasons} if results else set()
+
+    def test_off_by_default(self):
+        # A deck generated with `--no-notes` must not be flagged wholesale.
+        note = _ko_note(comments=_three_ko_sentences())
+        assert audit_notes([note], target_sentences=3, jyutping_resolver=_fake_jyutping) == []
+
+    def test_flagged_when_opted_in(self):
+        note = _ko_note(comments=_three_ko_sentences())
+        codes = self._codes(note, include_missing_notes=True)
+        assert "missing_context_notes" in codes
+
+    def test_not_flagged_when_notes_present(self):
+        html = format_context_notes("Compare 음식 with 요리.") + _three_ko_sentences()
+        note = _ko_note(comments=html)
+        assert audit_notes([note], target_sentences=3, include_missing_notes=True) == []
+
+    def test_empty_notes_block_counts_as_missing(self):
+        # `format_context_notes` never emits this, so it can only be a hand-edit
+        # — and it renders as a stray gray nothing on the card.
+        html = '<div class="ankigen-notes"><span style="color: gray;"></span></div>'
+        note = _ko_note(comments=html + _three_ko_sentences())
+        codes = self._codes(note, include_missing_notes=True)
+        assert "missing_context_notes" in codes
+
+    def test_whitespace_only_notes_block_counts_as_missing(self):
+        html = format_context_notes("Real notes.").replace("Real notes.", "   ")
+        note = _ko_note(comments=html + _three_ko_sentences())
+        codes = self._codes(note, include_missing_notes=True)
+        assert "missing_context_notes" in codes
+
+    def test_chinese_cards_are_swept_too(self):
+        note = _zh_note(sentence=_one_zh_sentence())
+        codes = self._codes(note, include_missing_notes=True)
+        assert "missing_context_notes" in codes
+
+    def test_blank_sentence_field_skipped_when_sentences_disabled(self):
+        # With `-n 0` nothing will ever populate the sentences, and notes on
+        # their own are a shape `generate` never produces.
+        note = _ko_note(comments="")
+        assert (
+            audit_notes(
+                [note],
+                target_sentences=0,
+                include_missing_notes=True,
+                jyutping_resolver=_fake_jyutping,
+            )
+            == []
+        )
+
+    def test_populated_card_still_swept_when_sentences_disabled(self):
+        # `-n 0` only disables the sentence-count rule; a card that has
+        # sentences and no notes is still a card missing its notes.
+        note = _ko_note(comments=_three_ko_sentences())
+        codes = self._codes(note, target_sentences=0, include_missing_notes=True)
+        assert codes == {"missing_context_notes"}
+
+    def test_blank_sentence_field_flagged_when_sentences_enabled(self):
+        # At -n 3 the card is already being topped up, so the notes ride along.
+        note = _ko_note(comments="")
+        codes = self._codes(note, include_missing_notes=True)
+        assert codes == {"too_few_sentences", "missing_context_notes"}
+
+
 # ---------------------------------------------------------------------------
 # Chinese rules
 # ---------------------------------------------------------------------------

@@ -32,6 +32,7 @@ from ankigen.formatter import (
     BR_SPLIT_RE,
     apply_markers,
     escape_text,
+    format_context_notes,
     format_sentence_list,
     has_markers,
     split_field,
@@ -43,8 +44,10 @@ from ankigen.hanja_lookup import resolve_hanja
 from ankigen.jyutping import get_jyutping
 from ankigen.llm import (
     estimate_cost,
+    generate_notes,
     generate_sentences,
     get_llm_max_output_tokens,
+    notes_prompts,
     remark_prompts,
     remark_sentences,
     sentence_prompts,
@@ -155,16 +158,22 @@ class BackfillEstimate(NamedTuple):
     remark call for the affected card.
     """
 
-    notes: int
+    notes: int  # cards in the run, not context-notes calls
     translate_calls: int
     sentence_calls: int
     remark_calls: int
     input_tokens: int = 0
     output_ceiling: int = 0
+    context_notes_calls: int = 0
 
     @property
     def total(self) -> int:
-        return self.translate_calls + self.sentence_calls + self.remark_calls
+        return (
+            self.translate_calls
+            + self.sentence_calls
+            + self.remark_calls
+            + self.context_notes_calls
+        )
 
     def minutes_at_rpm(self, rpm: int) -> float:
         """Lower bound on wall-clock, given a requests-per-minute ceiling."""
@@ -185,10 +194,14 @@ def estimate_note_input_tokens(entry: AuditedNote, target_sentences: int) -> int
     fields = entry.note.fields
     headword = fields.get(resolved.headword, "")
 
-    translate, sentence, remark = estimate_note_calls(entry, target_sentences)
+    translate, sentence, remark, context_notes = estimate_note_calls(entry, target_sentences)
     tokens = 0
     if translate:
         tokens += translation_prompts(headword, lang).estimated_input_tokens()
+    if context_notes:
+        tokens += notes_prompts(
+            headword, lang, fields.get(resolved.english, "")
+        ).estimated_input_tokens()
 
     if sentence or remark:
         existing_html, _ = split_field(fields.get(resolved.sentence, ""))
@@ -207,8 +220,8 @@ def estimate_note_input_tokens(entry: AuditedNote, target_sentences: int) -> int
     return tokens
 
 
-def estimate_note_calls(entry: AuditedNote, target_sentences: int) -> tuple[int, int, int]:
-    """Return ``(translate, sentence, remark)`` call counts for one note.
+def estimate_note_calls(entry: AuditedNote, target_sentences: int) -> tuple[int, int, int, int]:
+    """Return ``(translate, sentence, remark, context_notes)`` counts for one note.
 
     Mirrors the branching in :func:`backfill_note`. The two are kept in step by
     a test that runs both over a corpus and asserts the counts match, so this
@@ -256,7 +269,12 @@ def estimate_note_calls(entry: AuditedNote, target_sentences: int) -> tuple[int,
         if any(not has_markers(s) and headword and headword not in s for s in sentences):
             remark = 1
 
-    return translate, sentence, remark
+    # Only a card with no sentence top-up pays for its notes — otherwise the
+    # top-up response carries them, and a blank `notes` in that response is
+    # taken as "nothing to add" rather than a reason to ask again.
+    context_notes = 1 if "missing_context_notes" in reason_codes and not sentence else 0
+
+    return translate, sentence, remark, context_notes
 
 
 def estimate_backfill(
@@ -264,16 +282,17 @@ def estimate_backfill(
     target_sentences: int,
 ) -> BackfillEstimate:
     """Project the LLM spend for backfilling ``entries``."""
-    translate = sentence = remark = 0
+    translate = sentence = remark = context_notes = 0
     input_tokens = 0
     for entry in entries:
-        t, s, r = estimate_note_calls(entry, target_sentences)
+        t, s, r, n = estimate_note_calls(entry, target_sentences)
         translate += t
         sentence += s
         remark += r
-        if t or s or r:
+        context_notes += n
+        if t or s or r or n:
             input_tokens += estimate_note_input_tokens(entry, target_sentences)
-    calls = translate + sentence + remark
+    calls = translate + sentence + remark + context_notes
     return BackfillEstimate(
         notes=len(entries),
         translate_calls=translate,
@@ -281,6 +300,7 @@ def estimate_backfill(
         remark_calls=remark,
         input_tokens=input_tokens,
         output_ceiling=calls * get_llm_max_output_tokens(),
+        context_notes_calls=context_notes,
     )
 
 
@@ -292,6 +312,7 @@ def format_estimate(estimate: BackfillEstimate, rpm: int) -> list[str]:
         f"   translations:     {estimate.translate_calls}",
         f"   sentence top-ups: {estimate.sentence_calls}",
         f"   keyword marking:  {estimate.remark_calls}",
+        f"   context notes:    {estimate.context_notes_calls}",
     ]
     if estimate.total:
         lines.append(
@@ -406,6 +427,14 @@ def backfill_note(
     # `too_few_sentences` and `keyword_not_highlighted` got its new sentences
     # marked but kept its old unmarked ones — and then passed every later audit.
     sentence_field = resolved.sentence
+    # `generate_sentences` returns context notes alongside the sentences, so a
+    # card that needs both is served by the one call. `sentence_call_made`
+    # records that the question was asked — a top-up that comes back with blank
+    # notes means the model had nothing to add, not that we should pay to ask
+    # again. Keeping it a separate flag (rather than testing the string) is also
+    # what lets `estimate_note_calls` predict this branch exactly.
+    harvested_notes = ""
+    sentence_call_made = False
     wants_sentences = bool(
         reason_codes
         & {
@@ -441,8 +470,13 @@ def backfill_note(
         if ("too_few_sentences" in reason_codes or rejected) and target_sentences > 0:
             needed = max(target_sentences - len(sentences), 0)
             if needed > 0:
+                sentence_call_made = True
                 try:
-                    sentences += list(generate_sentences(headword, lang, needed).sentences)
+                    topped_up = generate_sentences(headword, lang, needed)
+                    sentences += list(topped_up.sentences)
+                    # The same response carries context notes, so a card that
+                    # needs both gets its notes for nothing.
+                    harvested_notes = topped_up.notes
                 except Exception as exc:  # noqa: BLE001 — provider SDKs raise heterogeneous types
                     logger.warning(
                         "Sentence top-up failed for '%s' (%s); keeping %d existing sentence(s)",
@@ -482,6 +516,26 @@ def backfill_note(
 
         if sentences:
             _set(sentence_field, notes_html + format_sentence_list(sentences, headword))
+
+    # ----- Context notes ---------------------------------------------------
+    # Runs after the sentence pass so it reads back whatever that wrote (or the
+    # original field when no sentence rule fired) and re-prepends the block to
+    # it. Splitting again also drops the empty wrapper that flagged the card in
+    # the `empty notes block` case.
+    if "missing_context_notes" in reason_codes:
+        new_notes = harvested_notes
+        if not sentence_call_made:
+            try:
+                new_notes = generate_notes(headword, lang, fields.get(resolved.english, ""))
+            except Exception as exc:  # noqa: BLE001 — provider SDKs raise heterogeneous types
+                logger.warning("Context notes failed for '%s' (%s); leaving field", headword, exc)
+                new_notes = ""
+        # An empty result means the model had nothing to add. `_set` marks the
+        # field touched unconditionally, so writing it would rewrite the field
+        # to no effect and count the note as changed.
+        if new_notes:
+            sentences_html, _ = split_field(fields.get(sentence_field, ""))
+            _set(sentence_field, format_context_notes(new_notes) + sentences_html)
 
     # Headword sanity check — backfill must never overwrite it.
     fields[resolved.headword] = headword

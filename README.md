@@ -185,7 +185,9 @@ them apart from the sentences:
 ```
 
 Pass `--no-notes` to omit the block. The wrapper class is stable, so you can
-style it in your card template (e.g. smaller font, indented).
+style it in your card template (e.g. smaller font, indented). Cards that predate
+context notes can be topped up in place with
+[`audit --include-missing-notes`](#audit--backfill-fix-oldincomplete-vocab-cards-in-an-existing-deck).
 
 **Grammar output** (`outputs/ko/output_20260516_grammar.csv`):
 
@@ -552,8 +554,19 @@ Default paths mirror the rest of ankigen: the JSONL audit report lands in `input
 | `plain_text_sentences` | `Comment` non-empty but contains no `<span` tags (legacy) | `Sentence` non-empty but contains no `<span` tags |
 | `duplicate_sentences` | The same sentence appears twice (opt in via `--check-content`; free, no LLM call) | same |
 | `sentence_quality` | The LLM judge rejected one or more sentences (opt in via `--check-content`) | same |
+| `missing_context_notes` | `Comment` has no `<div class="ankigen-notes">` block, or one that is empty (opt in via `--include-missing-notes`) | same, on `Sentence` |
 
 All the sentence rules ignore the trailing context-notes block, so notes never inflate the sentence count or mask a legacy plain-text card.
+
+**Missing context notes (`--include-missing-notes`)**
+
+Cards generated before context notes existed have none, and neither do cards generated with `--no-notes`. Since ankigen can't tell those two apart, the sweep is opt-in rather than on by default.
+
+Detecting a missing block is free — it is just a `<div class="ankigen-notes">` wrapper. Fixing one is usually free too: `backfill` already calls the LLM for a sentence top-up, and that same response carries the notes, so a card flagged for both `too_few_sentences` and `missing_context_notes` costs exactly what the top-up cost. Only a card whose sentences are already fine pays for a call of its own. If the top-up comes back with empty notes, that is taken as "nothing useful to add" and no second call is made.
+
+An empty block counts as missing. `format_context_notes` returns nothing for blank input, so an empty wrapper can only come from a hand-edit, and it renders as a stray gray gap on the card.
+
+One deliberate gap: at `-n 0` a card whose sentence field is completely blank is skipped. Nothing will ever populate its sentences in that configuration, and notes on their own are a card shape `generate` never produces (it drops notes entirely when `-n 0`). At any `-n` above 0 those cards are flagged `too_few_sentences` anyway, so their notes arrive free with the top-up.
 
 `wrong_jyutping` is the one rule that authorizes overwriting a field you may have edited yourself, so it is deliberately narrow. It fires only on the two signatures of romanization produced before simplified input was converted: a reading shorter than the headword (`新鲜` → `san1`, truncated at the first character the dictionary missed), or a simplified headword whose stored reading disagrees with the corrected one (`什么` → `zaap6 jiu1`, a complete and valid reading of an entirely different word). A traditional or colloquial-Cantonese headword can't satisfy the second condition, so hand-edited readings on those cards are never touched. Reformatting alone is not a disagreement — the older concatenated `gwai1naap6` compares equal to `gwai1 naap6`.
 
@@ -587,6 +600,7 @@ The judge is biased toward passing: it is told to flag only clear, describable d
 | `plain_text_sentences` | `format_sentences` re-run over the existing text (no LLM) |
 | `duplicate_sentences` | The repeats are dropped and the card is topped back up to `-n` (first occurrence kept) |
 | `sentence_quality` | The rejected sentences are dropped and the card is topped back up to `-n` |
+| `missing_context_notes` | The notes returned by the sentence top-up are used when one ran (free); otherwise one LLM `generate_notes` call. An empty result leaves the field untouched |
 
 All the sentence rules run as a **single pass** over the field: sentences are recovered, rejected positions are dropped, the shortfall is requested in one `generate_sentences` call, and unmarked sentences are marked. So a card flagged for several sentence reasons at once still costs at most one top-up call plus one marking call — and, unlike the old per-rule branches, its pre-existing sentences can't be left behind unfixed.
 
@@ -621,10 +635,11 @@ A `Pinyin` field is deliberately **never** offered as a candidate for `jyutping_
 
 ```
 Notes to backfill:  120
-Projected LLM calls: 72
+Projected LLM calls: 80
    translations:     24
    sentence top-ups: 36
    keyword marking:  12
+   context notes:    8
 Input tokens: ~25,140 (output up to 294,912)
 Estimated cost: 0.0068 - 0.3312 at your configured rates
 At least 1.4 minutes at ANKIGEN_LLM_RATE_LIMIT_RPM=50
@@ -645,7 +660,7 @@ It prints however the command ends, so an interrupted run still tells you what i
 
 The call counts are **exact, not a guess**. Everything that decides whether a note reaches the LLM — its audit reasons, its current field contents, and the local Hanja resolver — is available without spending anything, so the projection walks the same branches `backfill` will. A test runs the estimator and the real code over a corpus covering every branch and asserts the call counts match, so the two can't drift apart. The one assumption is that generated sentences arrive carrying `**markers**` as the prompt requires; a model that ignores that adds one marking call for the affected card.
 
-**LLM call volume.** `--include-empty-hanja` issues ~1 LLM call per Hangul-only Korean note, `--check-content` issues ~1 per reviewed card *at audit time* (the only rule that costs anything before backfill), and `too_few_sentences` can also be call-heavy on large decks. Both `audit` and `backfill` pace themselves against:
+**LLM call volume.** `--include-empty-hanja` issues ~1 LLM call per Hangul-only Korean note, `--check-content` issues ~1 per reviewed card *at audit time* (the only rule that costs anything before backfill), `--include-missing-notes` issues ~1 per flagged card that isn't already getting a sentence top-up, and `too_few_sentences` can also be call-heavy on large decks. Both `audit` and `backfill` pace themselves against:
 
 | Env var | Default | Meaning |
 |---|---|---|
