@@ -503,6 +503,46 @@ class TestBackfillNoteChinese:
         assert out["Jyutping"] == "jyut(促使)"
         translate.assert_not_called()
 
+    def test_wrong_jyutping_overwrites_existing_value(self, mocker):
+        translate = mocker.patch("ankigen.backfill.translate_word")
+        note = _zh_note(hanzi="新鲜", jyutping="san1", english="fresh", sentence="x")
+        out, touched = backfill_note(
+            _entry(note, lang="zh", reasons=[("wrong_jyutping", "san1 -> san1 sin1")]),
+            target_sentences=1,
+            jyutping_resolver=lambda _: "san1 sin1",
+        )
+        assert out["Jyutping"] == "san1 sin1"
+        assert "Jyutping" in touched
+        translate.assert_not_called()
+
+    def test_headword_html_is_stripped_before_lookup(self):
+        seen: list[str] = []
+
+        def _record(word: str) -> str:
+            seen.append(word)
+            return "cuk1 si2"
+
+        note = _zh_note(hanzi="<b>促使</b>", jyutping="", english="urge", sentence="x")
+        out, _ = backfill_note(
+            _entry(note, lang="zh", reasons=[("missing_jyutping", "")]),
+            target_sentences=1,
+            jyutping_resolver=_record,
+        )
+        assert seen == ["促使"]
+        assert out["Jyutping"] == "cuk1 si2"
+
+    def test_unresolvable_word_leaves_the_field_untouched(self):
+        # Writing "" would blank a populated column and count as a change —
+        # the opposite of the repair the flag asked for.
+        note = _zh_note(hanzi="新鲜", jyutping="san1", english="fresh", sentence="x")
+        out, touched = backfill_note(
+            _entry(note, lang="zh", reasons=[("wrong_jyutping", "")]),
+            target_sentences=1,
+            jyutping_resolver=lambda _: "",
+        )
+        assert out["Jyutping"] == "san1"
+        assert "Jyutping" not in touched
+
     def test_empty_english_chinese(self, mocker):
         translate = mocker.patch(
             "ankigen.backfill.translate_word",

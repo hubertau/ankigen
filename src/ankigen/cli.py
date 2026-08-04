@@ -20,13 +20,6 @@ Usage:
     ankigen status  # Show configuration and health check
 """
 
-# Suppress pkg_resources deprecation warning from wordseg (pycantonese dependency).
-# This MUST happen before any imports that trigger pycantonese loading.
-# ruff: noqa: E402 (imports below are intentionally after the warning filter)
-import warnings
-
-warnings.filterwarnings("ignore", message="pkg_resources is deprecated")
-
 import argparse
 import csv
 import logging
@@ -74,6 +67,7 @@ from ankigen.grammar import (
     write_grammar_jsonl,
 )
 from ankigen.hanja_lookup import resolve_hanja
+from ankigen.jyutping import get_jyutping
 from ankigen.llm import (
     Language,
     format_usage,
@@ -96,27 +90,6 @@ logger = logging.getLogger("ankigen.cli")
 
 # Languages shown in `status` (typed for mypy vs get_anki_deck_name / get_anki_field)
 _STATUS_LANG_CODES: tuple[Language, Language] = ("zh", "ko")
-
-
-def get_jyutping(word: str) -> str:
-    """
-    Get Jyutping (Cantonese romanization) for a Chinese word.
-
-    Returns empty string if pycantonese is not available or word not found.
-    """
-    try:
-        import pycantonese
-    except ImportError:
-        return ""
-
-    try:
-        # Convert characters to Jyutping
-        result = pycantonese.characters_to_jyutping(word)
-        # Result is a list of (character, jyutping) tuples
-        jyutping_parts = [jp for _, jp in result if jp]
-        return " ".join(jyutping_parts) if jyutping_parts else ""
-    except Exception:
-        return ""
 
 
 def get_pinyin(word: str) -> str:

@@ -43,7 +43,6 @@ import logging
 import os
 import re
 from collections.abc import Callable
-from functools import cache
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
@@ -55,8 +54,15 @@ from ankigen.content import (
     parse_indices,
     review_note_sentences,
 )
-from ankigen.formatter import BR_SPLIT_RE, has_keyword_highlight, split_field
+from ankigen.formatter import BR_SPLIT_RE, has_keyword_highlight, split_field, strip_html
 from ankigen.hanja_lookup import extract_hanja_chars
+from ankigen.jyutping import (
+    contains_simplified,
+    count_cjk,
+    count_syllables,
+    get_jyutping,
+    jyutping_available,
+)
 from ankigen.llm import Language
 
 logger = logging.getLogger("ankigen.audit")
@@ -106,7 +112,7 @@ _VALID_OVERRIDE_ROLES: frozenset[str] = frozenset(
 _FIELD_CANDIDATES: dict[str, tuple[str, ...]] = {
     "headword_field": ("korean", "hanzi", "word", "chinese", "headword"),
     "hanja_field": ("hanja", "hanzi"),
-    "jyutping_field": ("jyutping", "pinyin", "romanization", "reading"),
+    "jyutping_field": ("jyutping", "romanization", "reading"),
     "english_field": ("english", "translation", "meaning", "def", "definition"),
     "sentence_field": (
         "comment",
@@ -117,6 +123,30 @@ _FIELD_CANDIDATES: dict[str, tuple[str, ...]] = {
         "example",
         "notes",
         "note",
+    ),
+}
+
+
+class _WrongSystem(NamedTuple):
+    """A field name that fits a role's *shape* but not its content."""
+
+    needles: tuple[str, ...]
+    explanation: str
+
+
+# Field names deliberately kept out of _FIELD_CANDIDATES because suggesting
+# them would be actively harmful, not merely unhelpful. They still get named
+# in the warning: to a user looking at a note type with a `Pinyin` field and
+# no `Jyutping` field, Pinyin is the obvious answer, and silently withholding
+# it just produces a "???" snippet with no explanation of what went wrong.
+_WRONG_SYSTEM_CANDIDATES: dict[str, _WrongSystem] = {
+    "jyutping_field": _WrongSystem(
+        needles=("pinyin",),
+        explanation=(
+            "that column holds Mandarin Pinyin, whereas this role is filled with "
+            "Cantonese Jyutping from pycantonese, so backfill would overwrite your "
+            "Pinyin with the wrong romanisation system"
+        ),
     ),
 }
 
@@ -204,6 +234,11 @@ def _suggest_candidates(role: str, field_order: list[str]) -> list[str]:
     needles = _FIELD_CANDIDATES.get(role, ())
     if not needles:
         return []
+    return _match_needles(needles, field_order)
+
+
+def _match_needles(needles: tuple[str, ...], field_order: list[str]) -> list[str]:
+    """Field names containing any of ``needles``, case-insensitive, in order."""
     lowered = [(f, f.lower()) for f in field_order]
     matches: list[str] = []
     for needle in needles:
@@ -211,6 +246,19 @@ def _suggest_candidates(role: str, field_order: list[str]) -> list[str]:
             if needle in low and orig not in matches:
                 matches.append(orig)
     return matches
+
+
+def _wrong_system_candidates(role: str, field_order: list[str]) -> tuple[list[str], str]:
+    """Return fields that fit ``role``'s shape but hold the wrong content.
+
+    Returns ``([], "")`` when the role has no such trap or the note has no
+    matching field.
+    """
+    trap = _WRONG_SYSTEM_CANDIDATES.get(role)
+    if trap is None:
+        return [], ""
+    matches = _match_needles(trap.needles, field_order)
+    return (matches, trap.explanation) if matches else ([], "")
 
 
 def resolve_fields_for_note(
@@ -276,6 +324,7 @@ def resolve_fields_for_note(
                 continue
             warned.add(cache_key)
             suggestions = _suggest_candidates(role, note.field_order)
+            mismatched, why_not = _wrong_system_candidates(role, note.field_order)
             snippet = _build_override_snippet(note.model_name, lang, resolved, role, suggestions)
             if suggestions:
                 logger.warning(
@@ -285,6 +334,20 @@ def resolve_fields_for_note(
                     role,
                     expected,
                     " or ".join(repr(s) for s in suggestions),
+                    snippet,
+                )
+            elif mismatched:
+                logger.warning(
+                    "Skipping note type %r: %s=%r is not a field on this note. "
+                    "%s is NOT a substitute — %s. Add a %r field to the note type "
+                    "instead; override only if you really want that column "
+                    "overwritten:\n%s",
+                    note.model_name,
+                    role,
+                    expected,
+                    " and ".join(repr(m) for m in mismatched),
+                    why_not,
+                    expected,
                     snippet,
                 )
             else:
@@ -335,6 +398,7 @@ ReasonCode = Literal[
     "missing_hanja_for_sino",
     "empty_hanja_optional",
     "missing_jyutping",
+    "wrong_jyutping",
     "empty_english",
     "too_few_sentences",
     "keyword_not_highlighted",
@@ -514,12 +578,70 @@ def _rule_zh_missing_jyutping(
     """
     if note.fields.get(resolved.secondary, "").strip():
         return None
-    hanzi = note.fields.get(resolved.headword, "")
+    hanzi = strip_html(note.fields.get(resolved.headword, ""))
     if not hanzi:
         return None
-    if not jyutping_resolver(hanzi).strip():
+    reading = jyutping_resolver(hanzi).strip()
+    if not reading:
         return None
-    return AuditReason("missing_jyutping", "pycantonese can resolve")
+    # The reading goes in `detail` so the audit report shows what backfill is
+    # about to write, rather than making the user run backfill to find out.
+    return AuditReason("missing_jyutping", reading)
+
+
+def _rule_zh_wrong_jyutping(
+    note: AnkiNote,
+    *,
+    resolved: ResolvedFields,
+    jyutping_resolver: Callable[[str], str],
+) -> AuditReason | None:
+    """Flag a *populated* Jyutping column that the resolver contradicts.
+
+    This rule authorises backfill to overwrite a field the user may have
+    edited by hand, so it only fires on the two signatures of the old
+    lookup-without-converting path — never on a merely stylistic difference:
+
+    (a) **Syllable-count mismatch.** Cantonese is one syllable per character,
+        so a reading with fewer syllables than the headword has characters is
+        truncated, full stop. This is what the old code produced whenever it
+        dropped an unresolvable segment: ``新鲜`` → ``san1``.
+
+    (b) **Simplified headword, different reading.** The headword contains a
+        character that simplified→traditional conversion rewrites, and the
+        stored reading disagrees with the corrected one. That combination can
+        only come from looking the simplified form up directly, which is how
+        ``什么`` ended up as ``zaap6 jiu1`` — right syllable count, valid
+        Jyutping, wrong word. A traditional or Cantonese-only headword never
+        satisfies this, so hand-edited readings on those cards are safe.
+    """
+    stored = note.fields.get(resolved.secondary, "").strip()
+    if not stored:
+        return None  # blank is `missing_jyutping`'s job
+    hanzi = strip_html(note.fields.get(resolved.headword, ""))
+    if not hanzi:
+        return None
+    reading = jyutping_resolver(hanzi).strip()
+    if not reading:
+        # Nothing better to offer — leave whatever the user has in place.
+        return None
+
+    stored_text = strip_html(stored)
+    if count_syllables(stored_text) != count_cjk(hanzi):
+        return AuditReason("wrong_jyutping", f"{stored_text} -> {reading}")
+    if contains_simplified(hanzi) and _normalize_reading(stored_text) != _normalize_reading(
+        reading
+    ):
+        return AuditReason("wrong_jyutping", f"{stored_text} -> {reading}")
+    return None
+
+
+def _normalize_reading(text: str) -> str:
+    """Collapse a Jyutping string to its syllables for comparison.
+
+    Ignores case and spacing so the historical concatenated format
+    (``cuk1si2``) doesn't read as a disagreement with ``cuk1 si2``.
+    """
+    return " ".join(re.findall(r"[a-z]+[1-6]", text.lower()))
 
 
 # ---------------------------------------------------------------------------
@@ -655,16 +777,6 @@ def _rule_plain_text_sentences(note: AnkiNote, *, resolved: ResolvedFields) -> A
 # ---------------------------------------------------------------------------
 
 
-@cache
-def _get_default_jyutping_fn() -> Callable[[str], str]:
-    # Imported lazily to avoid a circular import (cli imports audit at
-    # module level; audit must not import cli at module level in return).
-    # lru_cache ensures the import only runs once.
-    from ankigen.cli import get_jyutping
-
-    return get_jyutping
-
-
 def audit_notes(
     notes: list[AnkiNote],
     *,
@@ -688,10 +800,9 @@ def audit_notes(
         include_empty_hanja: When True, also flag every Hangul-only Korean
             word with a blank Hanja column (the "wide sweep"). Off by
             default because it costs ~1 LLM call per note in backfill.
-        jyutping_resolver: Callable used by ``missing_jyutping`` to check
-            whether pycantonese can produce a romanisation for a Hanzi.
-            Injected for testability; defaults to
-            :func:`ankigen.cli.get_jyutping` when omitted.
+        jyutping_resolver: Callable used by ``missing_jyutping`` and
+            ``wrong_jyutping`` to romanise a Hanzi. Injected for testability;
+            defaults to :func:`ankigen.jyutping.get_jyutping` when omitted.
         overrides: Override mapping (see
             :func:`get_note_type_overrides`). Omit to read from the
             ``ANKIGEN_NOTE_TYPE_OVERRIDES`` env var.
@@ -710,7 +821,15 @@ def audit_notes(
     is about to change.
     """
     if jyutping_resolver is None:
-        jyutping_resolver = _get_default_jyutping_fn()
+        jyutping_resolver = get_jyutping
+        if not jyutping_available():
+            # Without this the Jyutping rules see "" for every note, read it as
+            # "no such word", and report a clean bill of health for a deck they
+            # never actually checked.
+            logger.warning(
+                "pycantonese could not be loaded — Jyutping checks are disabled "
+                "for this run. Reinstall dependencies with `uv sync`."
+            )
 
     if overrides is None:
         overrides = get_note_type_overrides()
@@ -755,11 +874,10 @@ def audit_notes(
                 if reason is not None:
                     reasons.append(reason)
         else:  # lang == "zh"
-            reason = _rule_zh_missing_jyutping(
-                note, resolved=resolved, jyutping_resolver=jyutping_resolver
-            )
-            if reason is not None:
-                reasons.append(reason)
+            for zh_rule in (_rule_zh_missing_jyutping, _rule_zh_wrong_jyutping):
+                reason = zh_rule(note, resolved=resolved, jyutping_resolver=jyutping_resolver)
+                if reason is not None:
+                    reasons.append(reason)
             reason = _rule_empty_english(note, resolved=resolved)
             if reason is not None:
                 reasons.append(reason)

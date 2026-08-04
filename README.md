@@ -1,5 +1,7 @@
 # ankigen
 
+[![CI](https://github.com/hubertau/ankigen/actions/workflows/ci.yml/badge.svg)](https://github.com/hubertau/ankigen/actions/workflows/ci.yml)
+
 Generate Anki vocabulary **and grammar** CSVs with LLM-powered example sentences and translations.
 
 ## Features
@@ -146,10 +148,18 @@ ankigen generate inputs/zh/words.txt
 
 | Hanzi | Pinyin | Jyutping | English | Sentence |
 |-------|--------|----------|---------|----------|
-| 促使 | cùshǐ | cuk1sai2 | Verb: to urge, to spur | (HTML formatted sentences) |
+| 促使 | cùshǐ | cuk1 si2 | Verb: to urge, to spur | (HTML formatted sentences) |
 
 The Pinyin column carries tone-marked Mandarin romanization (via `pypinyin`).
 Add a matching `Pinyin` field to your Chinese note type before importing.
+
+The Jyutping column carries Cantonese romanization as space-separated syllables
+with tone numbers (via `pycantonese`). Because pycantonese's dictionary is
+traditional-only, simplified input is converted to traditional before the lookup
+— the `Hanzi` column keeps whatever script you wrote. When a word can't be fully
+resolved the column is left **blank** rather than filled with a partial reading:
+a truncated romanization looks complete on a card, and there is no way to tell
+from the outside which syllables are missing.
 
 **Vocab output (Korean)** (`outputs/ko/output_words.csv`):
 
@@ -535,6 +545,7 @@ Default paths mirror the rest of ankigen: the JSONL audit report lands in `input
 | `missing_hanja_for_sino` | `Hanja` blank AND `Korean` contains embedded Hanja OR a `한글(漢字)` annotation | — |
 | `empty_hanja_optional` | `Hanja` blank on a Hangul-only word (opt in via `--include-empty-hanja`) | — |
 | `missing_jyutping` | — | `Jyutping` blank AND pycantonese can resolve `Hanzi` |
+| `wrong_jyutping` | — | `Jyutping` non-empty but contradicted by the resolver — either it has fewer syllables than `Hanzi` has characters, or `Hanzi` is simplified and the stored reading disagrees with the corrected one |
 | `empty_english` | `English` blank | `English` blank |
 | `too_few_sentences` | `Comment` has fewer than `-n` sentence blocks | `Sentence` has fewer than `-n` blocks |
 | `keyword_not_highlighted` | `Comment` non-empty, formatted with spans, but no red `<span>` related to `Korean` (conjugated/particled forms count as related) | `Sentence` non-empty but no red `<span>` matches `Hanzi` |
@@ -543,6 +554,8 @@ Default paths mirror the rest of ankigen: the JSONL audit report lands in `input
 | `sentence_quality` | The LLM judge rejected one or more sentences (opt in via `--check-content`) | same |
 
 All the sentence rules ignore the trailing context-notes block, so notes never inflate the sentence count or mask a legacy plain-text card.
+
+`wrong_jyutping` is the one rule that authorizes overwriting a field you may have edited yourself, so it is deliberately narrow. It fires only on the two signatures of romanization produced before simplified input was converted: a reading shorter than the headword (`新鲜` → `san1`, truncated at the first character the dictionary missed), or a simplified headword whose stored reading disagrees with the corrected one (`什么` → `zaap6 jiu1`, a complete and valid reading of an entirely different word). A traditional or colloquial-Cantonese headword can't satisfy the second condition, so hand-edited readings on those cards are never touched. Reformatting alone is not a disagreement — the older concatenated `gwai1naap6` compares equal to `gwai1 naap6`.
 
 **Content review (`--check-content`)**
 
@@ -567,6 +580,7 @@ The judge is biased toward passing: it is told to flag only clear, describable d
 | `missing_hanja_for_sino` | Local Hanja resolver (no LLM); falls back to LLM if local returns blank |
 | `empty_hanja_optional` | LLM `translate_word` (coalesced with `empty_english` when both fire — one call) |
 | `missing_jyutping` | `pycantonese` (no LLM) |
+| `wrong_jyutping` | `pycantonese` (no LLM); the existing value is overwritten, and left alone if the resolver has nothing better to offer |
 | `empty_english` | LLM `translate_word` |
 | `too_few_sentences` | Existing sentences are preserved; LLM `generate_sentences` is asked for the shortfall only, then `format_sentences` re-renders the whole field |
 | `keyword_not_highlighted` | Preserve existing red spans as `**markers**` and re-run `format_sentences` (no LLM); if there are no red spans, LLM `remark_sentences` then `format_sentences` |
@@ -596,6 +610,8 @@ export ANKIGEN_NOTE_TYPE_OVERRIDES='{
 You only need to list the roles that differ from the defaults — unspecified roles fall back to the language default. Valid role keys are `headword_field`, `hanja_field` (Korean) / `jyutping_field` (Chinese), `english_field`, and `sentence_field`. Run `ankigen status` to confirm your overrides parsed correctly.
 
 When a note type has neither a recognised default schema nor a matching override, the entire note type is **skipped with a `WARNING`** at audit time (so it never silently slips through to backfill). The warning lists the missing field, any plausible candidate it spotted on the note (e.g. it would flag `Comments` as a likely match for `sentence_field`), and prints a ready-to-paste `ANKIGEN_NOTE_TYPE_OVERRIDES=...` snippet.
+
+A `Pinyin` field is deliberately **never** offered as a candidate for `jyutping_field`. The two are different romanization systems, and since the snippet is meant to be pasted as-is, suggesting it would hand you an override that makes backfill overwrite your Mandarin readings with Cantonese ones. A note type with a `Pinyin` column but no `Jyutping` column gets a warning saying so, and the snippet leaves `"jyutping_field": "???"` for you to fill in. Setting it to `Pinyin` yourself still works — the guard shapes the suggestion, it doesn't overrule you.
 
 **Backfill progress logs.** During backfill, each note is logged at `INFO` as `[N/total] guid=… model=… reasons=[…] → touched=[…]` so you can follow long runs without `-v`. The `INFO` line `Note-type override active for 'Model name': sentence_field='Comments'` confirms an override was applied.
 
@@ -782,10 +798,9 @@ uv run pre-commit install
 ```bash
 # Run all tests
 uv run pytest
-
-# Run with coverage
-uv run pytest --cov=ankigen
 ```
+
+The suite is fully mocked — no LLM API key or network access is needed. `pytest-cov` is not a dev dependency, so `--cov` will fail; add it first if you want coverage.
 
 ### Code Quality
 
@@ -797,6 +812,12 @@ uv run ruff format src/ tests/
 # Type checking
 uv run mypy src/
 ```
+
+### CI
+
+`.github/workflows/ci.yml` runs the same commands on every pull request and on pushes to `master`: `uv sync --locked`, `ruff check`, `ruff format --check`, `mypy src/`, `pytest`, and the non-ruff/mypy `pre-commit` hooks (trailing whitespace, end-of-file, YAML, large files).
+
+Two differences from local use. CI reports rather than rewrites, so it runs `ruff check` without `--fix`. And `uv sync --locked` fails outright if `uv.lock` has drifted from `pyproject.toml` — if that step goes red, run `uv sync` locally and commit the updated lockfile.
 
 ## Project Structure
 
