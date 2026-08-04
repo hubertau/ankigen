@@ -18,6 +18,7 @@ from ankigen.llm import (
 from ankigen.models import (
     ContentReviewResponse,
     KoreanTranslationResponse,
+    NotesResponse,
     SentenceVerdict,
     TranslationResponse,
     create_sentence_response,
@@ -661,6 +662,15 @@ class TestPromptSpecsMatchWhatIsSent:
         spec = llm.sentence_prompts("음식", "ko", 3)
         assert self._sent(mock) == (spec.system, spec.user)
 
+    def test_generate_notes_sends_the_spec(self, mocker):
+        mock = mocker.patch(
+            "ankigen.llm.generate_structured_response",
+            return_value=NotesResponse(notes="Compare 음식 with 요리."),
+        )
+        llm.generate_notes("음식", lang="ko", english="Noun: food")
+        spec = llm.notes_prompts("음식", "ko", "Noun: food")
+        assert self._sent(mock) == (spec.system, spec.user)
+
     def test_remark_sentences_sends_the_spec(self, mocker):
         sents = ["첫째 문장.", "둘째 문장."]
         SentenceResponse = create_sentence_response(2, with_notes=False)
@@ -687,6 +697,74 @@ class TestPromptSpecsMatchWhatIsSent:
         short = llm.translation_prompts("음식", "ko").estimated_input_tokens()
         long = llm.sentence_prompts("음식", "ko", 3).estimated_input_tokens()
         assert 0 < short < long  # the sentence prompt carries the notes spec
+
+
+class TestNotesPrompt:
+    """The notes spec is shared by the sentence call and the notes-only call."""
+
+    # The sentence prompt as it read before the notes spec was factored out of
+    # it. Pinned verbatim: `generate` sends this on every card, and the split
+    # was meant to add a second caller, not to reword the existing one.
+    _KO_SENTENCE_PROMPT_BEFORE_SPLIT = (
+        "Generate exactly 3 natural example sentences in Korean using "
+        "the word '음식'. The sentences should demonstrate different usages and "
+        "contexts of the word. Wrap the word's form as it naturally appears in the "
+        "sentence (conjugated or with particles) in double asterisks, "
+        "e.g. **먹었어요** for 먹다 or **음식을** for 음식. "
+        "Return the sentences in the `sentences` field, with no translations or "
+        "explanations inside them.\n\n"
+        "Also return a `notes` field with supplementary usage notes for '음식'. "
+        "The learner is upper-intermediate to advanced (TOPIK II, evidential "
+        "endings, reported speech, formal register). Skip basic grammar and any "
+        "section with nothing useful to say.\n\n"
+        "1. NEAR-SYNONYMS — words a learner would wrongly substitute; the "
+        "dividing line; a minimal pair where the swap changes meaning.\n"
+        "2. REGISTER — spoken vs written, formal vs casual; where it sounds "
+        "stiff or rude.\n"
+        "3. COLLOCATIONS — 2–4 attested partner words you are confident in.\n"
+        "4. PARTICLES / VALENCY — particles it takes; transitive or "
+        "intransitive; active/passive or causative counterpart if any.\n"
+        "5. IRREGULARITIES — irregular conjugation, spacing, homographs, "
+        "spelling traps.\n"
+        "6. HANJA — characters plus 2–3 common words sharing them; skip if "
+        "native Korean.\n"
+        "7. LEARNER ERROR — the single most likely mistake, as ✗ / ✓.\n\n"
+        "RULES\n"
+        "- Do not repeat or rephrase the `sentences` you just generated.\n"
+        "- Write in English; cite Korean in Hangul. No romanization.\n"
+        "- No filler; if unsure about a collocation or nuance, say so instead "
+        "of inventing.\n"
+        "- Under 150 words; plain text, one line per point, category in caps.\n"
+        "- Return an empty string if there is genuinely nothing useful to add."
+    )
+
+    def test_sentence_prompt_is_unchanged_by_the_split(self):
+        assert llm.sentence_prompts("음식", "ko", 3).user == self._KO_SENTENCE_PROMPT_BEFORE_SPLIT
+
+    @pytest.mark.parametrize("lang,word", [("ko", "음식"), ("zh", "促使")])
+    def test_notes_only_prompt_carries_the_same_spec(self, lang, word):
+        sentence_user = llm.sentence_prompts(word, lang, 3).user
+        notes_user = llm.notes_prompts(word, lang).user
+        # Everything from the `notes` lead-in onward is shared, apart from the
+        # one rule that only applies when sentences were generated too.
+        rule = llm.LANGUAGE_CONFIG[lang]["notes_sentence_rule"]
+        shared = sentence_user[sentence_user.index("a `notes` field") :].replace(rule, "")
+        assert shared in notes_user
+
+    def test_notes_only_prompt_drops_the_sentence_rule(self):
+        # The rule refers to sentences generated in the same call; a notes-only
+        # request never generates any.
+        assert "you just generated" in llm.sentence_prompts("음식", "ko", 3).user
+        assert "you just generated" not in llm.notes_prompts("음식", "ko").user
+
+    def test_notes_only_prompt_says_not_to_write_sentences(self):
+        assert "No example sentences" in llm.notes_prompts("음식", "ko").user
+
+    def test_gloss_is_included_when_given(self):
+        assert "Noun: food" in llm.notes_prompts("음식", "ko", "Noun: food").user
+
+    def test_gloss_omitted_when_blank(self):
+        assert "English gloss" not in llm.notes_prompts("음식", "ko", "   ").user
 
 
 class TestUsageAccounting:

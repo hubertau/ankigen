@@ -4,6 +4,17 @@ from functools import cache
 
 from pydantic import BaseModel, Field
 
+# Shared by the sentence-plus-notes response and the notes-only response, so a
+# card gets the same notes whether they arrived with generated sentences or
+# were backfilled on their own.
+_NOTES_FIELD_DESCRIPTION = (
+    "Short English usage notes for the target word: closest "
+    "similar or easily-confused words and how they differ, the "
+    "register the word belongs to (written vs spoken, formal vs "
+    "casual), and any collocation quirk worth remembering. "
+    "Return an empty string when there is nothing useful to add."
+)
+
 
 @cache
 def create_sentence_response(
@@ -41,18 +52,26 @@ def create_sentence_response(
         )
         notes: str = Field(
             default="",
-            description=(
-                "Short English usage notes for the target word: closest "
-                "similar or easily-confused words and how they differ, the "
-                "register the word belongs to (written vs spoken, formal vs "
-                "casual), and any collocation quirk worth remembering. "
-                "Return an empty string when there is nothing useful to add."
-            ),
+            description=_NOTES_FIELD_DESCRIPTION,
         )
 
     SentenceResponseWithNotes.__name__ = "SentenceResponse"
     SentenceResponseWithNotes.__qualname__ = "SentenceResponse"
     return SentenceResponseWithNotes
+
+
+class NotesResponse(BaseModel):
+    """Response model for generating learner context notes on their own.
+
+    Used when a card's example sentences are already fine and only the
+    context-notes block is missing, so there is no sentence generation to
+    carry the notes back for free.
+    """
+
+    notes: str = Field(
+        default="",
+        description=_NOTES_FIELD_DESCRIPTION,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -949,12 +949,14 @@ def cmd_audit(args: argparse.Namespace) -> None:
     db_path, deck_name = resolved
 
     logger.info(
-        "Auditing Anki deck '%s' from %s (lang=%s, target_sentences=%d, include_empty_hanja=%s)",
+        "Auditing Anki deck '%s' from %s (lang=%s, target_sentences=%d, "
+        "include_empty_hanja=%s, include_missing_notes=%s)",
         deck_name,
         db_path,
         args.lang,
         args.sentences,
         args.include_empty_hanja,
+        args.include_missing_notes,
     )
     notes = load_anki_notes(db_path, deck_name)
     if not notes:
@@ -969,6 +971,7 @@ def cmd_audit(args: argparse.Namespace) -> None:
         notes,
         target_sentences=args.sentences,
         include_empty_hanja=args.include_empty_hanja,
+        include_missing_notes=args.include_missing_notes,
         check_content=args.check_content,
     )
 
@@ -1495,6 +1498,17 @@ def main() -> None:
             "Also flag every Hangul-only Korean word with a blank Hanja column "
             "(wide sweep). Costs ~1 LLM call per Hangul-only note in backfill — "
             "paced by ANKIGEN_LLM_RATE_LIMIT_RPM (default 50). Korean only."
+        ),
+    )
+    audit_parser.add_argument(
+        "--include-missing-notes",
+        action="store_true",
+        help=(
+            "Also flag cards whose sentence field has no context-notes block. "
+            "Free to detect; in backfill it is free for cards already getting a "
+            "sentence top-up (the notes come back in the same response) and "
+            "costs ~1 LLM call for the rest. Off by default — a deck built with "
+            "`generate --no-notes` has none on purpose."
         ),
     )
     audit_parser.add_argument(

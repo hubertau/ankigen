@@ -405,6 +405,7 @@ ReasonCode = Literal[
     "plain_text_sentences",
     "duplicate_sentences",
     "sentence_quality",
+    "missing_context_notes",
 ]
 
 # Reason codes whose ``detail`` is a 1-based list of sentence positions to
@@ -757,6 +758,40 @@ def _rule_sentence_quality(
     return AuditReason("sentence_quality", encode_indices(bad))
 
 
+def _rule_missing_context_notes(
+    note: AnkiNote, *, resolved: ResolvedFields, target: int
+) -> AuditReason | None:
+    """Flag a sentence field with no learner context-notes block.
+
+    Off by default — opt in via ``include_missing_notes``. Detection is free
+    (the block is just a ``<div class="ankigen-notes">`` wrapper), but fixing
+    one costs an LLM call in backfill unless the card is already having its
+    sentences regenerated, and a deck built with ``generate --no-notes`` has
+    no notes on purpose. So the sweep stays opt-in.
+
+    A field holding an empty wrapper counts as missing:
+    :func:`~ankigen.formatter.format_context_notes` returns ``""`` for blank
+    input, so an empty block can only come from a hand-edit, and it renders as
+    a stray gray nothing on the card.
+
+    Cards with no sentences at all are skipped when ``target`` is 0. Nothing
+    will ever populate their sentences in that configuration, and backfilling
+    notes alone would leave a field holding usage notes and no examples —
+    a shape ``ankigen generate`` never produces (it drops notes entirely when
+    ``-n 0``). At any ``target`` above 0 those cards are flagged
+    ``too_few_sentences`` too, so the notes ride along with the top-up.
+    """
+    field_html = note.fields.get(resolved.sentence, "")
+    sentences_html, notes_html = split_field(field_html)
+    if target <= 0 and not sentences_html.strip():
+        return None
+    if not notes_html:
+        return AuditReason("missing_context_notes", "no notes block")
+    if not strip_html(notes_html):
+        return AuditReason("missing_context_notes", "empty notes block")
+    return None
+
+
 def _rule_plain_text_sentences(note: AnkiNote, *, resolved: ResolvedFields) -> AuditReason | None:
     """Flag a non-empty sentence field with no ``<span`` tags at all.
 
@@ -782,6 +817,7 @@ def audit_notes(
     *,
     target_sentences: int = 3,
     include_empty_hanja: bool = False,
+    include_missing_notes: bool = False,
     jyutping_resolver: Callable[[str], str] | None = None,
     overrides: dict[str, dict[str, str]] | None = None,
     check_content: bool = False,
@@ -800,6 +836,11 @@ def audit_notes(
         include_empty_hanja: When True, also flag every Hangul-only Korean
             word with a blank Hanja column (the "wide sweep"). Off by
             default because it costs ~1 LLM call per note in backfill.
+        include_missing_notes: When True, also flag every card whose sentence
+            field carries no context-notes block. Free to detect; costs an
+            LLM call in backfill only for cards that aren't already having
+            their sentences regenerated. Off by default because a deck built
+            with ``generate --no-notes`` is missing them deliberately.
         jyutping_resolver: Callable used by ``missing_jyutping`` and
             ``wrong_jyutping`` to romanise a Hanzi. Injected for testability;
             defaults to :func:`ankigen.jyutping.get_jyutping` when omitted.
@@ -891,6 +932,10 @@ def audit_notes(
         reason = _rule_plain_text_sentences(note, resolved=resolved)
         if reason is not None:
             reasons.append(reason)
+        if include_missing_notes:
+            reason = _rule_missing_context_notes(note, resolved=resolved, target=target_sentences)
+            if reason is not None:
+                reasons.append(reason)
 
         if check_content:
             structural = {r.code for r in reasons} & {
