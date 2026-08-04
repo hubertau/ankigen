@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -571,6 +573,82 @@ def _read_tsv(path: Path) -> tuple[list[str], list[list[str]]]:
     data_lines = [ln for ln in lines if ln and not ln.startswith("#")]
     rows = [ln.split("\t") for ln in data_lines]
     return header_lines, rows
+
+
+def _tags(html: str) -> Counter[str]:
+    """Multiset of HTML tags in ``html``, normalised for case and self-closing.
+
+    Comparing these before and after the writer is what catches a sanitiser
+    that reinterprets content as markup rather than merely escaping it.
+    """
+    return Counter(re.sub(r"\s*/?>$", ">", t.lower()) for t in re.findall(r"<[^>]+>", html))
+
+
+# Field values a real collection actually holds. Several are taken verbatim in
+# shape from a 1856-note deck: pretty-printed add-on output, hand-edited glosses
+# with a trailing newline after a <br>, and ankigen's own generated HTML.
+_FIELD_CORPUS = [
+    "",
+    "plain gloss, no markup",
+    "sluggish, stalled, held up<br>\nThe most formal of these in everyday speech.",
+    "\n    unknown_morphs_amount_score: 0, <br>\n    all_morphs_total_priority_score: 18959, <br>\n",
+    "<div><div><strong>精心</strong> vs <em>细致</em></div></div><div><h3>Explanations</h3></div>",
+    '<span style="color: blue;">他 <span style="color: red;">促使</span> 我。</span><br>',
+    "line one\nline two\nline three",
+    "tabbed\tvalue\twith\tcolumns",
+    "windows\r\nline\r\nendings",
+    "already escaped &#10; and &#9; entities",
+    "<br><br>deliberate blank line above",
+]
+
+
+class TestWriterPreservesUntouchedFields:
+    """The writer must not alter fields backfill did not regenerate.
+
+    `_write_backfilled_row` runs `_sanitize_for_tsv` over *every* column, so a
+    change to that function reaches fields ankigen does not own — on one real
+    collection the worst-hit field belonged to the AnkiMorphs add-on. These are
+    the guard rails: escaping is allowed, reinterpreting content as markup is
+    not. The original defect (newline rewritten as `<br>`) fails the first test
+    here, which is the point.
+    """
+
+    @pytest.mark.parametrize("value", _FIELD_CORPUS)
+    def test_no_markup_is_invented_or_lost(self, value: str) -> None:
+        assert _tags(_sanitize_for_tsv(value)) == _tags(value)
+
+    @pytest.mark.parametrize("value", _FIELD_CORPUS)
+    def test_output_is_tsv_safe(self, value: str) -> None:
+        assert not any(ch in _sanitize_for_tsv(value) for ch in "\t\r\n")
+
+    @pytest.mark.parametrize("value", _FIELD_CORPUS)
+    def test_repeated_writes_converge(self, value: str) -> None:
+        once = _sanitize_for_tsv(value)
+        assert _sanitize_for_tsv(once) == once
+
+    def test_end_to_end_untouched_columns_keep_their_markup(self, tmp_path: Path) -> None:
+        """Drive the real pipeline: only Jyutping is regenerated, so every
+        other column must come out of the TSV with its markup intact."""
+        from ankigen.audit import write_audit_jsonl
+
+        note = _zh_note(hanzi="促使", jyutping="", english="urge", sentence="x")
+        extras = {f"addon-{i}": v for i, v in enumerate(_FIELD_CORPUS)}
+        note.fields.update(extras)
+        note.field_order.extend(extras)
+
+        jsonl = tmp_path / "audit.jsonl"
+        write_audit_jsonl([_entry(note, lang="zh", reasons=[("missing_jyutping", "")])], jsonl)
+        paths = backfill_jsonl(
+            jsonl,
+            tmp_path / "update",
+            target_sentences=1,
+            jyutping_resolver=lambda _: "cuk1 si2",
+        )
+        _, rows = _read_tsv(paths[0])
+
+        for name, original in extras.items():
+            written = rows[0][3 + note.field_order.index(name)]
+            assert _tags(written) == _tags(original), f"{name} gained or lost markup"
 
 
 class TestSanitizeForTsv:
