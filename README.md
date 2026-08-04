@@ -1,5 +1,7 @@
 # ankigen
 
+[![CI](https://github.com/hubertau/ankigen/actions/workflows/ci.yml/badge.svg)](https://github.com/hubertau/ankigen/actions/workflows/ci.yml)
+
 Generate Anki vocabulary **and grammar** CSVs with LLM-powered example sentences and translations.
 
 ## Features
@@ -796,10 +798,9 @@ uv run pre-commit install
 ```bash
 # Run all tests
 uv run pytest
-
-# Run with coverage
-uv run pytest --cov=ankigen
 ```
+
+The suite is fully mocked — no LLM API key or network access is needed. `pytest-cov` is not a dev dependency, so `--cov` will fail; add it first if you want coverage.
 
 ### Code Quality
 
@@ -811,6 +812,12 @@ uv run ruff format src/ tests/
 # Type checking
 uv run mypy src/
 ```
+
+### CI
+
+`.github/workflows/ci.yml` runs the same commands on every pull request and on pushes to `master`: `uv sync --locked`, `ruff check`, `ruff format --check`, `mypy src/`, `pytest`, and the non-ruff/mypy `pre-commit` hooks (trailing whitespace, end-of-file, YAML, large files).
+
+Two differences from local use. CI reports rather than rewrites, so it runs `ruff check` without `--fix`. And `uv sync --locked` fails outright if `uv.lock` has drifted from `pyproject.toml` — if that step goes red, run `uv sync` locally and commit the updated lockfile.
 
 ## Project Structure
 

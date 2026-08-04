@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+# A new push supersedes the run it interrupted — don't spend minutes finishing
+# a check on a diff nobody will look at. master is exempt: those runs are the
+# record of what the branch actually looked like at each commit.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Lint, type-check, test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v9
+        with:
+          enable-cache: true
+
+      # Reads .python-version, so the pin stays in one place. Runners don't
+      # ship 3.13 by default and the project requires it.
+      - name: Install Python
+        run: uv python install
+
+      # --locked fails instead of silently re-resolving, so a pyproject.toml
+      # edit that never made it into uv.lock is caught here rather than
+      # becoming a mystery version drift later.
+      - name: Install dependencies
+        run: uv sync --locked
+
+      # No --fix: CI reports, it doesn't rewrite. Same for format --check.
+      - name: Lint
+        run: uv run ruff check src/ tests/
+
+      - name: Format
+        run: uv run ruff format --check src/ tests/
+
+      - name: Type check
+        run: uv run mypy src/
+
+      - name: Tests
+        run: uv run pytest
+
+      # The hooks the pre-commit config runs locally that the commands above
+      # don't cover. ruff/mypy are skipped because they already ran, against
+      # the real dependency set — pre-commit runs mypy in an isolated env with
+      # a hand-listed subset, which is exactly why warn_unused_ignores is off
+      # in pyproject.toml. Running it here would type-check less, not more.
+      - name: Repo hygiene
+        env:
+          SKIP: ruff,ruff-format,mypy
+        run: uv run pre-commit run --all-files
