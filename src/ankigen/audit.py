@@ -112,7 +112,7 @@ _VALID_OVERRIDE_ROLES: frozenset[str] = frozenset(
 _FIELD_CANDIDATES: dict[str, tuple[str, ...]] = {
     "headword_field": ("korean", "hanzi", "word", "chinese", "headword"),
     "hanja_field": ("hanja", "hanzi"),
-    "jyutping_field": ("jyutping", "pinyin", "romanization", "reading"),
+    "jyutping_field": ("jyutping", "romanization", "reading"),
     "english_field": ("english", "translation", "meaning", "def", "definition"),
     "sentence_field": (
         "comment",
@@ -123,6 +123,30 @@ _FIELD_CANDIDATES: dict[str, tuple[str, ...]] = {
         "example",
         "notes",
         "note",
+    ),
+}
+
+
+class _WrongSystem(NamedTuple):
+    """A field name that fits a role's *shape* but not its content."""
+
+    needles: tuple[str, ...]
+    explanation: str
+
+
+# Field names deliberately kept out of _FIELD_CANDIDATES because suggesting
+# them would be actively harmful, not merely unhelpful. They still get named
+# in the warning: to a user looking at a note type with a `Pinyin` field and
+# no `Jyutping` field, Pinyin is the obvious answer, and silently withholding
+# it just produces a "???" snippet with no explanation of what went wrong.
+_WRONG_SYSTEM_CANDIDATES: dict[str, _WrongSystem] = {
+    "jyutping_field": _WrongSystem(
+        needles=("pinyin",),
+        explanation=(
+            "that column holds Mandarin Pinyin, whereas this role is filled with "
+            "Cantonese Jyutping from pycantonese, so backfill would overwrite your "
+            "Pinyin with the wrong romanisation system"
+        ),
     ),
 }
 
@@ -210,6 +234,11 @@ def _suggest_candidates(role: str, field_order: list[str]) -> list[str]:
     needles = _FIELD_CANDIDATES.get(role, ())
     if not needles:
         return []
+    return _match_needles(needles, field_order)
+
+
+def _match_needles(needles: tuple[str, ...], field_order: list[str]) -> list[str]:
+    """Field names containing any of ``needles``, case-insensitive, in order."""
     lowered = [(f, f.lower()) for f in field_order]
     matches: list[str] = []
     for needle in needles:
@@ -217,6 +246,19 @@ def _suggest_candidates(role: str, field_order: list[str]) -> list[str]:
             if needle in low and orig not in matches:
                 matches.append(orig)
     return matches
+
+
+def _wrong_system_candidates(role: str, field_order: list[str]) -> tuple[list[str], str]:
+    """Return fields that fit ``role``'s shape but hold the wrong content.
+
+    Returns ``([], "")`` when the role has no such trap or the note has no
+    matching field.
+    """
+    trap = _WRONG_SYSTEM_CANDIDATES.get(role)
+    if trap is None:
+        return [], ""
+    matches = _match_needles(trap.needles, field_order)
+    return (matches, trap.explanation) if matches else ([], "")
 
 
 def resolve_fields_for_note(
@@ -282,6 +324,7 @@ def resolve_fields_for_note(
                 continue
             warned.add(cache_key)
             suggestions = _suggest_candidates(role, note.field_order)
+            mismatched, why_not = _wrong_system_candidates(role, note.field_order)
             snippet = _build_override_snippet(note.model_name, lang, resolved, role, suggestions)
             if suggestions:
                 logger.warning(
@@ -291,6 +334,20 @@ def resolve_fields_for_note(
                     role,
                     expected,
                     " or ".join(repr(s) for s in suggestions),
+                    snippet,
+                )
+            elif mismatched:
+                logger.warning(
+                    "Skipping note type %r: %s=%r is not a field on this note. "
+                    "%s is NOT a substitute — %s. Add a %r field to the note type "
+                    "instead; override only if you really want that column "
+                    "overwritten:\n%s",
+                    note.model_name,
+                    role,
+                    expected,
+                    " and ".join(repr(m) for m in mismatched),
+                    why_not,
+                    expected,
                     snippet,
                 )
             else:

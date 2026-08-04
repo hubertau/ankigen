@@ -768,6 +768,62 @@ class TestResolveFieldsForNote:
         assert result is None
         assert "doesn't look like a vocab card we can audit" in caplog.text
 
+    def _pinyin_only_zh_note(self) -> AnkiNote:
+        """A Chinese note type with a Pinyin column but no Jyutping column."""
+        fields = {"Hanzi": "促使", "Pinyin": "cùshǐ", "English": "to urge", "Sentence": ""}
+        return AnkiNote(
+            nid=9,
+            guid="g-pinyin",
+            mid=900,
+            model_name="Chinese (Mandarin only)",
+            deck_id=2,
+            fields=fields,
+            field_order=list(fields),
+        )
+
+    def test_pinyin_is_never_suggested_for_jyutping(self, caplog):
+        # Pinyin and Jyutping are different romanisation systems. Offering the
+        # Pinyin column as a candidate puts it in a copy-pasteable override
+        # snippet, and backfill then overwrites Mandarin readings with
+        # Cantonese ones.
+        with caplog.at_level("WARNING"):
+            result = resolve_fields_for_note(self._pinyin_only_zh_note(), "zh", overrides={})
+        assert result is None
+        assert '"jyutping_field": "Pinyin"' not in caplog.text
+        assert '"jyutping_field": "???"' in caplog.text
+
+    def test_pinyin_field_gets_an_explanation_not_silence(self, caplog):
+        # Withholding the candidate isn't enough on its own — to a user staring
+        # at a Pinyin field, it is the obvious answer, so say why it's refused.
+        with caplog.at_level("WARNING"):
+            resolve_fields_for_note(self._pinyin_only_zh_note(), "zh", overrides={})
+        assert "'Pinyin' is NOT a substitute" in caplog.text
+        assert "Cantonese Jyutping" in caplog.text
+        assert "doesn't look like a vocab card we can audit" not in caplog.text
+
+    def test_explicit_pinyin_override_is_still_honoured(self):
+        # The guard shapes a suggestion; it does not overrule the user.
+        overrides = {"Chinese (Mandarin only)": {"jyutping_field": "Pinyin"}}
+        result = resolve_fields_for_note(self._pinyin_only_zh_note(), "zh", overrides=overrides)
+        assert result is not None
+        assert result.secondary == "Pinyin"
+
+    def test_jyutping_field_still_suggested_when_plausibly_named(self, caplog):
+        fields = {"Hanzi": "促使", "Reading": "", "English": "x", "Sentence": ""}
+        note = AnkiNote(
+            nid=10,
+            guid="g-reading",
+            mid=901,
+            model_name="Chinese (Reading)",
+            deck_id=2,
+            fields=fields,
+            field_order=list(fields),
+        )
+        with caplog.at_level("WARNING"):
+            resolve_fields_for_note(note, "zh", overrides={})
+        assert "'Reading'" in caplog.text
+        assert "might match" in caplog.text
+
     def test_warning_deduped_per_model_and_role(self, caplog):
         note_a = _custom_ko_note(
             model_name="Korean (legacy)",

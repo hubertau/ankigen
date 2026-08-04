@@ -609,6 +609,8 @@ You only need to list the roles that differ from the defaults — unspecified ro
 
 When a note type has neither a recognised default schema nor a matching override, the entire note type is **skipped with a `WARNING`** at audit time (so it never silently slips through to backfill). The warning lists the missing field, any plausible candidate it spotted on the note (e.g. it would flag `Comments` as a likely match for `sentence_field`), and prints a ready-to-paste `ANKIGEN_NOTE_TYPE_OVERRIDES=...` snippet.
 
+A `Pinyin` field is deliberately **never** offered as a candidate for `jyutping_field`. The two are different romanization systems, and since the snippet is meant to be pasted as-is, suggesting it would hand you an override that makes backfill overwrite your Mandarin readings with Cantonese ones. A note type with a `Pinyin` column but no `Jyutping` column gets a warning saying so, and the snippet leaves `"jyutping_field": "???"` for you to fill in. Setting it to `Pinyin` yourself still works — the guard shapes the suggestion, it doesn't overrule you.
+
 **Backfill progress logs.** During backfill, each note is logged at `INFO` as `[N/total] guid=… model=… reasons=[…] → touched=[…]` so you can follow long runs without `-v`. The `INFO` line `Note-type override active for 'Model name': sentence_field='Comments'` confirms an override was applied.
 
 **Important: quit Anki first.** The live `collection.anki2` is locked by Anki for SQLite reads; the audit will report "deck not found" or fail to open the file. Quit Anki (or export an `.apkg` and point `--anki-db` at that) before running.
