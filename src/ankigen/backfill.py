@@ -494,15 +494,32 @@ def backfill_note(
 
 
 def _sanitize_for_tsv(value: str) -> str:
-    """Strip raw tabs/newlines that would break the Anki TSV importer.
+    """Escape raw tabs/newlines that would break the Anki TSV importer.
 
-    The Anki importer treats literal tabs as column separators and literal
-    newlines as record separators even with ``#html:true``; downstream the
-    parser is happier if we replace them with their HTML escapes.
+    The importer treats a literal tab as a column separator and a literal
+    newline as a record separator even with ``#html:true``, so neither can
+    survive as itself. Both become numeric character references, which the
+    card renders back to the original character.
+
+    A newline is **escaped, not reinterpreted**. An Anki field is rendered as
+    HTML, where a newline is insignificant whitespace: ``a<br>\\nb`` shows a
+    single line break. Rewriting that newline as a second ``<br>`` invents a
+    break, so pretty-printed HTML gained a blank line between every existing
+    line on each backfill — and because the writer runs over *every* column,
+    it hit fields ankigen never regenerated, including ones owned by other
+    add-ons.
+
+    Escaping is idempotent: a value that already went through here has no raw
+    tabs or newlines left to convert.
     """
     if not value:
         return ""
-    return value.replace("\t", "&#9;").replace("\r\n", "<br>").replace("\n", "<br>")
+    return (
+        value.replace("\t", "&#9;")
+        .replace("\r\n", "&#10;")
+        .replace("\n", "&#10;")
+        .replace("\r", "&#10;")
+    )
 
 
 def _tsv_done_guids(output_stem: Path) -> set[str]:
