@@ -44,13 +44,16 @@ jobs:
 
       # No --fix: CI reports, it doesn't rewrite. Same for format --check.
       - name: Lint
-        run: uv run ruff check src/ tests/
+        run: uv run ruff check src/ tests/ scripts/
 
       - name: Format
-        run: uv run ruff format --check src/ tests/
+        run: uv run ruff format --check src/ tests/ scripts/
 
+      # scripts/ is checked too: it is one-off tooling, but it handles session
+      # cookies and writes a dump meant to be shared, so it is the last place
+      # that should go unchecked.
       - name: Type check
-        run: uv run mypy src/
+        run: uv run mypy src/ scripts/
 
       - name: Tests
         run: uv run pytest

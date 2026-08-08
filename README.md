@@ -357,6 +357,50 @@ Watch / folder behavior:
 
 **Supported formats**: PDF, DOCX, PNG, JPG, JPEG, GIF, WEBP
 
+### Pull: Fetch saved words from Du Chinese
+
+Pull the flashcards you've saved on [duchinese.net](https://duchinese.net) straight into a word list, so words you bookmarked while reading become Anki cards without retyping them.
+
+```bash
+# One-time: sign in and save the session
+uv sync --extra web
+uv run playwright install chromium
+ankigen pull --login
+
+# Then, any time:
+ankigen pull
+# → inputs/zh/{YYYYMMDD}.txt
+
+ankigen generate inputs/zh/{YYYYMMDD}.txt
+```
+
+`pull` writes to the same dated file `extract` uses, with the same append+dedupe rules, so words pulled from Du Chinese and words extracted from a PDF accumulate together and a re-run never duplicates anything.
+
+**Signing in.** `--login` opens a real browser and waits for you to authenticate by hand, which works whatever the login throws at you — captcha, 2FA, or a Google/Apple button. The session is saved to `~/.config/ankigen/duchinese_state.json` and reused, so you do this once, not every run. The file is created at mode 600 *before* anything is written to it, so the cookies are never briefly readable by other users on the machine.
+
+Set `DUCHINESE_EMAIL` and `DUCHINESE_PASSWORD` in `.env` and the form is pre-filled — but the window still opens, so if a captcha or 2FA prompt appears you just finish it yourself in the same run. A failed auto-fill is a warning, not an error: you are already looking at the browser. Add `--headless` for unattended use; it requires the credentials and cannot clear a captcha, so it is the exception rather than the default.
+
+When the session expires, `pull` tells you to re-run `--login` rather than failing obscurely. That check looks at the page content, not just its URL: Du Chinese is a single-page app and can redirect to sign-in *after* the page has loaded, which would otherwise be indistinguishable from an empty word list.
+
+**Playwright is an optional extra**, since `playwright install` fetches a browser (~150MB) that nothing else in ankigen needs. `uv sync` alone won't install it; `uv sync --extra web` will. If you already have a Chromium, point `--browser-path` (or `ANKIGEN_CHROMIUM_PATH`) at it and skip the download.
+
+**How the list is read.** Du Chinese serves the whole word list in one request — its own flashcard page fetches `/flashcards/list.json` with no page, offset, or cursor parameter — so there is no pagination to walk and no scrolling to simulate, however many words you have saved. ankigen calls that endpoint with your session cookies, which needs no browser at all. The same array is also inlined into the list page's HTML, so if the endpoint answers with anything unexpected, ankigen loads the page in a headless browser and reads it from there instead. Both carry identical fields.
+
+**Options**:
+
+| Option | Description |
+|--------|-------------|
+| `--source {duchinese}` | Where to pull from (default: `duchinese`) |
+| `--login` | Open a browser, sign in, save the session, and exit without pulling |
+| `--headless` | With `--login`, sign in with no window. Needs `DUCHINESE_EMAIL`/`DUCHINESE_PASSWORD`; can't clear a captcha |
+| `-o, --output FILE` | Output word list (default: `inputs/zh/{YYYYMMDD}.txt`) |
+| `--overwrite` | Wipe the output file instead of appending |
+| `--traditional` | Write traditional characters instead of simplified |
+| `--browser-path PATH` | Use an existing Chromium instead of Playwright's own |
+| `--anki-db`, `--anki-deck`, `--anki-field` | Skip words already in your deck (see [Anki database filtering](#anki-database-filtering-optional)) |
+
+Only your own saved words are read, and only the list endpoint is ever requested — `pull` never touches the delete or review endpoints.
+
 ### Clean: Remove translations and annotations
 
 Clean vocabulary files by removing English translations, romanization (pinyin/romaja), and other annotations.
