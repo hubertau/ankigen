@@ -376,9 +376,11 @@ ankigen generate inputs/zh/{YYYYMMDD}.txt
 
 `pull` writes to the same dated file `extract` uses, with the same append+dedupe rules, so words pulled from Du Chinese and words extracted from a PDF accumulate together and a re-run never duplicates anything.
 
-**Signing in.** `--login` opens a real browser and waits for you to authenticate by hand, which works whatever the login throws at you — captcha, 2FA, or a Google/Apple button. The session is saved to `~/.config/ankigen/duchinese_state.json` (mode 600) and reused, so you do this once, not every run. Set `DUCHINESE_EMAIL` and `DUCHINESE_PASSWORD` in `.env` to have the form filled instead; if that fails for any reason it says so and points you back at the interactive path.
+**Signing in.** `--login` opens a real browser and waits for you to authenticate by hand, which works whatever the login throws at you — captcha, 2FA, or a Google/Apple button. The session is saved to `~/.config/ankigen/duchinese_state.json` and reused, so you do this once, not every run. The file is created at mode 600 *before* anything is written to it, so the cookies are never briefly readable by other users on the machine.
 
-When the session expires, `pull` tells you to re-run `--login` rather than failing obscurely.
+Set `DUCHINESE_EMAIL` and `DUCHINESE_PASSWORD` in `.env` and the form is pre-filled — but the window still opens, so if a captcha or 2FA prompt appears you just finish it yourself in the same run. A failed auto-fill is a warning, not an error: you are already looking at the browser. Add `--headless` for unattended use; it requires the credentials and cannot clear a captcha, so it is the exception rather than the default.
+
+When the session expires, `pull` tells you to re-run `--login` rather than failing obscurely. That check looks at the page content, not just its URL: Du Chinese is a single-page app and can redirect to sign-in *after* the page has loaded, which would otherwise be indistinguishable from an empty word list.
 
 **Playwright is an optional extra**, since `playwright install` fetches a browser (~150MB) that nothing else in ankigen needs. `uv sync` alone won't install it; `uv sync --extra web` will. If you already have a Chromium, point `--browser-path` (or `ANKIGEN_CHROMIUM_PATH`) at it and skip the download.
 
@@ -390,6 +392,7 @@ When the session expires, `pull` tells you to re-run `--login` rather than faili
 |--------|-------------|
 | `--source {duchinese}` | Where to pull from (default: `duchinese`) |
 | `--login` | Open a browser, sign in, save the session, and exit without pulling |
+| `--headless` | With `--login`, sign in with no window. Needs `DUCHINESE_EMAIL`/`DUCHINESE_PASSWORD`; can't clear a captcha |
 | `-o, --output FILE` | Output word list (default: `inputs/zh/{YYYYMMDD}.txt`) |
 | `--overwrite` | Wipe the output file instead of appending |
 | `--traditional` | Write traditional characters instead of simplified |

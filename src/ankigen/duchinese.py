@@ -183,117 +183,192 @@ def _import_playwright() -> Any:
     return sync_playwright
 
 
+def _launch_browser(pw: Any, *, headless: bool, browser_path: str | None) -> Any:
+    """
+    Start Chromium, turning Playwright's own failures into DuChineseError.
+
+    A missing *module* is not the only way this goes wrong: `uv sync --extra
+    web` without `playwright install chromium` leaves the package importable
+    and the browser absent. Without this, that raises a Playwright error the
+    CLI does not catch, so the user gets a traceback instead of the very hint
+    written for their situation.
+    """
+    try:
+        return pw.chromium.launch(
+            headless=headless,
+            executable_path=browser_path or os.getenv("ANKIGEN_CHROMIUM_PATH") or None,
+        )
+    except DuChineseError:
+        raise
+    except Exception as exc:
+        raise DuChineseError(f"Could not start Chromium: {exc}\n\n{_PLAYWRIGHT_HINT}") from exc
+
+
 def _save_state(context: Any, state_path: Path) -> None:
-    """Persist cookies, readable only by this user."""
+    """
+    Persist cookies, readable only by this user.
+
+    The file is created empty at 0600 *before* Playwright writes it. Letting
+    Playwright create it and chmod'ing afterwards would leave the whole cookie
+    jar world-readable under the usual umask for as long as the write takes.
+    """
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    context.storage_state(path=str(state_path))
+    os.close(os.open(state_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600))
     state_path.chmod(0o600)
+    context.storage_state(path=str(state_path))
     logger.info("Saved duchinese.net session to %s", state_path)
 
 
-def _fill_credentials(page: Any, email: str, password: str) -> None:
+def _fill_credentials(page: Any, email: str, password: str) -> bool:
     """
-    Best-effort sign-in for a headless refresh.
+    Pre-fill the sign-in form from the configured credentials.
 
-    Deliberately narrow: it fills the standard email/password inputs and
-    submits. Anything unexpected — a captcha, a renamed field, an SSO-only
-    account — raises, because the interactive path always works and guessing
-    harder would only produce a more confusing failure.
+    Returns whether the form was submitted. A failure here is not fatal: the
+    browser is on screen either way, so the user simply finishes by hand. That
+    matters because the failure this most often hits — a captcha — cannot be
+    automated at all, and an exception would strand them in a loop, re-running
+    a command that takes the same automated path every time.
     """
     try:
         page.fill("input[type=email], input[name*=email i]", email, timeout=10_000)
         page.fill("input[type=password], input[name*=password i]", password, timeout=10_000)
         page.press("input[type=password], input[name*=password i]", "Enter")
         page.wait_for_load_state("networkidle", timeout=30_000)
+        return True
     except Exception as exc:
-        raise DuChineseAuthError(
-            "Could not sign in with DUCHINESE_EMAIL / DUCHINESE_PASSWORD. "
-            "Run `ankigen pull --login` and sign in in the browser window instead."
-        ) from exc
+        logger.warning(
+            "Could not fill the sign-in form automatically (%s). Finish signing in "
+            "in the browser window.",
+            exc,
+        )
+        return False
 
 
-def login(*, state_path: Path | None = None, browser_path: str | None = None) -> None:
+def login(
+    *,
+    state_path: Path | None = None,
+    browser_path: str | None = None,
+    headless: bool = False,
+) -> None:
     """
     Establish a duchinese.net session and save it for later pulls.
 
-    Opens a real browser window and waits for you to sign in. If
-    ``DUCHINESE_EMAIL`` and ``DUCHINESE_PASSWORD`` are both set, the form is
-    filled automatically and no interaction is needed.
+    Opens a real browser window. When ``DUCHINESE_EMAIL`` and
+    ``DUCHINESE_PASSWORD`` are set the form is pre-filled, but the window still
+    appears so you can clear a captcha or a 2FA prompt the fill cannot handle.
+    ``headless=True`` is for unattended use and requires those credentials.
     """
     state_path = state_path or get_state_path()
     sync_playwright = _import_playwright()
     email = os.getenv("DUCHINESE_EMAIL", "").strip()
     password = os.getenv("DUCHINESE_PASSWORD", "").strip()
-    automated = bool(email and password)
+
+    if headless and not (email and password):
+        raise DuChineseAuthError(
+            "--headless login needs DUCHINESE_EMAIL and DUCHINESE_PASSWORD. "
+            "Drop --headless to sign in through a browser window."
+        )
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=automated,
-            executable_path=browser_path or os.getenv("ANKIGEN_CHROMIUM_PATH") or None,
-        )
-        context = browser.new_context()
-        page = context.new_page()
-        page.goto(SIGN_IN_URL, wait_until="domcontentloaded")
+        browser = _launch_browser(pw, headless=headless, browser_path=browser_path)
+        try:
+            context = browser.new_context()
+            page = context.new_page()
+            page.goto(SIGN_IN_URL, wait_until="domcontentloaded")
 
-        if automated:
-            logger.info("Signing in as the configured DUCHINESE_EMAIL")
-            _fill_credentials(page, email, password)
-        else:
-            print(
-                "\nA browser window is open at duchinese.net.\n"
-                "Sign in, then come back here and press Enter.\n"
-            )
-            input("Press Enter once you are signed in... ")
+            submitted = False
+            if email and password:
+                logger.info("Pre-filling the sign-in form for the configured DUCHINESE_EMAIL")
+                submitted = _fill_credentials(page, email, password)
 
-        cards = _cards_via_page(context, page)
-        if not cards and _looks_signed_out(page.url):
-            raise DuChineseAuthError("Still signed out after the login step — nothing was saved.")
+            if not headless and not (submitted and not _is_signed_out(page)):
+                print(
+                    "\nA browser window is open at duchinese.net.\n"
+                    "Sign in, then come back here and press Enter.\n"
+                )
+                input("Press Enter once you are signed in... ")
 
-        _save_state(context, state_path)
-        context.close()
-        browser.close()
+            # Save before verifying. Verification navigates, and anything that
+            # goes wrong there (a slow load, a false positive) must not throw
+            # away a sign-in the user may have just spent a captcha and a 2FA
+            # code on.
+            _save_state(context, state_path)
+
+            cards = _cards_via_page(page)
+            if not cards and _is_signed_out(page):
+                raise DuChineseAuthError(
+                    "Still signed out after the login step. The session was saved "
+                    "anyway; re-run `ankigen pull --login` to try again."
+                )
+        finally:
+            browser.close()
 
     logger.info("Login complete. `ankigen pull` will reuse this session.")
 
 
-def _looks_signed_out(url: str) -> bool:
-    return "sign_in" in url or "sign_up" in url
+def _is_signed_out(page: Any) -> bool:
+    """
+    Whether the browser has been bounced to the sign-in screen.
+
+    The URL alone is not enough. Du Chinese is a single-page app, so an expired
+    session can be redirected client-side, after ``domcontentloaded`` and thus
+    after ``page.url`` was already read — which would make an expired session
+    indistinguishable from an empty word list. The page content is checked too,
+    so the user is told to sign in again rather than that they have no words.
+    """
+    if "sign_in" in page.url or "sign_up" in page.url:
+        return True
+    try:
+        return int(page.locator("input[type=password]").count()) > 0
+    except Exception:
+        return False
+
+
+class _EndpointUnavailable(Exception):
+    """The list endpoint could not answer — distinct from answering with zero words."""
 
 
 def _cards_via_request(pw: Any, state_path: Path) -> list[DuChineseCard]:
-    """Fetch the list endpoint with stored cookies — no browser needed."""
-    context = pw.request.new_context(storage_state=str(state_path))
+    """
+    Fetch the list endpoint with stored cookies — no browser needed.
+
+    Raises ``_EndpointUnavailable`` rather than returning ``[]`` when the
+    request itself fails, so that an account with genuinely zero saved words
+    does not trigger the browser fallback (and, with no browser installed, a
+    crash) after the cheap path already answered correctly.
+    """
+    try:
+        context = pw.request.new_context(storage_state=str(state_path))
+    except Exception as exc:
+        raise _EndpointUnavailable(f"could not open a request context: {exc}") from exc
     try:
         response = context.get(LIST_JSON_URL)
         if not response.ok:
-            logger.debug("list.json returned HTTP %s", response.status)
-            return []
+            raise _EndpointUnavailable(f"list.json returned HTTP {response.status}")
         try:
             payload = response.json()
-        except Exception:
-            logger.debug("list.json did not return JSON (likely a sign-in redirect)")
-            return []
+        except Exception as exc:
+            raise _EndpointUnavailable("list.json did not return JSON") from exc
+        if not isinstance(payload, dict) or "words" not in payload:
+            raise _EndpointUnavailable("list.json did not carry a 'words' array")
         return parse_flashcards(payload)
     finally:
         context.dispose()
 
 
-def _cards_via_page(context: Any, page: Any) -> list[DuChineseCard]:
+def _cards_via_page(page: Any) -> list[DuChineseCard]:
     """Load the list page in a browser and read its inlined copy."""
-    page.goto(LIST_PAGE_URL, wait_until="domcontentloaded")
+    page.goto(LIST_PAGE_URL, wait_until="networkidle")
     return extract_inline_flashcards(page.content())
 
 
 def _cards_via_browser(pw: Any, state_path: Path, browser_path: str | None) -> list[DuChineseCard]:
-    browser = pw.chromium.launch(
-        headless=True,
-        executable_path=browser_path or os.getenv("ANKIGEN_CHROMIUM_PATH") or None,
-    )
+    browser = _launch_browser(pw, headless=True, browser_path=browser_path)
     try:
         context = browser.new_context(storage_state=str(state_path))
         page = context.new_page()
-        cards = _cards_via_page(context, page)
-        if not cards and _looks_signed_out(page.url):
+        cards = _cards_via_page(page)
+        if not cards and _is_signed_out(page):
             raise DuChineseAuthError(
                 "The saved duchinese.net session has expired. "
                 "Run `ankigen pull --login` to sign in again."
@@ -322,10 +397,12 @@ def fetch_cards(
 
     sync_playwright = _import_playwright()
     with sync_playwright() as pw:
-        cards = _cards_via_request(pw, state_path)
-        if cards:
+        try:
+            cards = _cards_via_request(pw, state_path)
+        except _EndpointUnavailable as exc:
+            logger.info("Could not read the list endpoint (%s); retrying via the page", exc)
+        else:
             logger.debug("Read %d flashcards from %s", len(cards), LIST_JSON_URL)
             return cards
 
-        logger.info("The list endpoint returned nothing usable; retrying via the page")
         return _cards_via_browser(pw, state_path, browser_path)

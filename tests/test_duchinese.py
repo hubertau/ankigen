@@ -27,6 +27,7 @@ from ankigen.duchinese import (
     parse_flashcards,
     select_words,
 )
+from ankigen.duchinese import login as duchinese_login
 
 
 def make_entry(simplified: str, traditional: str = "", **overrides: object) -> dict[str, object]:
@@ -243,33 +244,54 @@ class FakeRequestFactory:
         return self.context
 
 
+class FakeLocator:
+    def __init__(self, count: int):
+        self._count = count
+
+    def count(self) -> int:
+        return self._count
+
+
 class FakePage:
-    def __init__(self, html: str, url: str):
+    def __init__(self, html: str, url: str, *, password_inputs: int = 0):
         self._html = html
         self.url = url
+        self._password_inputs = password_inputs
+        self.wait_states: list[str] = []
 
-    def goto(self, url: str, **_: object) -> None:
-        pass
+    def goto(self, url: str, **kwargs: object) -> None:
+        wait_until = kwargs.get("wait_until")
+        if isinstance(wait_until, str):
+            self.wait_states.append(wait_until)
 
     def content(self) -> str:
         return self._html
+
+    def locator(self, _selector: str) -> FakeLocator:
+        return FakeLocator(self._password_inputs)
 
 
 class FakeBrowserContext:
     def __init__(self, page: FakePage):
         self._page = page
+        self.saved_to: str | None = None
 
     def new_page(self) -> FakePage:
         return self._page
+
+    def storage_state(self, path: str) -> None:
+        self.saved_to = path
+        Path(path).write_text('{"cookies": []}', encoding="utf-8")
 
 
 class FakeBrowser:
     def __init__(self, page: FakePage):
         self._page = page
         self.closed = False
+        self.context = FakeBrowserContext(page)
 
     def new_context(self, **_: object) -> FakeBrowserContext:
-        return FakeBrowserContext(self._page)
+        return self.context
 
     def close(self) -> None:
         self.closed = True
@@ -279,9 +301,13 @@ class FakeChromium:
     def __init__(self, browser: FakeBrowser):
         self._browser = browser
         self.launched = False
+        self.headless: bool | None = None
 
-    def launch(self, **_: object) -> FakeBrowser:
+    def launch(self, **kwargs: object) -> FakeBrowser:
         self.launched = True
+        headless = kwargs.get("headless")
+        if isinstance(headless, bool):
+            self.headless = headless
         return self._browser
 
 
@@ -377,13 +403,102 @@ class TestFetchCards:
         with pytest.raises(DuChineseAuthError, match="--login"):
             fetch_cards(state_path=tmp_path / "absent.json")
 
-    def test_empty_account_is_not_an_error(self, monkeypatch, state_file):
-        self.install(
+    def test_empty_account_is_answered_without_launching_a_browser(self, monkeypatch, state_file):
+        # An account with zero saved words is a successful answer, not a failed
+        # request. Treating the two alike sent this down the browser fallback,
+        # which crashes outright when `playwright install` was never run —
+        # after the cheap path had already returned the right answer.
+        fake = self.install(
             monkeypatch,
             FakeResponse({"words": []}),
             FakePage("<html>no cards</html>", "https://duchinese.net/flashcards/list"),
         )
+
         assert fetch_cards(state_path=state_file) == []
+        assert not fake.chromium.launched
+
+    def test_payload_without_a_words_key_falls_back(self, monkeypatch, state_file):
+        # A 200 that isn't the payload we expect (an error envelope, an
+        # interstitial) must not be read as "you have no words".
+        html = (
+            "<script>window.flashcards = "
+            + json.dumps([make_entry("耐心")], ensure_ascii=False)
+            + ";</script>"
+        )
+        fake = self.install(
+            monkeypatch,
+            FakeResponse({"error": "nope"}),
+            FakePage(html, "https://duchinese.net/flashcards/list"),
+        )
+
+        assert [c.simplified for c in fetch_cards(state_path=state_file)] == ["耐心"]
+        assert fake.chromium.launched
+
+    def test_client_side_redirect_to_sign_in_is_an_auth_error(self, monkeypatch, state_file):
+        # The SPA can bounce an expired session to sign-in *after*
+        # domcontentloaded, so page.url still reads as the list page. Trusting
+        # the URL alone reported "no saved flashcards" for a session that had
+        # merely expired — the obscure failure the README promises to avoid.
+        self.install(
+            monkeypatch,
+            FakeResponse(None, ok=False, status=302),
+            FakePage(
+                "<html><form><input type=password></form></html>",
+                "https://duchinese.net/flashcards/list",
+                password_inputs=1,
+            ),
+        )
+
+        with pytest.raises(DuChineseAuthError, match="expired"):
+            fetch_cards(state_path=state_file)
+
+    def test_page_load_waits_for_the_network_to_settle(self, monkeypatch, state_file):
+        # domcontentloaded fires before a client-side redirect resolves.
+        page = FakePage("<html>nothing</html>", "https://duchinese.net/flashcards/list")
+        self.install(monkeypatch, FakeResponse(None, ok=False, status=500), page)
+
+        fetch_cards(state_path=state_file)
+
+        assert page.wait_states == ["networkidle"]
+
+    def test_browser_launch_failure_becomes_a_duchinese_error(self, monkeypatch, state_file):
+        # `uv sync --extra web` without `playwright install chromium` leaves the
+        # module importable and the browser missing. That has to surface as the
+        # install hint, not as a Playwright traceback the CLI never catches.
+        fake = self.install(
+            monkeypatch,
+            FakeResponse(None, ok=False, status=500),
+            FakePage("", ""),
+        )
+
+        def no_browser(**_: object) -> object:
+            raise RuntimeError("Executable doesn't exist at /opt/pw-browsers/chromium")
+
+        monkeypatch.setattr(fake.chromium, "launch", no_browser)
+
+        with pytest.raises(DuChineseError, match="playwright install chromium"):
+            fetch_cards(state_path=state_file)
+
+    def test_request_context_failure_falls_back(self, monkeypatch, state_file):
+        # A corrupt state file breaks new_context; that must not escape as a
+        # raw traceback, and must not leak an undisposed context.
+        html = (
+            "<script>window.flashcards = "
+            + json.dumps([make_entry("矛盾")], ensure_ascii=False)
+            + ";</script>"
+        )
+        fake = self.install(
+            monkeypatch,
+            FakeResponse(None),
+            FakePage(html, "https://duchinese.net/flashcards/list"),
+        )
+
+        def bad_context(**_: object) -> object:
+            raise RuntimeError("invalid storage state")
+
+        monkeypatch.setattr(fake.request, "new_context", bad_context)
+
+        assert [c.simplified for c in fetch_cards(state_path=state_file)] == ["矛盾"]
 
     def test_missing_playwright_explains_the_extra(self, monkeypatch, state_file):
         def boom() -> object:
@@ -396,6 +511,128 @@ class TestFetchCards:
             fetch_cards(state_path=state_file)
 
 
+class TestLogin:
+    def install(self, monkeypatch, page: FakePage) -> FakePlaywright:
+        fake = FakePlaywright(FakeResponse(None), page)
+        monkeypatch.setattr("ankigen.duchinese._import_playwright", lambda: lambda: fake)
+        monkeypatch.setattr("builtins.input", lambda *_: "")
+        monkeypatch.delenv("DUCHINESE_EMAIL", raising=False)
+        monkeypatch.delenv("DUCHINESE_PASSWORD", raising=False)
+        return fake
+
+    def signed_in_page(self) -> FakePage:
+        html = (
+            "<script>window.flashcards = "
+            + json.dumps([make_entry("促使")], ensure_ascii=False)
+            + ";</script>"
+        )
+        return FakePage(html, "https://duchinese.net/flashcards/list")
+
+    def test_saves_the_session(self, monkeypatch, tmp_path):
+        fake = self.install(monkeypatch, self.signed_in_page())
+        state = tmp_path / "state.json"
+
+        duchinese_login(state_path=state)
+
+        assert state.exists()
+        assert fake.browser.context.saved_to == str(state)
+
+    def test_session_file_is_not_world_readable(self, monkeypatch, tmp_path):
+        self.install(monkeypatch, self.signed_in_page())
+        state = tmp_path / "state.json"
+
+        duchinese_login(state_path=state)
+
+        # The cookie jar must never be readable by other local users, not even
+        # for the moment between creation and a follow-up chmod.
+        assert state.stat().st_mode & 0o077 == 0
+
+    def test_session_survives_a_failed_verification(self, monkeypatch, tmp_path):
+        # A manual sign-in can cost a captcha and a 2FA code. If verification
+        # then trips — a slow load, a false positive — throwing the session
+        # away makes the user do all of that again for nothing.
+        page = FakePage(
+            "<html><input type=password></html>",
+            "https://duchinese.net/accounts/sign_in",
+            password_inputs=1,
+        )
+        self.install(monkeypatch, page)
+        state = tmp_path / "state.json"
+
+        with pytest.raises(DuChineseAuthError):
+            duchinese_login(state_path=state)
+
+        assert state.exists()
+
+    def test_browser_is_closed_even_when_verification_fails(self, monkeypatch, tmp_path):
+        page = FakePage("<html></html>", "https://duchinese.net/accounts/sign_in")
+        fake = self.install(monkeypatch, page)
+
+        with pytest.raises(DuChineseAuthError):
+            duchinese_login(state_path=tmp_path / "state.json")
+
+        assert fake.browser.closed
+
+    def test_opens_a_window_by_default(self, monkeypatch, tmp_path):
+        fake = self.install(monkeypatch, self.signed_in_page())
+
+        duchinese_login(state_path=tmp_path / "state.json")
+
+        assert fake.chromium.headless is False
+
+    def test_credentials_prefill_but_still_show_the_window(self, monkeypatch, tmp_path):
+        # A captcha cannot be automated. Filling the form headlessly and
+        # erroring out left the user re-running a command that took the same
+        # automated path every time, with no way out but editing .env.
+        fake = self.install(monkeypatch, self.signed_in_page())
+        monkeypatch.setenv("DUCHINESE_EMAIL", "someone@example.com")
+        monkeypatch.setenv("DUCHINESE_PASSWORD", "secret")
+        filled: list[str] = []
+        monkeypatch.setattr(
+            "ankigen.duchinese._fill_credentials",
+            lambda *_a, **_k: filled.append("filled") or True,
+        )
+
+        duchinese_login(state_path=tmp_path / "state.json")
+
+        assert filled == ["filled"]
+        assert fake.chromium.headless is False
+
+    def test_failed_prefill_hands_over_to_the_user(self, monkeypatch, tmp_path):
+        # The fill failing is not fatal: the window is open, so the user
+        # finishes by hand in the same run.
+        self.install(monkeypatch, self.signed_in_page())
+        monkeypatch.setenv("DUCHINESE_EMAIL", "someone@example.com")
+        monkeypatch.setenv("DUCHINESE_PASSWORD", "secret")
+        monkeypatch.setattr("ankigen.duchinese._fill_credentials", lambda *_a, **_k: False)
+        prompted: list[str] = []
+        monkeypatch.setattr("builtins.input", lambda *_: prompted.append("asked") or "")
+
+        duchinese_login(state_path=tmp_path / "state.json")
+
+        assert prompted == ["asked"]
+
+    def test_headless_without_credentials_is_refused(self, monkeypatch, tmp_path):
+        self.install(monkeypatch, self.signed_in_page())
+
+        with pytest.raises(DuChineseAuthError, match="DUCHINESE_EMAIL"):
+            duchinese_login(state_path=tmp_path / "state.json", headless=True)
+
+    def test_headless_with_credentials_does_not_prompt(self, monkeypatch, tmp_path):
+        fake = self.install(monkeypatch, self.signed_in_page())
+        monkeypatch.setenv("DUCHINESE_EMAIL", "someone@example.com")
+        monkeypatch.setenv("DUCHINESE_PASSWORD", "secret")
+        monkeypatch.setattr("ankigen.duchinese._fill_credentials", lambda *_a, **_k: True)
+        monkeypatch.setattr(
+            "builtins.input",
+            lambda *_: pytest.fail("headless login must not wait for input"),
+        )
+
+        duchinese_login(state_path=tmp_path / "state.json", headless=True)
+
+        assert fake.chromium.headless is True
+
+
 class TestCmdPull:
     """The CLI wiring, with the network layer replaced."""
 
@@ -403,6 +640,7 @@ class TestCmdPull:
         defaults: dict[str, object] = {
             "source": "duchinese",
             "login": False,
+            "headless": False,
             "output": tmp_path / "words.txt",
             "overwrite": False,
             "traditional": False,

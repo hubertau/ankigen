@@ -728,7 +728,7 @@ def cmd_pull(args: argparse.Namespace) -> None:
     """Handle the 'pull' subcommand — fetch saved words from a website."""
     if args.login:
         try:
-            duchinese_login(browser_path=args.browser_path)
+            duchinese_login(browser_path=args.browser_path, headless=args.headless)
         except DuChineseError as exc:
             logger.error("%s", exc)
             sys.exit(1)
@@ -1481,9 +1481,16 @@ def main() -> None:
     pull_parser.add_argument(
         "--login",
         action="store_true",
-        help="Open a browser, sign in by hand, and save the session. Does not "
-        "pull anything. Set DUCHINESE_EMAIL and DUCHINESE_PASSWORD to skip the "
-        "manual step.",
+        help="Open a browser, sign in, and save the session. Does not pull "
+        "anything. DUCHINESE_EMAIL and DUCHINESE_PASSWORD pre-fill the form; "
+        "the window still opens so you can clear a captcha or 2FA prompt.",
+    )
+    pull_parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="With --login, sign in without opening a window. Needs "
+        "DUCHINESE_EMAIL and DUCHINESE_PASSWORD, and cannot handle a captcha "
+        "or 2FA prompt — for unattended use only.",
     )
     pull_parser.add_argument(
         "-o",

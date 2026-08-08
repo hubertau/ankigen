@@ -39,7 +39,16 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 DEFAULT_START_URL = "https://duchinese.net/"
-DEFAULT_STATE = Path.home() / ".config" / "ankigen" / "duchinese_state.json"
+
+# Share the session file with `ankigen pull` — including its
+# ANKIGEN_DUCHINESE_STATE override — so signing in here signs you in there,
+# rather than the two silently writing different files.
+try:
+    from ankigen.duchinese import get_state_path
+
+    DEFAULT_STATE = get_state_path()
+except ModuleNotFoundError:  # running the script outside the installed package
+    DEFAULT_STATE = Path.home() / ".config" / "ankigen" / "duchinese_state.json"
 
 # Endpoints whose URL says "this might be the wordlist".
 INTERESTING_URL_WORDS = (
@@ -102,6 +111,7 @@ class Capture:
     cjk_chars: int
     body_file: str | None = None
     shape: Any = None
+    truncated: bool = False
 
     def score(self) -> int:
         """Rank how likely this response is to be the saved-word payload."""
@@ -128,10 +138,31 @@ class Recorder:
     captures: list[Capture] = field(default_factory=list)
     bodies: dict[int, str] = field(default_factory=dict)
     enabled: bool = True
+    # Strong references to in-flight handler tasks. asyncio keeps only a weak
+    # reference to a running task, so without this a handler suspended on
+    # `await response.body()` can be collected mid-flight and its capture lost
+    # silently — including, potentially, the one response we are looking for.
+    pending: set[asyncio.Task[None]] = field(default_factory=set)
+    oversized: int = 0
+
+    def track(self, task: asyncio.Task[None]) -> None:
+        self.pending.add(task)
+        task.add_done_callback(self.pending.discard)
+
+    async def drain(self) -> None:
+        """Wait for handlers already in flight to finish."""
+        while self.pending:
+            await asyncio.gather(*tuple(self.pending), return_exceptions=True)
+
+    async def stop(self) -> None:
+        """Stop recording and let in-flight handlers settle."""
+        self.enabled = False
+        await self.drain()
 
     def clear(self) -> None:
         self.captures.clear()
         self.bodies.clear()
+        self.oversized = 0
 
     def redact(self, text: str) -> str:
         text = _EMAIL_RE.sub("<email redacted>", text)
@@ -272,13 +303,26 @@ async def record_response(recorder: Recorder, response: Any) -> None:
         headers = {}
     content_type = headers.get("content-type", "")
     body_text = ""
+    oversized = False
     if any(kind in content_type for kind in ("json", "javascript", "text/plain")):
         try:
             raw = await response.body()
             if len(raw) <= MAX_BODY_BYTES:
                 body_text = raw.decode("utf-8", errors="replace")
+            else:
+                # Do not let the cap hide the payload we are hunting for: a big
+                # word list is *more* likely to be the answer, not less. Keep a
+                # prefix so the shape and its Chinese content still score.
+                oversized = True
+                body_text = raw[:MAX_BODY_BYTES].decode("utf-8", errors="replace")
+                recorder.oversized += 1
         except Exception:
             body_text = ""
+
+    # A late handler must not land in the log after recording is stopped —
+    # that is what would leak login traffic into a dump meant to be shared.
+    if not recorder.enabled:
+        return
 
     index = len(recorder.captures)
     capture = Capture(
@@ -299,8 +343,11 @@ async def record_response(recorder: Recorder, response: Any) -> None:
             try:
                 capture.shape = summarize_json(json.loads(safe))
             except (ValueError, TypeError):
-                capture.shape = "<unparseable json>"
+                # Expected for a truncated oversized body — the prefix is not
+                # valid JSON on its own, but still shows the fields.
+                capture.shape = "<truncated json>" if oversized else "<unparseable json>"
 
+    capture.truncated = oversized
     recorder.captures.append(capture)
 
 
@@ -361,10 +408,19 @@ def write_summary(out_dir: Path, page_url: str, recorder: Recorder, probes: dict
         "| --- | --- | --- | --- | --- | --- |",
     ]
     for capture in ranked[:12]:
+        note = " (truncated)" if capture.truncated else ""
         lines.append(
             f"| {capture.score()} | {capture.status} | {capture.content_type} | "
-            f"{capture.cjk_chars} | {capture.body_bytes} | `{capture.url[:110]}` |"
+            f"{capture.cjk_chars} | {capture.body_bytes}{note} | `{capture.url[:110]}` |"
         )
+
+    if recorder.oversized:
+        lines += [
+            "",
+            f"> {recorder.oversized} response(s) exceeded the {MAX_BODY_BYTES:,}-byte capture "
+            "cap and were stored as a prefix. A large word list is a *likelier* candidate, "
+            "not a weaker one — check those first.",
+        ]
 
     top = ranked[0] if ranked else None
     lines += [
@@ -446,7 +502,10 @@ async def run(args: argparse.Namespace) -> int:
         context = await browser.new_context(storage_state=storage)
         page = await context.new_page()
         page.on(
-            "response", lambda response: asyncio.create_task(record_response(recorder, response))
+            "response",
+            lambda response: recorder.track(
+                asyncio.create_task(record_response(recorder, response))
+            ),
         )
 
         await page.goto(args.start_url, wait_until="domcontentloaded")
@@ -460,13 +519,19 @@ async def run(args: argparse.Namespace) -> int:
         await asyncio.to_thread(input, "Press Enter once the wordlist is on screen... ")
 
         state_path.parent.mkdir(parents=True, exist_ok=True)
+        # Create the file at 0600 before writing, so the cookie jar is never
+        # briefly world-readable under the usual umask.
+        os.close(os.open(state_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600))
         await context.storage_state(path=str(state_path))
-        os.chmod(state_path, 0o600)
         print(f"Session saved to {state_path} (mode 0600, not part of the dump)")
 
-        # Everything captured so far includes the login exchange. Drop it and
-        # reload, so the recorded traffic is a clean wordlist page load.
+        # Everything captured so far includes the login exchange. Stop
+        # recording, let handlers already in flight settle, and only then drop
+        # what they wrote — otherwise a late handler appends login traffic into
+        # a log that is about to be written out and shared.
+        await recorder.stop()
         recorder.clear()
+        recorder.enabled = True
         page_url = page.url
         print(f"\nReloading {page_url} with a clean network log...")
         await page.reload(wait_until="networkidle")
@@ -485,6 +550,10 @@ async def run(args: argparse.Namespace) -> int:
         html = recorder.redact(await page.content())
         if args.screenshot:
             await page.screenshot(path=str(out_dir / "page.png"), full_page=True)
+
+        # Let any handler still reading a body finish before the page closes,
+        # so a slow response is not dropped from the dump.
+        await recorder.stop()
 
         await context.close()
         await browser.close()
