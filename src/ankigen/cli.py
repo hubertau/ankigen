@@ -52,6 +52,21 @@ from ankigen.backfill import (
     format_estimate,
 )
 from ankigen.cleaner import clean_and_write, clean_vocabulary_file, parse_hanja_token
+from ankigen.duchinese import (
+    DuChineseError,
+)
+from ankigen.duchinese import (
+    fetch_cards as fetch_duchinese_cards,
+)
+from ankigen.duchinese import (
+    get_state_path as get_duchinese_state_path,
+)
+from ankigen.duchinese import (
+    login as duchinese_login,
+)
+from ankigen.duchinese import (
+    select_words as select_duchinese_words,
+)
 from ankigen.extractor import (
     ExtractMode,
     extract_vocabulary_from_file,
@@ -538,15 +553,26 @@ def _extract_single_file_vocab(args: argparse.Namespace, output_file: Path | Non
         if skipped:
             logger.info("Skipped %d words already present in Anki", skipped)
 
+    _write_word_list(words, output_file, overwrite=args.overwrite)
+
+
+def _write_word_list(words: list[str], output_file: Path, *, overwrite: bool) -> None:
+    """
+    Write a vocab word list, appending and deduping unless ``overwrite``.
+
+    Shared by `extract` and `pull` so a word list assembled from a document and
+    one pulled from a website accumulate into the same dated file on the same
+    terms.
+    """
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
-    if output_file.exists() and not args.overwrite:
+    if output_file.exists() and not overwrite:
         # Dedupe by bare word (without ``(漢字)`` annotation) so that the same
         # word with and without Hanja still collapses to one entry.
         existing_bare = {parse_hanja_token(w)[0] for w in read_words(output_file)}
         new_words = [w for w in words if parse_hanja_token(w)[0] not in existing_bare]
         if not new_words:
-            logger.info("All extracted words already exist in %s", output_file)
+            logger.info("All words already exist in %s", output_file)
             return
         logger.info(
             "Appending %d new words to %s (skipping %d duplicates)",
@@ -696,6 +722,46 @@ def _log_folder_result(result: object, mode: ExtractMode) -> None:
         logger.info("Vocab output:   %s", result.vocab_path)
     if result.grammar_path is not None:
         logger.info("Grammar output: %s", result.grammar_path)
+
+
+def cmd_pull(args: argparse.Namespace) -> None:
+    """Handle the 'pull' subcommand — fetch saved words from a website."""
+    if args.login:
+        try:
+            duchinese_login(browser_path=args.browser_path)
+        except DuChineseError as exc:
+            logger.error("%s", exc)
+            sys.exit(1)
+        return
+
+    try:
+        cards = fetch_duchinese_cards(browser_path=args.browser_path)
+    except DuChineseError as exc:
+        logger.error("%s", exc)
+        sys.exit(1)
+
+    if not cards:
+        logger.warning("No saved flashcards found on duchinese.net")
+        return
+    logger.info("Fetched %d saved flashcard(s) from duchinese.net", len(cards))
+
+    # Du Chinese is Chinese-only, so the word list belongs with the zh inputs.
+    exclude_words = _resolve_anki_words(args, "zh")
+    words = select_duchinese_words(
+        cards,
+        traditional=args.traditional,
+        exclude=exclude_words or None,
+    )
+    skipped = len(cards) - len(words)
+    if skipped:
+        logger.info("Skipped %d word(s): duplicates or already present in Anki", skipped)
+
+    if not words:
+        logger.info("Nothing new to write")
+        return
+
+    output_file = args.output or _default_vocab_output("zh")
+    _write_word_list(words, output_file, overwrite=args.overwrite)
 
 
 def cmd_clean(args: argparse.Namespace) -> None:
@@ -1158,6 +1224,15 @@ def cmd_status(args: argparse.Namespace) -> None:
         "(SQLite lock). Quit Anki or export an .apkg for reliable reads."
     )
 
+    print("\n🌐 DU CHINESE (ankigen pull):")
+    state_path = get_duchinese_state_path()
+    if state_path.exists():
+        print(f"   Session: {state_path} ✓")
+    else:
+        print(f"   Session: {state_path} ✗ (run `ankigen pull --login`)")
+    creds = "set" if os.getenv("DUCHINESE_EMAIL") and os.getenv("DUCHINESE_PASSWORD") else "not set"
+    print(f"   DUCHINESE_EMAIL / DUCHINESE_PASSWORD: {creds} (optional)")
+
     # Audit / backfill note-type field overrides
     print("\n🧩 NOTE TYPE OVERRIDES (audit / backfill):")
     raw_overrides = os.environ.get("ANKIGEN_NOTE_TYPE_OVERRIDES", "").strip()
@@ -1386,6 +1461,58 @@ def main() -> None:
     )
     _add_anki_args(ext_parser)
 
+    # 'pull' subcommand
+    pull_parser = subparsers.add_parser(
+        "pull",
+        help="Pull saved words from a website into a word list",
+        description=(
+            "Fetch your saved flashcards from duchinese.net into the dated "
+            "word list, ready for `ankigen generate`. Run `pull --login` once "
+            "to sign in; the session is reused afterwards."
+        ),
+    )
+    pull_parser.add_argument(
+        "--source",
+        type=str,
+        choices=["duchinese"],
+        default="duchinese",
+        help="Where to pull from (default: duchinese)",
+    )
+    pull_parser.add_argument(
+        "--login",
+        action="store_true",
+        help="Open a browser, sign in by hand, and save the session. Does not "
+        "pull anything. Set DUCHINESE_EMAIL and DUCHINESE_PASSWORD to skip the "
+        "manual step.",
+    )
+    pull_parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=None,
+        help="Output word list (default: {output_dir}/zh/{YYYYMMDD}.txt, "
+        "appended and deduped like `extract`)",
+    )
+    pull_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Wipe the output file before writing instead of appending",
+    )
+    pull_parser.add_argument(
+        "--traditional",
+        action="store_true",
+        help="Write traditional characters instead of simplified",
+    )
+    pull_parser.add_argument(
+        "--browser-path",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Use an existing Chromium binary instead of Playwright's own "
+        "(also settable via ANKIGEN_CHROMIUM_PATH)",
+    )
+    _add_anki_args(pull_parser)
+
     # 'clean' subcommand
     clean_parser = subparsers.add_parser(
         "clean",
@@ -1607,6 +1734,7 @@ def main() -> None:
     handlers = {
         "generate": cmd_generate,
         "extract": cmd_extract,
+        "pull": cmd_pull,
         "clean": cmd_clean,
         "similar": cmd_similar,
         "audit": cmd_audit,

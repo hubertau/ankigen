@@ -493,15 +493,19 @@ async def run(args: argparse.Namespace) -> int:
     (out_dir / "dom_probe.json").write_text(
         json.dumps(probes, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    # Record where each body landed *before* serialising the index, otherwise
+    # every body_file in network.json is null and the URL→payload mapping is
+    # lost.
+    for index, body in recorder.bodies.items():
+        recorder.captures[index].body_file = f"bodies/{index:03d}.json"
+        (out_dir / "bodies" / f"{index:03d}.json").write_text(body, encoding="utf-8")
+
     (out_dir / "network.json").write_text(
         json.dumps(
             [capture.__dict__ for capture in recorder.captures], ensure_ascii=False, indent=2
         ),
         encoding="utf-8",
     )
-    for index, body in recorder.bodies.items():
-        recorder.captures[index].body_file = f"bodies/{index:03d}.json"
-        (out_dir / "bodies" / f"{index:03d}.json").write_text(body, encoding="utf-8")
 
     write_summary(out_dir, probes["page_url"], recorder, probes)
 
